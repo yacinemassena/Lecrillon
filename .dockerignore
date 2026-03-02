@@ -1,0 +1,65 @@
+# Git
+.git
+.gitignore
+.gitattributes
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+venv_windows/
+tcnvenv/
+*.egg-info/
+.pytest_cache/
+
+# Checkpoints and models
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+pretrained/
+
+# Data
+datasets/
+splits/
+available_streams.json
+
+# Results and logs
+results/
+slurm_history/
+
+# IDE
+.vscode/
+.idea/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Documentation
+*.md
+!README.md
+
+# Scripts not needed in container
+setupenv.sh
+setupvps.sh
+pack_env.sh
+activate.txt
+
+# SSH keys
+*.pub
+yacine
+yacine.pub
+
+# Temporary files
+*.log
+*.tmp
+test_environment.py
+download_*.py
+upload_*.py
+downloaded_wheels/
+*.tar.zst
