@@ -8,7 +8,7 @@ echo "🐳 Building Mamba VIX Docker Image"
 echo "===================================="
 
 # Configuration
-DOCKER_USERNAME="${DOCKER_USERNAME:-yacinemassena}"
+DOCKER_USERNAME="${DOCKER_USERNAME:-yacinedaoud}"
 IMAGE_NAME="mamba-vix-training"
 TAG="${TAG:-latest}"
 FULL_IMAGE_NAME="${DOCKER_USERNAME}/${IMAGE_NAME}:${TAG}"
