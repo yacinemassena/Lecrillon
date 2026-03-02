@@ -434,21 +434,27 @@ def main(args):
     train_dataset = MambaL1Dataset(config, split='train', level=level)
     val_dataset = MambaL1Dataset(config, split='val', level=level)
 
+    # Use num_workers from GPU profile for parallel data loading
+    num_workers = config.train.num_workers
     train_loader = DataLoader(
         train_dataset,
         batch_size=1,       # IterableDataset yields single samples
         shuffle=False,
-        num_workers=0,      # Threading handled internally
+        num_workers=num_workers,
         collate_fn=MambaL1Dataset.collate_fn,
         pin_memory=True,
+        prefetch_factor=2 if num_workers > 0 else None,
+        persistent_workers=num_workers > 0,
     )
     val_loader = DataLoader(
         val_dataset,
         batch_size=1,
         shuffle=False,
-        num_workers=0,
+        num_workers=num_workers,
         collate_fn=MambaL1Dataset.collate_fn,
         pin_memory=True,
+        prefetch_factor=2 if num_workers > 0 else None,
+        persistent_workers=num_workers > 0,
     )
 
     if rank == 0:
@@ -476,10 +482,11 @@ def main(args):
         total_steps = config.train.epochs * config.train.steps_per_epoch
         warmup_steps = config.train.warmup_epochs * config.train.steps_per_epoch
 
-        # Linear warmup + cosine decay
+        # Linear warmup + cosine decay (start at 10% of base LR, not 0)
         def lr_lambda(step):
             if step < warmup_steps:
-                return step / max(warmup_steps, 1)
+                # Start at 0.1, ramp to 1.0
+                return 0.1 + 0.9 * (step / max(warmup_steps, 1))
             progress = (step - warmup_steps) / max(total_steps - warmup_steps, 1)
             return max(config.train.min_lr / config.train.lr, 0.5 * (1 + np.cos(np.pi * progress)))
 

@@ -331,10 +331,20 @@ class MambaL1Dataset(IterableDataset):
 
     def __iter__(self) -> Iterator[MambaBatch]:
         """Iterate over samples, yielding MambaBatch."""
-        # Shuffle anchor dates for training
+        # Handle multiple workers - each worker processes a subset of indices
+        worker_info = torch.utils.data.get_worker_info()
         indices = list(range(len(self.anchor_dates)))
+        
         if self.split == 'train':
             np.random.shuffle(indices)
+        
+        if worker_info is not None:
+            # Split indices among workers
+            per_worker = len(indices) // worker_info.num_workers
+            worker_id = worker_info.id
+            start = worker_id * per_worker
+            end = start + per_worker if worker_id < worker_info.num_workers - 1 else len(indices)
+            indices = indices[start:end]
 
         for idx in indices:
             sample = self.anchor_dates[idx]

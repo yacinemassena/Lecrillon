@@ -33,25 +33,25 @@ GPU_PROFILES: Dict[str, dict] = {
         'vram_gb': 16,
         'max_frames_per_batch': 64,
         'grad_accum_steps': 8,
-        'num_workers': 4,
+        'num_workers': 12,
     },
     'rtx5090': {
         'vram_gb': 32,
         'max_frames_per_batch': 128,
         'grad_accum_steps': 4,
-        'num_workers': 4,
+        'num_workers': 12,
     },
     'a100': {
         'vram_gb': 80,
         'max_frames_per_batch': 256,
         'grad_accum_steps': 2,
-        'num_workers': 8,
+        'num_workers': 16,
     },
     'b200': {
         'vram_gb': 180,
         'max_frames_per_batch': 512,
         'grad_accum_steps': 1,
-        'num_workers': 8,
+        'num_workers': 16,
     },
 }
 
