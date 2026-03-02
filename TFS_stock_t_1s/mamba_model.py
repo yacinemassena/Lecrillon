@@ -102,6 +102,11 @@ class VIXHead(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, 1),
         )
+        
+        # Initialize final layer to predict mean VIX (~15)
+        with torch.no_grad():
+            self.net[-1].weight.fill_(0.0)
+            self.net[-1].bias.fill_(15.0)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """x: [B, D] → [B]"""
@@ -219,19 +224,19 @@ class StockMambaL1(nn.Module):
         frames: torch.Tensor,
         frame_mask: torch.Tensor,
         ticker_ids: Optional[torch.Tensor] = None,
-        chunk_size: int = 64,
-        use_checkpoint: bool = True,
+        chunk_size: int = 128,
+        use_checkpoint: bool = False,
     ) -> torch.Tensor:
         """Encode frames in chunks to reduce VRAM usage.
         
         Instead of loading all 1170 frames at once (~4GB VRAM),
-        process 64 frames at a time (~200MB VRAM).
+        process 128 frames at a time (~400MB VRAM).
 
         Args:
             frames: [N, max_bars, F]
             frame_mask: [N, max_bars]
             ticker_ids: [N, max_bars] optional
-            chunk_size: frames per chunk (default 64)
+            chunk_size: frames per chunk (default 128)
             use_checkpoint: use gradient checkpointing (saves VRAM, slower)
 
         Returns:

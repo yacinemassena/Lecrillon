@@ -196,7 +196,8 @@ def train_epoch(
         num_samples += 1
 
         with torch.autocast(device_type='cuda', dtype=amp_dtype, enabled=config.train.amp):
-            outputs = model(frames, frame_mask, ticker_ids)
+            # Use larger chunk_size and disable checkpointing for speed
+            outputs = model(frames, frame_mask, ticker_ids, chunk_size=128)
             pred = outputs['vix_pred']
             loss = criterion(pred, target) / grad_accum
 
