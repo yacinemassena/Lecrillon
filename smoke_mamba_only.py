@@ -43,8 +43,11 @@ logger = logging.getLogger(__name__)
 # Path detection (WSL or Windows)
 # ---------------------------------------------------------------------------
 def get_data_paths() -> Dict[str, Path]:
-    """Detect data paths for WSL or Windows."""
-    if os.path.exists('/mnt/d/Mamba v2/datasets'):
+    """Detect data paths for WSL, Windows, or Linux VPS."""
+    if os.path.exists('/workspace/datasets'):
+        # Linux VPS (Docker)
+        base = Path('/workspace/datasets')
+    elif os.path.exists('/mnt/d/Mamba v2/datasets'):
         # WSL
         base = Path('/mnt/d/Mamba v2/datasets')
     elif os.path.exists(r'D:\Mamba v2\datasets'):
