@@ -97,81 +97,220 @@ $SUDO apt-get install -y $APT_OPTS \
     python3.11-distutils \
     python3-pip
 
-echo "🐍 Creating venv..."
-# Use /workspace if available (Docker/VPS with large disk), otherwise project root
-if [ -d "/workspace" ] && [ -w "/workspace" ]; then
-    VENV_PATH="/workspace/venv"
-    echo "Using /workspace for venv (large disk detected)"
-else
-    VENV_PATH="$PROJECT_DIR/venv"
-    echo "Using project root for venv"
-fi
-echo "Venv path: $VENV_PATH"
+echo "🐍 Checking for pre-packaged environment in R2..."
+# Quick python script to check and download from R2
+cat > "$PROJECT_DIR/download_env.py" << 'EOF'
+import os
+import sys
+import boto3
+from botocore.config import Config
 
-if [[ ! -d "$VENV_PATH" ]]; then
-    echo "Creating venv..."
-    python3.11 -m venv "$VENV_PATH"
-    echo "✅ venv created"
-else
-    echo "✅ venv already exists"
-fi
+R2_ACCOUNT_ID = "2a139e9393f803634546ad9d541d37b9"
+R2_ACCESS_KEY_ID = "fdfa18bf64b18c61bbee64fda98ca20b"
+R2_SECRET_ACCESS_KEY = "394c88a7aaf0027feabe74ae20da9b2f743ab861336518a09972bc39534596d8"
+R2_ENDPOINT_URL = f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+BUCKET_NAME = "europe"
+PREFIX = "environments/"
 
-echo "🔌 Activating venv..."
-source "$VENV_PATH/bin/activate"
-echo "✅ venv activated: $VENV_PATH"
+# Determine GPU compute cap (simplified for script)
+try:
+    import torch
+    cap = str(torch.cuda.get_device_capability(0)).replace('(', '').replace(')', '').replace(', ', '')
+except:
+    cap = "cpu"
 
-# Set pip cache to /workspace to avoid filling overlay
-if [ -d "/workspace" ]; then
-    export PIP_CACHE_DIR="/workspace/.pip-cache"
-    mkdir -p "$PIP_CACHE_DIR"
-    echo "📦 Using pip cache: $PIP_CACHE_DIR"
-fi
+tar_filename = f"mamba_venv_linux_{cap}.tar.zst"
+object_name = f"{PREFIX}{tar_filename}"
+download_path = sys.argv[1]
 
-echo "📦 Installing Python packages..."
-pip install --upgrade pip setuptools wheel ninja packaging
+print(f"Connecting to R2 to check for {tar_filename}...")
+s3 = boto3.client('s3', endpoint_url=R2_ENDPOINT_URL,
+                  aws_access_key_id=R2_ACCESS_KEY_ID, aws_secret_access_key=R2_SECRET_ACCESS_KEY,
+                  config=Config(signature_version='s3v4'), region_name='auto')
 
-# Install PyTorch
-if [ -n "$CUDA_HOME" ]; then
-    echo "🔥 Installing PyTorch with CUDA 12.x support..."
-    pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
-else
-    echo "💻 Installing PyTorch (CPU-only)..."
-    pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
-fi
+try:
+    s3.head_object(Bucket=BUCKET_NAME, Key=object_name)
+    print(f"✅ Pre-packaged environment found! Downloading...")
+    s3.download_file(BUCKET_NAME, object_name, download_path)
+    print("✅ Download complete!")
+    sys.exit(0)
+except Exception as e:
+    print(f"⚠️  No pre-packaged environment found in R2 ({object_name}).")
+    sys.exit(1)
+EOF
 
-# Install other dependencies
-echo "📦 Installing additional packages..."
-pip install numpy pandas pyarrow boto3 tqdm einops triton transformers
+TAR_FILEPATH="$PROJECT_DIR/downloaded_venv.tar.zst"
 
-# Detect GPU compute capability
-GPU_COMPUTE_CAP=""
-if [ -n "$CUDA_HOME" ]; then
-    echo "🔍 Detecting GPU compute capability..."
-    GPU_COMPUTE_CAP=$(python3.11 -c "import torch; print(torch.cuda.get_device_capability(0) if torch.cuda.is_available() else '')" 2>/dev/null || echo "")
-    echo "GPU compute capability: $GPU_COMPUTE_CAP"
-fi
+# We need boto3 installed temporarily in the system to run the download script
+$SUDO pip3 install boto3 --break-system-packages || pip3 install boto3
 
-# Install causal-conv1d and mamba_ssm based on GPU
-if [ -n "$CUDA_HOME" ] && [ -n "$GPU_COMPUTE_CAP" ]; then
-    # Always use custom packages for CUDA GPUs (supports sm_80 A100 and sm_120 Blackwell)
-    echo "🚀 GPU detected - installing custom mamba packages..."
+if python3 "$PROJECT_DIR/download_env.py" "$TAR_FILEPATH"; then
+    echo "🗜️ Extracting pre-packaged environment using zstd..."
     
-    # Clean any existing PyPI versions first
-    pip uninstall -y mamba-ssm causal-conv1d 2>/dev/null || true
-    rm -rf "$VENV_PATH/lib/python3.11/site-packages/mamba_ssm"* 2>/dev/null || true
-    rm -rf "$VENV_PATH/lib/python3.11/site-packages/selective_scan_cuda"* 2>/dev/null || true
-    rm -rf "$VENV_PATH/lib/python3.11/site-packages/causal_conv1d"* 2>/dev/null || true
+    # Make sure zstd is installed
+    if ! command -v zstd &> /dev/null; then
+        $SUDO apt-get update $APT_OPTS && $SUDO apt-get install -y $APT_OPTS zstd
+    fi
     
-    echo "🔧 Installing causal-conv1d from custom package..."
-    cd "$PROJECT_DIR/custom_packages/causal-conv1d-sm120"
-    pip install -e . --no-build-isolation --force-reinstall
+    # Extract
+    if [ -d "/workspace" ] && [ -w "/workspace" ]; then
+        cd /workspace
+        tar -I zstd -xf "$TAR_FILEPATH"
+        VENV_PATH="/workspace/venv"
+    else
+        cd "$PROJECT_DIR"
+        tar -I zstd -xf "$TAR_FILEPATH"
+        VENV_PATH="$PROJECT_DIR/venv"
+    fi
     
-    echo "🐍 Installing mamba_ssm from custom package..."
-    cd "$PROJECT_DIR/custom_packages/mamba_blackwell"
-    pip install -e . --no-build-isolation --force-reinstall
+    rm "$TAR_FILEPATH"
+    
+    echo "🔧 Relocating venv paths..."
+    # Venvs have hardcoded paths in bin/activate and pip shebangs.
+    # We update them to the current absolute path.
+    for script in "$VENV_PATH"/bin/*; do
+        if [ -f "$script" ] && file "$script" | grep -q "text"; then
+            sed -i "s|/workspace/venv|$VENV_PATH|g" "$script" 2>/dev/null || true
+            sed -i "s|.*Mamba v2/venv|$VENV_PATH|g" "$script" 2>/dev/null || true
+        fi
+    done
+    
+    echo "🔌 Activating extracted venv..."
+    source "$VENV_PATH/bin/activate"
+    echo "✅ Fast setup complete using pre-packaged environment!"
+    
+    # Clean up script
+    rm "$PROJECT_DIR/download_env.py"
 else
-    echo "⚠️  No CUDA - skipping causal-conv1d and mamba_ssm"
+    # FALLBACK: Build from scratch
+    rm "$PROJECT_DIR/download_env.py"
+    echo "⚠️ Falling back to full source build..."
+    
+    echo "🐍 Creating venv..."
+    # Use /workspace if available (Docker/VPS with large disk), otherwise project root
+    if [ -d "/workspace" ] && [ -w "/workspace" ]; then
+        VENV_PATH="/workspace/venv"
+        echo "Using /workspace for venv (large disk detected)"
+    else
+        VENV_PATH="$PROJECT_DIR/venv"
+        echo "Using project root for venv"
+    fi
+    echo "Venv path: $VENV_PATH"
+
+    if [[ ! -d "$VENV_PATH" ]]; then
+        echo "Creating venv..."
+        python3.11 -m venv "$VENV_PATH"
+        echo "✅ venv created"
+    else
+        echo "✅ venv already exists"
+    fi
+
+    echo "🔌 Activating venv..."
+    source "$VENV_PATH/bin/activate"
+    echo "✅ venv activated: $VENV_PATH"
+
+    # Set pip cache to /workspace to avoid filling overlay
+    if [ -d "/workspace" ]; then
+        export PIP_CACHE_DIR="/workspace/.pip-cache"
+        mkdir -p "$PIP_CACHE_DIR"
+        echo "📦 Using pip cache: $PIP_CACHE_DIR"
+    fi
+
+    echo "📦 Installing Python packages..."
+    pip install --upgrade pip setuptools wheel ninja packaging
+
+    # Install PyTorch
+    if [ -n "$CUDA_HOME" ]; then
+        echo "🔥 Installing PyTorch with CUDA 12.x support..."
+        pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+    else
+        echo "💻 Installing PyTorch (CPU-only)..."
+        pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+    fi
+
+    # Install other dependencies
+    echo "📦 Installing additional packages..."
+    pip install numpy pandas pyarrow boto3 tqdm einops triton transformers
+
+    # Detect GPU compute capability
+    GPU_COMPUTE_CAP=""
+    if [ -n "$CUDA_HOME" ]; then
+        echo "🔍 Detecting GPU compute capability..."
+        GPU_COMPUTE_CAP=$(python3.11 -c "import torch; print(torch.cuda.get_device_capability(0) if torch.cuda.is_available() else '')" 2>/dev/null || echo "")
+        echo "GPU compute capability: $GPU_COMPUTE_CAP"
+    fi
+
+    # Install causal-conv1d and mamba_ssm based on GPU
+    if [ -n "$CUDA_HOME" ] && [ -n "$GPU_COMPUTE_CAP" ]; then
+        # Always use custom packages for CUDA GPUs (supports sm_80 A100 and sm_120 Blackwell)
+        echo "🚀 GPU detected - installing custom mamba packages..."
+        
+        # Clean any existing PyPI versions first
+        pip uninstall -y mamba-ssm causal-conv1d 2>/dev/null || true
+        rm -rf "$VENV_PATH/lib/python3.11/site-packages/mamba_ssm"* 2>/dev/null || true
+        rm -rf "$VENV_PATH/lib/python3.11/site-packages/selective_scan_cuda"* 2>/dev/null || true
+        rm -rf "$VENV_PATH/lib/python3.11/site-packages/causal_conv1d"* 2>/dev/null || true
+        
+        echo "☁️ Downloading pre-built wheels from Cloudflare R2..."
+        WHEELS_DIR="$PROJECT_DIR/downloaded_wheels"
+        mkdir -p "$WHEELS_DIR"
+        
+        # Download wheels using boto3 script
+        cat > "$PROJECT_DIR/download_wheels.py" << 'EOF'
+import os
+import boto3
+from botocore.config import Config
+
+print("Downloading wheels from R2...")
+R2_ACCOUNT_ID = "2a139e9393f803634546ad9d541d37b9"
+R2_ACCESS_KEY_ID = "fdfa18bf64b18c61bbee64fda98ca20b"
+R2_SECRET_ACCESS_KEY = "394c88a7aaf0027feabe74ae20da9b2f743ab861336518a09972bc39534596d8"
+R2_ENDPOINT_URL = f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+BUCKET_NAME = "europe"
+PREFIX = "custom_mamba_wheels/"
+DOWNLOAD_DIR = "downloaded_wheels"
+
+s3 = boto3.client('s3', endpoint_url=R2_ENDPOINT_URL,
+                  aws_access_key_id=R2_ACCESS_KEY_ID, aws_secret_access_key=R2_SECRET_ACCESS_KEY,
+                  config=Config(signature_version='s3v4'), region_name='auto')
+
+response = s3.list_objects_v2(Bucket=BUCKET_NAME, Prefix=PREFIX)
+if 'Contents' in response:
+    for obj in response['Contents']:
+        if obj['Key'].endswith('.whl'):
+            filename = os.path.basename(obj['Key'])
+            filepath = os.path.join(DOWNLOAD_DIR, filename)
+            print(f"Downloading {filename}...")
+            s3.download_file(BUCKET_NAME, obj['Key'], filepath)
+    print("✅ Download complete!")
+else:
+    print("❌ No wheels found in R2 bucket.")
+EOF
+        
+        python3 "$PROJECT_DIR/download_wheels.py"
+        rm "$PROJECT_DIR/download_wheels.py"
+        
+        # Check if wheels were downloaded
+        if ls "$WHEELS_DIR"/*.whl 1> /dev/null 2>&1; then
+            echo "📦 Installing downloaded wheels..."
+            pip install "$WHEELS_DIR"/*.whl --force-reinstall
+            echo "✅ Installed pre-built custom packages!"
+        else
+            echo "⚠️ No pre-built wheels found in R2. Falling back to source build..."
+            echo "🔧 Installing causal-conv1d from custom package..."
+            cd "$PROJECT_DIR/custom_packages/causal-conv1d-sm120"
+            pip install -e . --no-build-isolation --force-reinstall
+            
+            echo "🐍 Installing mamba_ssm from custom package..."
+            cd "$PROJECT_DIR/custom_packages/mamba_blackwell"
+            pip install -e . --no-build-isolation --force-reinstall
+            cd "$PROJECT_DIR"
+        fi
+    else
+        echo "⚠️  No CUDA - skipping causal-conv1d and mamba_ssm"
+    fi
 fi
+
 
 cd "$PROJECT_DIR"
 
