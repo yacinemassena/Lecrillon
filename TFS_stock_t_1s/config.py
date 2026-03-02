@@ -115,6 +115,13 @@ class DataConfig:
     val_end: str = '2024-12-31'
     test_start: str = '2025-02-01'
 
+    # VIX target normalization: 'none', 'zscore', 'log_return'
+    # zscore: (vix - mean) / std, mean=20, std=8 (historical VIX stats)
+    # log_return: log(vix_target / vix_yesterday)
+    vix_normalize: str = 'zscore'
+    vix_mean: float = 20.0   # historical VIX mean
+    vix_std: float = 8.0     # historical VIX std
+
     # Bar features to use
     features: List[str] = field(default_factory=lambda: [
         'close', 'volume', 'trade_count',

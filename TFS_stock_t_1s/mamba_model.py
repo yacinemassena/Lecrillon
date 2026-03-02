@@ -103,10 +103,10 @@ class VIXHead(nn.Module):
             nn.Linear(hidden_dim, 1),
         )
         
-        # Initialize final layer to predict mean VIX (~15)
+        # Initialize final layer to predict 0 (z-score normalized VIX mean)
         with torch.no_grad():
             self.net[-1].weight.fill_(0.0)
-            self.net[-1].bias.fill_(15.0)
+            self.net[-1].bias.fill_(0.0)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """x: [B, D] → [B]"""
@@ -272,6 +272,7 @@ class StockMambaL1(nn.Module):
         frame_mask: torch.Tensor,
         ticker_ids: Optional[torch.Tensor] = None,
         chunk_size: int = 64,
+        return_timing: bool = False,
     ) -> Dict[str, torch.Tensor]:
         """
         Full forward: frames → Transformer (chunked) → Mamba-1 → VIX.
@@ -281,16 +282,25 @@ class StockMambaL1(nn.Module):
             frame_mask: [N_total, max_bars]
             ticker_ids: [N_total, max_bars] optional
             chunk_size: frames per Transformer chunk (reduces VRAM)
+            return_timing: if True, include timing breakdown in output
 
         Returns:
             dict with 'vix_pred' [1] and 'mamba_hidden' [1, T, D]
         """
+        import time
+        timings = {}
+        
         # Level 0: encode frames in chunks (VRAM efficient)
+        t0 = time.time()
         frame_emb = self.encode_frames_chunked(
             frames, frame_mask, ticker_ids, chunk_size=chunk_size
         )  # [N, hidden_dim]
+        if return_timing:
+            torch.cuda.synchronize()
+            timings['transformer'] = time.time() - t0
 
         # Project to Mamba dim
+        t0 = time.time()
         x = self.proj(frame_emb)  # [N, d_model]
 
         # Reshape to [1, T, d_model] (single sample)
@@ -298,15 +308,25 @@ class StockMambaL1(nn.Module):
 
         # Level 1: Mamba-1
         h = self.mamba(x)  # [1, T, d_model]
+        if return_timing:
+            torch.cuda.synchronize()
+            timings['mamba'] = time.time() - t0
 
         # Pool → predict
+        t0 = time.time()
         h_pool = self.pooling(h)  # [1, d_model]
         vix_pred = self.vix_head(h_pool)  # [1]
+        if return_timing:
+            torch.cuda.synchronize()
+            timings['head'] = time.time() - t0
 
-        return {
+        result = {
             'vix_pred': vix_pred,
             'mamba_hidden': h,
         }
+        if return_timing:
+            result['timing'] = timings
+        return result
 
     def get_daily_summaries(self, mamba_hidden: torch.Tensor) -> torch.Tensor:
         """Pool Mamba-1 hidden states into daily summaries for Level 2.

@@ -203,10 +203,11 @@ def train_epoch(
         t_fwd_start = time.time()
         with torch.autocast(device_type='cuda', dtype=amp_dtype, enabled=config.train.amp):
             # Use larger chunk_size and disable checkpointing for speed
-            outputs = model(frames, frame_mask, ticker_ids, chunk_size=128)
+            outputs = model(frames, frame_mask, ticker_ids, chunk_size=128, return_timing=True)
             pred = outputs['vix_pred']
             loss = criterion(pred, target) / grad_accum
         t_fwd = time.time() - t_fwd_start
+        timing = outputs.get('timing', {})
 
         t_bwd_start = time.time()
         scaler.scale(loss).backward()
@@ -226,13 +227,15 @@ def train_epoch(
 
         total_loss += loss.item() * grad_accum
         num_batches += 1
+        t_enc = timing.get('transformer', 0)
+        t_mamba = timing.get('mamba', 0)
         pbar.set_postfix({
             'loss': f'{total_loss / num_batches:.4f}',
             'pred': f'{pred.item():.2f}',
             'tgt': f'{target.item():.2f}',
-            'lr': f'{optimizer.param_groups[0]["lr"]:.2e}',
             'data': f'{t_data:.1f}s',
-            'fwd': f'{t_fwd:.1f}s',
+            'enc': f'{t_enc:.1f}s',
+            'mamba': f'{t_mamba:.1f}s',
             'bwd': f'{t_bwd:.1f}s',
         })
 

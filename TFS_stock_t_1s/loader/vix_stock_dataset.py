@@ -132,6 +132,11 @@ class MambaL1Dataset(IterableDataset):
         self.lookback_days = mamba_cfg.lookback_days
         self.max_frames_per_batch = config.train.max_frames_per_batch
 
+        # VIX normalization
+        self.vix_normalize = getattr(data_cfg, 'vix_normalize', 'none')
+        self.vix_mean = getattr(data_cfg, 'vix_mean', 20.0)
+        self.vix_std = getattr(data_cfg, 'vix_std', 8.0)
+
         # Target horizon
         if level == 1:
             self.target_horizon_days = 1   # next day
@@ -367,7 +372,15 @@ class MambaL1Dataset(IterableDataset):
             frames_t = torch.from_numpy(np.stack(all_frames))
             masks_t = torch.from_numpy(np.stack(all_masks))
             tids_t = torch.from_numpy(np.stack(all_tids)) if all_tids else None
-            target_t = torch.tensor([target_vix], dtype=torch.float32)
+            
+            # Normalize VIX target
+            if self.vix_normalize == 'zscore':
+                target_norm = (target_vix - self.vix_mean) / self.vix_std
+            elif self.vix_normalize == 'log':
+                target_norm = np.log(target_vix) if target_vix > 0 else 0.0
+            else:
+                target_norm = target_vix
+            target_t = torch.tensor([target_norm], dtype=torch.float32)
 
             yield MambaBatch(
                 frames=frames_t,
