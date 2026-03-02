@@ -60,9 +60,19 @@ else
     SUDO="sudo"
 fi
 
+# Use /workspace for apt cache if available to avoid filling overlay
+if [ -d "/workspace" ] && [ -w "/workspace" ]; then
+    export APT_CACHE_DIR="/workspace/.apt-cache"
+    mkdir -p "$APT_CACHE_DIR/archives/partial"
+    echo "📦 Using apt cache: $APT_CACHE_DIR"
+    APT_OPTS="-o Dir::Cache::Archives=$APT_CACHE_DIR"
+else
+    APT_OPTS=""
+fi
+
 echo "📦 Installing system dependencies..."
-$SUDO apt-get update
-$SUDO apt-get install -y \
+$SUDO apt-get update $APT_OPTS
+$SUDO apt-get install -y $APT_OPTS \
     software-properties-common \
     gnupg \
     ca-certificates \
@@ -76,11 +86,11 @@ $SUDO apt-get install -y \
 echo "🐍 Adding deadsnakes PPA for Python 3.11..."
 if ! grep -q "^deb .*deadsnakes/ppa" /etc/apt/sources.list /etc/apt/sources.list.d/* 2>/dev/null; then
     $SUDO add-apt-repository ppa:deadsnakes/ppa -y
-    $SUDO apt-get update
+    $SUDO apt-get update $APT_OPTS
 fi
 
 echo "🔧 Installing Python 3.11 and build tools..."
-$SUDO apt-get install -y \
+$SUDO apt-get install -y $APT_OPTS \
     python3.11 \
     python3.11-dev \
     python3.11-venv \
