@@ -87,9 +87,15 @@ $SUDO apt-get install -y \
     python3.11-distutils \
     python3-pip
 
-echo "🐍 Creating venv in project root..."
-VENV_PATH="$PROJECT_DIR/venv"
-echo "Project root: $PROJECT_DIR"
+echo "🐍 Creating venv..."
+# Use /workspace if available (Docker/VPS with large disk), otherwise project root
+if [ -d "/workspace" ] && [ -w "/workspace" ]; then
+    VENV_PATH="/workspace/venv"
+    echo "Using /workspace for venv (large disk detected)"
+else
+    VENV_PATH="$PROJECT_DIR/venv"
+    echo "Using project root for venv"
+fi
 echo "Venv path: $VENV_PATH"
 
 if [[ ! -d "$VENV_PATH" ]]; then
@@ -186,11 +192,16 @@ python test_environment.py
 rm test_environment.py
 
 echo ""
+echo ""
 echo "🎉 VPS Setup Complete!"
 echo "🚀 To activate your environment:"
-echo "  source venv/bin/activate"
+echo "  source $VENV_PATH/bin/activate"
 echo "🧪 To download data:"
 echo "  pip install boto3"
-echo "  python download_data.py --year 2024 --data-type both"
+if [ -d "/workspace" ]; then
+    echo "  python download_data.py --year 2024 --data-type both --stock-dir /workspace/datasets/Stock_Data_1s --vix-dir /workspace/datasets/VIX"
+else
+    echo "  python download_data.py --year 2024 --data-type both"
+fi
 echo "🏃 To run smoke test:"
 echo "  python smoke_mamba_only.py --train-steps 20 --val-steps 5 --epochs 1"
