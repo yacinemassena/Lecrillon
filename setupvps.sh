@@ -18,7 +18,7 @@ append_if_missing() {
 
 # Set environment variables
 export DEBIAN_FRONTEND=noninteractive
-export TORCH_CUDA_ARCH_LIST="8.0;8.6;8.9;9.0"
+export TORCH_CUDA_ARCH_LIST="8.0;8.6;8.9;9.0;12.0"
 export FORCE_CUDA=1
 export MAX_JOBS=$(nproc)
 
@@ -48,7 +48,7 @@ if [ -n "$CUDA_HOME" ]; then
     append_if_missing "export PATH=$CUDA_HOME/bin:\$PATH" "$BASHRC"
     append_if_missing "export LD_LIBRARY_PATH=$CUDA_HOME/lib64:\$LD_LIBRARY_PATH" "$BASHRC"
     append_if_missing "export CUDA_HOME=$CUDA_HOME" "$BASHRC"
-    append_if_missing 'export TORCH_CUDA_ARCH_LIST="8.0;8.6;8.9;9.0"' "$BASHRC"
+    append_if_missing 'export TORCH_CUDA_ARCH_LIST="8.0;8.6;8.9;9.0;12.0"' "$BASHRC"
     append_if_missing 'export FORCE_CUDA=1' "$BASHRC"
 fi
 
@@ -141,7 +141,7 @@ fi
 
 # Install other dependencies
 echo "📦 Installing additional packages..."
-pip install numpy pandas pyarrow boto3 einops triton transformers
+pip install numpy pandas pyarrow boto3 tqdm einops triton transformers
 
 # Detect GPU compute capability
 GPU_COMPUTE_CAP=""

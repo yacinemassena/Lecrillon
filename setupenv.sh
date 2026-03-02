@@ -30,7 +30,7 @@ append_if_missing() {
 
 # Set environment variables for RTX 5080 + sm_120
 export DEBIAN_FRONTEND=noninteractive
-export TORCH_CUDA_ARCH_LIST="8.6;8.9;9.0;12.0"
+export TORCH_CUDA_ARCH_LIST="8.0;8.6;8.9;9.0;12.0"
 export FORCE_CUDA=1
 export MAX_JOBS=12
 
@@ -44,7 +44,7 @@ BASHRC="$HOME/.bashrc"
 append_if_missing 'export PATH=/usr/local/cuda-12.8/bin:$PATH' "$BASHRC"
 append_if_missing 'export LD_LIBRARY_PATH=/usr/local/cuda-12.8/lib64:$LD_LIBRARY_PATH' "$BASHRC"
 append_if_missing 'export CUDA_HOME=/usr/local/cuda-12.8' "$BASHRC"
-append_if_missing 'export TORCH_CUDA_ARCH_LIST="8.6;8.9;9.0;12.0"' "$BASHRC"
+append_if_missing 'export TORCH_CUDA_ARCH_LIST="8.0;8.6;8.9;9.0;12.0"' "$BASHRC"
 append_if_missing 'export FORCE_CUDA=1' "$BASHRC"
 append_if_missing 'export MAX_JOBS=12' "$BASHRC"
 
@@ -161,8 +161,8 @@ else
     git pull
 fi
 
-# Install dependencies first
-pip install transformers einops triton tokenizers safetensors huggingface_hub
+# Install dependencies first (only what mamba_ssm actually needs)
+pip install transformers einops triton
 
 # Build mamba-ssm in editable mode
 pip install -e . --no-build-isolation --no-deps
@@ -202,9 +202,8 @@ cd ../..
 
 echo "📚 Installing additional ML libraries..."
 pip install \
-    numpy pandas pyarrow scipy scikit-learn tqdm pyyaml \
-    tensorboard ipykernel jupyter \
-    einops transformers
+    numpy pandas pyarrow tqdm pyyaml boto3 \
+    tensorboard
 
 echo ""
 echo "🎉 RTX 5080 + CUDA 12.8 + sm_120 Setup Complete!"
