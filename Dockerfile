@@ -87,5 +87,5 @@ ENV PATH=/usr/local/cuda/bin:$PATH
 ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
 ENV CUDA_HOME=/usr/local/cuda
 
-# Default command
-CMD ["/bin/bash"]
+# Default command - keep container running for RunPod
+CMD ["sleep", "infinity"]
