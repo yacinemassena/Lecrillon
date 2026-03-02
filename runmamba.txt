@@ -1,0 +1,32 @@
+# 1. Check disks
+df -h
+
+# 2. Clone repo to /workspace
+cd /workspace
+git clone https://github.com/yacinemassena/Lecrillon.git
+cd Lecrillon
+
+# 3. Run setup script
+bash setupvps.sh
+
+# 4. Activate venv
+source /workspace/venv/bin/activate
+
+# 5. Verify mamba is from custom package
+python -c "import mamba_ssm; print(mamba_ssm.__file__)"
+# Should show: /workspace/Lecrillon/custom_packages/mamba_blackwell/mamba_ssm/__init__.py
+
+# 6. Download VIX data
+cd /workspace
+python /workspace/Lecrillon/download_vix.py --vix-dir /workspace/datasets/VIX
+
+# 7. Download 2024 stock data
+python /workspace/Lecrillon/download_data.py --year 2024 --data-type stock --stock-dir /workspace/datasets/Stock_Data_1s
+
+# 8. Verify data
+ls -lh /workspace/datasets/Stock_Data_1s/ | head -5
+ls -lh /workspace/datasets/VIX/
+
+# 9. Run smoke test
+cd /workspace/Lecrillon
+python smoke_mamba_only.py --train-steps 20 --val-steps 5 --epochs 1

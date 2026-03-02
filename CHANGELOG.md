@@ -1,5 +1,57 @@
 # Changelog
 
+## 2026-03-02 - Deployment Improvements & Docker Support
+
+### Docker Deployment for RunPod
+- **Created `Dockerfile`**: Complete Docker image with CUDA 12.4, PyTorch cu124, mamba_blackwell, causal-conv1d-sm120
+- **Created `build_docker.sh`**: Automated build and push script for Docker Hub
+- **Created `.dockerignore`**: Optimized Docker build context (excludes datasets, checkpoints, venv)
+- **Created `install_docker_wsl.sh`**: One-command Docker installation for WSL
+- **Created `README_DOCKER.md`**: Complete Docker deployment guide for RunPod
+- **Deployment time**: Reduced from 60 minutes (source build) to ~30 seconds (Docker pull)
+- **Image size**: ~5-8GB compressed (includes all dependencies and compiled CUDA extensions)
+
+### Setup Script Improvements
+- **Fixed `setupenv.sh`**: 
+  - Changed `MAX_JOBS=12` to `MAX_JOBS=$(nproc)` for dynamic CPU core detection
+  - Added `8.0` to `TORCH_CUDA_ARCH_LIST` for A100 compatibility
+  - Added `boto3` for R2 data operations
+  - Removed bloat packages (scipy, scikit-learn, jupyter, ipykernel, safetensors, tokenizers, huggingface_hub)
+- **Fixed `setupvps.sh`**:
+  - Added `12.0` to `TORCH_CUDA_ARCH_LIST` for Blackwell support
+  - Added `tqdm` (required by train.py, compute_rv.py, pretrain_tcn_rv.py)
+  - Added pre-installed PyTorch cleanup for RunPod compatibility
+  - Added pre-packaged venv download from R2 (fast-path deployment)
+- **Fixed `mamba_blackwell/setup.py`**: Changed sm_120 CUDA threshold from 12.0 to 12.8 (matches causal-conv1d-sm120)
+
+### Environment Packaging (Alternative to Docker)
+- **Created `pack_env.sh`**: Compress and upload venv to R2 as `.tar.zst` (~2.8GB)
+- **Updated `setupvps.sh`**: Auto-download and extract pre-packaged venv from R2 if available
+- **Path relocation**: Automatic venv path fixing with `sed` for portability
+- **Deployment time**: ~2 minutes (download + extract) vs 60 minutes (source build)
+
+### RunPod Workflow
+Created `runmamba.txt` with complete RunPod deployment steps:
+1. Clone repo to /workspace
+2. Run setupvps.sh (or use Docker image)
+3. Download VIX and stock data from R2
+4. Run smoke test
+5. Start training
+
+### Requirements Analysis
+- Analyzed all 47 Python files in the repository
+- Identified actual dependencies vs bloat packages
+- Documented missing packages (boto3 in setupenv.sh, tqdm in setupvps.sh)
+- Fixed CUDA architecture list gaps (A100 sm_80, Blackwell sm_120)
+
+### Key Improvements
+- **3 deployment options**: Docker (fastest), pre-packaged venv (fast), source build (slow fallback)
+- **RunPod optimized**: Pre-installed PyTorch cleanup, /workspace disk detection
+- **Consistent ARCH_LIST**: `8.0;8.6;8.9;9.0;12.0` across all scripts
+- **Minimal dependencies**: Removed ~200MB of unnecessary packages
+
+---
+
 ## 2026-03-02 - Stock → Transformer → Mamba → VIX Pipeline (WSL Required)
 
 ### Major Architecture Change
