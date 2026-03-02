@@ -124,24 +124,36 @@ fi
 
 # Install other dependencies
 echo "📦 Installing additional packages..."
-pip install numpy pandas pyarrow boto3
+pip install numpy pandas pyarrow boto3 einops triton transformers
 
-# Install causal-conv1d (custom sm_120 version)
-echo "🔧 Installing causal-conv1d..."
-cd "$PROJECT_DIR/custom_packages/causal-conv1d-sm120"
+# Detect GPU compute capability
+GPU_COMPUTE_CAP=""
 if [ -n "$CUDA_HOME" ]; then
-    pip install -e . --no-build-isolation
-else
-    echo "⚠️  Skipping causal-conv1d (requires CUDA)"
+    echo "🔍 Detecting GPU compute capability..."
+    GPU_COMPUTE_CAP=$(python3.11 -c "import torch; print(torch.cuda.get_device_capability(0) if torch.cuda.is_available() else '')" 2>/dev/null || echo "")
+    echo "GPU compute capability: $GPU_COMPUTE_CAP"
 fi
 
-# Install mamba_ssm (custom Blackwell version)
-echo "🐍 Installing mamba_ssm..."
-cd "$PROJECT_DIR/custom_packages/mamba_blackwell"
-if [ -n "$CUDA_HOME" ]; then
-    pip install -e . --no-build-isolation
+# Install causal-conv1d and mamba_ssm based on GPU
+if [ -n "$CUDA_HOME" ] && [ -n "$GPU_COMPUTE_CAP" ]; then
+    # Check if RTX 5080/Blackwell (sm_120 = compute capability 12.0)
+    if [[ "$GPU_COMPUTE_CAP" == "(12, 0)" ]]; then
+        echo "🚀 RTX 5080/Blackwell detected - installing custom sm_120 versions..."
+        
+        echo "🔧 Installing causal-conv1d (sm_120)..."
+        cd "$PROJECT_DIR/custom_packages/causal-conv1d-sm120"
+        pip install -e . --no-build-isolation
+        
+        echo "🐍 Installing mamba_ssm (Blackwell)..."
+        cd "$PROJECT_DIR/custom_packages/mamba_blackwell"
+        pip install -e . --no-build-isolation
+    else
+        echo "📦 Standard GPU detected - installing PyPI versions..."
+        pip install causal-conv1d>=1.4.0
+        pip install mamba-ssm
+    fi
 else
-    echo "⚠️  Skipping mamba_ssm (requires CUDA)"
+    echo "⚠️  No CUDA - skipping causal-conv1d and mamba_ssm"
 fi
 
 cd "$PROJECT_DIR"
@@ -194,14 +206,23 @@ rm test_environment.py
 echo ""
 echo ""
 echo "🎉 VPS Setup Complete!"
+echo ""
+if [ -n "$GPU_COMPUTE_CAP" ]; then
+    echo "GPU: $(python3.11 -c 'import torch; print(torch.cuda.get_device_name(0))' 2>/dev/null)"
+    echo "Compute Capability: $GPU_COMPUTE_CAP"
+fi
+echo ""
 echo "🚀 To activate your environment:"
 echo "  source $VENV_PATH/bin/activate"
+echo ""
 echo "🧪 To download data:"
-echo "  pip install boto3"
 if [ -d "/workspace" ]; then
-    echo "  python download_data.py --year 2024 --data-type both --stock-dir /workspace/datasets/Stock_Data_1s --vix-dir /workspace/datasets/VIX"
+    echo "  cd /workspace"
+    echo "  python $PROJECT_DIR/download_data.py --year 2024 --data-type both --stock-dir /workspace/datasets/Stock_Data_1s --vix-dir /workspace/datasets/VIX"
 else
     echo "  python download_data.py --year 2024 --data-type both"
 fi
+echo ""
 echo "🏃 To run smoke test:"
+echo "  cd $PROJECT_DIR"
 echo "  python smoke_mamba_only.py --train-steps 20 --val-steps 5 --epochs 1"
