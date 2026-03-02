@@ -214,25 +214,76 @@ class StockMambaL1(nn.Module):
         """
         return self.frame_encoder(frames, frame_mask, ticker_ids)
 
+    def encode_frames_chunked(
+        self,
+        frames: torch.Tensor,
+        frame_mask: torch.Tensor,
+        ticker_ids: Optional[torch.Tensor] = None,
+        chunk_size: int = 64,
+        use_checkpoint: bool = True,
+    ) -> torch.Tensor:
+        """Encode frames in chunks to reduce VRAM usage.
+        
+        Instead of loading all 1170 frames at once (~4GB VRAM),
+        process 64 frames at a time (~200MB VRAM).
+
+        Args:
+            frames: [N, max_bars, F]
+            frame_mask: [N, max_bars]
+            ticker_ids: [N, max_bars] optional
+            chunk_size: frames per chunk (default 64)
+            use_checkpoint: use gradient checkpointing (saves VRAM, slower)
+
+        Returns:
+            [N, hidden_dim] frame embeddings
+        """
+        N = frames.size(0)
+        if N <= chunk_size:
+            return self.encode_frames(frames, frame_mask, ticker_ids)
+        
+        embeddings = []
+        for i in range(0, N, chunk_size):
+            end_idx = min(i + chunk_size, N)
+            chunk_frames = frames[i:end_idx]
+            chunk_mask = frame_mask[i:end_idx]
+            chunk_tickers = ticker_ids[i:end_idx] if ticker_ids is not None else None
+            
+            if use_checkpoint and self.training:
+                # Gradient checkpointing: recompute forward during backward
+                emb = torch_checkpoint(
+                    self.encode_frames,
+                    chunk_frames, chunk_mask, chunk_tickers,
+                    use_reentrant=False,
+                )
+            else:
+                emb = self.encode_frames(chunk_frames, chunk_mask, chunk_tickers)
+            embeddings.append(emb)
+        
+        return torch.cat(embeddings, dim=0)
+
     def forward(
         self,
         frames: torch.Tensor,
         frame_mask: torch.Tensor,
         ticker_ids: Optional[torch.Tensor] = None,
+        chunk_size: int = 64,
     ) -> Dict[str, torch.Tensor]:
         """
-        Full forward: frames → Transformer → Mamba-1 → VIX.
+        Full forward: frames → Transformer (chunked) → Mamba-1 → VIX.
 
         Args:
             frames: [N_total, max_bars, F]
             frame_mask: [N_total, max_bars]
             ticker_ids: [N_total, max_bars] optional
+            chunk_size: frames per Transformer chunk (reduces VRAM)
 
         Returns:
             dict with 'vix_pred' [1] and 'mamba_hidden' [1, T, D]
         """
-        # Level 0: encode all frames
-        frame_emb = self.encode_frames(frames, frame_mask, ticker_ids)  # [N, hidden_dim]
+        # Level 0: encode frames in chunks (VRAM efficient)
+        frame_emb = self.encode_frames_chunked(
+            frames, frame_mask, ticker_ids, chunk_size=chunk_size
+        )  # [N, hidden_dim]
 
         # Project to Mamba dim
         x = self.proj(frame_emb)  # [N, d_model]
