@@ -153,22 +153,22 @@ fi
 
 # Install causal-conv1d and mamba_ssm based on GPU
 if [ -n "$CUDA_HOME" ] && [ -n "$GPU_COMPUTE_CAP" ]; then
-    # Check if RTX 5080/Blackwell (sm_120 = compute capability 12.0)
-    if [[ "$GPU_COMPUTE_CAP" == "(12, 0)" ]]; then
-        echo "🚀 RTX 5080/Blackwell detected - installing custom sm_120 versions..."
-        
-        echo "🔧 Installing causal-conv1d (sm_120)..."
-        cd "$PROJECT_DIR/custom_packages/causal-conv1d-sm120"
-        pip install -e . --no-build-isolation
-        
-        echo "🐍 Installing mamba_ssm (Blackwell)..."
-        cd "$PROJECT_DIR/custom_packages/mamba_blackwell"
-        pip install -e . --no-build-isolation
-    else
-        echo "📦 Standard GPU detected - installing PyPI versions..."
-        pip install causal-conv1d>=1.4.0
-        pip install mamba-ssm
-    fi
+    # Always use custom packages for CUDA GPUs (supports sm_80 A100 and sm_120 Blackwell)
+    echo "🚀 GPU detected - installing custom mamba packages..."
+    
+    # Clean any existing PyPI versions first
+    pip uninstall -y mamba-ssm causal-conv1d 2>/dev/null || true
+    rm -rf "$VENV_PATH/lib/python3.11/site-packages/mamba_ssm"* 2>/dev/null || true
+    rm -rf "$VENV_PATH/lib/python3.11/site-packages/selective_scan_cuda"* 2>/dev/null || true
+    rm -rf "$VENV_PATH/lib/python3.11/site-packages/causal_conv1d"* 2>/dev/null || true
+    
+    echo "🔧 Installing causal-conv1d from custom package..."
+    cd "$PROJECT_DIR/custom_packages/causal-conv1d-sm120"
+    pip install -e . --no-build-isolation --force-reinstall
+    
+    echo "🐍 Installing mamba_ssm from custom package..."
+    cd "$PROJECT_DIR/custom_packages/mamba_blackwell"
+    pip install -e . --no-build-isolation --force-reinstall
 else
     echo "⚠️  No CUDA - skipping causal-conv1d and mamba_ssm"
 fi
