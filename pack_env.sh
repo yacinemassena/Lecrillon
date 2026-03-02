@@ -90,7 +90,7 @@ except Exception as e:
     sys.exit(1)
 EOF
 
-python3 "$PROJECT_DIR/upload_env.py" "$TAR_FILEPATH"
+"$VENV_PATH/bin/python" "$PROJECT_DIR/upload_env.py" "$TAR_FILEPATH"
 rm "$PROJECT_DIR/upload_env.py"
 
 echo "🎉 All done! You can now use the pre-packaged environment on new VPS instances."
