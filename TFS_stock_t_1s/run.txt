@@ -1,0 +1,39 @@
+### Activate Virtual Environment
+tcnvenv\Scripts\activate
+
+### Deactivate
+deactivate
+
+### Verify CUDA sm_120 support
+tcnvenv\Scripts\python.exe -c "import torch; print('PyTorch:', torch.__version__); print('CUDA:', torch.cuda.is_available()); print('Device:', torch.cuda.get_device_name(0)); print('Capability:', torch.cuda.get_device_capability(0))"
+
+### Run Training Commands (GPU)
+
+# Train INDEX stream on RTX 5080 GPU
+tcnvenv\Scripts\python.exe pretrain_tcn_rv.py --profile rtx5080 --stream index
+
+# Train STOCKS stream on RTX 5080 (filtered top 100)
+tcnvenv\Scripts\python.exe pretrain_tcn_rv.py --profile rtx5080 --stream stocks
+
+# Train OPTIONS stream on RTX 5080
+tcnvenv\Scripts\python.exe pretrain_tcn_rv.py --profile rtx5080 --stream options
+
+# Override epochs
+tcnvenv\Scripts\python.exe pretrain_tcn_rv.py --profile rtx5080 --stream index --epochs 10
+
+# Override RV file path
+tcnvenv\Scripts\python.exe pretrain_tcn_rv.py --profile rtx5080 --stream index --rv_file "path/to/rv.parquet"
+
+VPS SETUP 
+
+# 1. Setup (checks what's available)
+bash setup_vps.sh
+
+# 2. If data missing, download specific stream
+python check_data_availability.py --download --stream index
+
+# 3. Or download all available from R2
+python check_data_availability.py --download
+
+# 4. Train on available stream
+python pretrain_tcn_rv.py --stream index --profile h100
