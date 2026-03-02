@@ -110,6 +110,13 @@ echo "🔌 Activating venv..."
 source "$VENV_PATH/bin/activate"
 echo "✅ venv activated: $VENV_PATH"
 
+# Set pip cache to /workspace to avoid filling overlay
+if [ -d "/workspace" ]; then
+    export PIP_CACHE_DIR="/workspace/.pip-cache"
+    mkdir -p "$PIP_CACHE_DIR"
+    echo "📦 Using pip cache: $PIP_CACHE_DIR"
+fi
+
 echo "📦 Installing Python packages..."
 pip install --upgrade pip setuptools wheel ninja packaging
 
