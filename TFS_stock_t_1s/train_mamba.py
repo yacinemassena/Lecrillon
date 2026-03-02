@@ -177,6 +177,7 @@ def train_epoch(
     start_time = datetime.datetime.now()
 
     for step_idx in pbar:
+        t_data_start = time.time()
         try:
             batch = next(loader_iter)
         except StopIteration:
@@ -186,22 +187,29 @@ def train_epoch(
             except StopIteration:
                 logger.error("Dataset exhausted. Check data paths and split dates.")
                 break
+        t_data = time.time() - t_data_start
 
         # Move to device
+        t_gpu_start = time.time()
         frames = batch.frames.to(device, non_blocking=True)
         frame_mask = batch.frame_mask.to(device, non_blocking=True)
         ticker_ids = batch.ticker_ids.to(device, non_blocking=True) if batch.ticker_ids is not None else None
         target = batch.vix_target.to(device, non_blocking=True)
+        t_gpu = time.time() - t_gpu_start
 
         num_samples += 1
 
+        t_fwd_start = time.time()
         with torch.autocast(device_type='cuda', dtype=amp_dtype, enabled=config.train.amp):
             # Use larger chunk_size and disable checkpointing for speed
             outputs = model(frames, frame_mask, ticker_ids, chunk_size=128)
             pred = outputs['vix_pred']
             loss = criterion(pred, target) / grad_accum
+        t_fwd = time.time() - t_fwd_start
 
+        t_bwd_start = time.time()
         scaler.scale(loss).backward()
+        t_bwd = time.time() - t_bwd_start
 
         if (step_idx + 1) % grad_accum == 0:
             scaler.unscale_(optimizer)
@@ -222,6 +230,9 @@ def train_epoch(
             'pred': f'{pred.item():.2f}',
             'tgt': f'{target.item():.2f}',
             'lr': f'{optimizer.param_groups[0]["lr"]:.2e}',
+            'data': f'{t_data:.1f}s',
+            'fwd': f'{t_fwd:.1f}s',
+            'bwd': f'{t_bwd:.1f}s',
         })
 
     elapsed = (datetime.datetime.now() - start_time).total_seconds()
