@@ -97,6 +97,12 @@ $SUDO apt-get install -y $APT_OPTS \
     python3.11-distutils \
     python3-pip
 
+echo "🧹 Cleaning up pre-installed PyTorch (RunPod compatibility)..."
+# Remove any system-wide PyTorch installations that might conflict
+pip3 uninstall -y torch torchvision torchaudio 2>/dev/null || true
+python3 -m pip uninstall -y torch torchvision torchaudio 2>/dev/null || true
+python3.11 -m pip uninstall -y torch torchvision torchaudio 2>/dev/null || true
+
 echo "🐍 Checking for pre-packaged environment in R2..."
 # Quick python script to check and download from R2
 cat > "$PROJECT_DIR/download_env.py" << 'EOF'
