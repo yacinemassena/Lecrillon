@@ -3,7 +3,7 @@ df -h
 
 # 2. Clone repo to /workspace
 cd /workspace
-git clone https://github.com/yacinemassena/Lecrillon.git
+git clone https://github.com/yacinedaoud/mamba-vix-training.git
 cd Lecrillon
 
 # 3. Run setup script
