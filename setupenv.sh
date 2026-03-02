@@ -32,7 +32,7 @@ append_if_missing() {
 export DEBIAN_FRONTEND=noninteractive
 export TORCH_CUDA_ARCH_LIST="8.0;8.6;8.9;9.0;12.0"
 export FORCE_CUDA=1
-export MAX_JOBS=12
+export MAX_JOBS=$(nproc)
 
 # CUDA Exports for current session
 export PATH=/usr/local/cuda-12.8/bin:$PATH
@@ -46,7 +46,7 @@ append_if_missing 'export LD_LIBRARY_PATH=/usr/local/cuda-12.8/lib64:$LD_LIBRARY
 append_if_missing 'export CUDA_HOME=/usr/local/cuda-12.8' "$BASHRC"
 append_if_missing 'export TORCH_CUDA_ARCH_LIST="8.0;8.6;8.9;9.0;12.0"' "$BASHRC"
 append_if_missing 'export FORCE_CUDA=1' "$BASHRC"
-append_if_missing 'export MAX_JOBS=12' "$BASHRC"
+append_if_missing 'export MAX_JOBS=$(nproc)' "$BASHRC"
 
 echo "📦 Installing system dependencies..."
 sudo apt-get update
