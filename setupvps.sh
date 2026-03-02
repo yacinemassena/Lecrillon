@@ -52,9 +52,17 @@ if [ -n "$CUDA_HOME" ]; then
     append_if_missing 'export FORCE_CUDA=1' "$BASHRC"
 fi
 
+# Detect if running as root (Docker) or regular user
+if [ "$EUID" -eq 0 ]; then
+    SUDO=""
+    echo "📦 Running as root (Docker container detected)"
+else
+    SUDO="sudo"
+fi
+
 echo "📦 Installing system dependencies..."
-sudo apt-get update
-sudo apt-get install -y \
+$SUDO apt-get update
+$SUDO apt-get install -y \
     software-properties-common \
     gnupg \
     ca-certificates \
@@ -67,12 +75,12 @@ sudo apt-get install -y \
 
 echo "🐍 Adding deadsnakes PPA for Python 3.11..."
 if ! grep -q "^deb .*deadsnakes/ppa" /etc/apt/sources.list /etc/apt/sources.list.d/* 2>/dev/null; then
-    sudo add-apt-repository ppa:deadsnakes/ppa -y
-    sudo apt-get update
+    $SUDO add-apt-repository ppa:deadsnakes/ppa -y
+    $SUDO apt-get update
 fi
 
 echo "🔧 Installing Python 3.11 and build tools..."
-sudo apt-get install -y \
+$SUDO apt-get install -y \
     python3.11 \
     python3.11-dev \
     python3.11-venv \
