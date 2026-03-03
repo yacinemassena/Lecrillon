@@ -1,5 +1,5 @@
-# Mamba VIX Training Environment - CUDA 12.4
-FROM nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04
+# Mamba VIX Training Environment - CUDA 12.8 (sm_120 / RTX 5090 support)
+FROM nvidia/cuda:12.8.0-cudnn-devel-ubuntu22.04
 
 # Prevent interactive prompts during build
 ENV DEBIAN_FRONTEND=noninteractive
@@ -42,8 +42,8 @@ RUN update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1
 # Upgrade pip
 RUN python3.11 -m pip install --upgrade pip setuptools wheel ninja packaging
 
-# Install PyTorch with CUDA 12.4 support
-RUN pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+# Install PyTorch nightly with CUDA 12.8 support (required for sm_120 / RTX 5090)
+RUN pip install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu128
 
 # Install core dependencies
 RUN pip install \
@@ -65,15 +65,15 @@ WORKDIR /workspace
 COPY custom_packages/causal-conv1d-sm120 /tmp/causal-conv1d-sm120
 COPY custom_packages/mamba_blackwell /tmp/mamba_blackwell
 
-# Build and install causal-conv1d
+# Build and install causal-conv1d (non-editable so it persists after cleanup)
 WORKDIR /tmp/causal-conv1d-sm120
-RUN pip install -e . --no-build-isolation --no-deps
+RUN pip install . --no-build-isolation --no-deps
 
-# Build and install mamba_ssm
+# Build and install mamba_ssm (non-editable so it persists after cleanup)
 WORKDIR /tmp/mamba_blackwell
-RUN pip install -e . --no-build-isolation --no-deps
+RUN pip install . --no-build-isolation --no-deps
 
-# Clean up build artifacts
+# Clean up build artifacts (packages are installed to site-packages, safe to delete source)
 RUN rm -rf /tmp/causal-conv1d-sm120 /tmp/mamba_blackwell
 
 # Set working directory back to /workspace
