@@ -33,7 +33,9 @@ cd /workspace
 git clone https://github.com/yacinemassena/Lecrillon.git
 cd Lecrillon
 python download_vix.py --vix-dir /workspace/datasets/VIX
-python smoke_mamba_only.py
+python download_data.py --year 2024 --data-type both --stock-dir /workspace/datasets/Stock_Data_1s --vix-dir /workspace/datasets/VIX
+
+python train.py
 No setup script needed!
 
 Option 2: setupvps.sh (Uses Pre-Built Wheels/Venv)
@@ -43,7 +45,8 @@ bash
 cd /workspace
 git clone https://github.com/yacinemassena/Lecrillon.git
 cd Lecrillon
-bash setupvps.sh  # Downloads pre-packaged venv from R2
-source venv/bin/activate
+bash setupvps.sh  # Downloads pre-packaged venv from R2 or builds from source
+source /workspace/venv/bin/activate
 python download_vix.py --vix-dir /workspace/datasets/VIX
-This will:
+python download_data.py --year 2024 --data-type both --stock-dir /workspace/datasets/Stock_Data_1s --vix-dir /workspace/datasets/VIX
+python train.py

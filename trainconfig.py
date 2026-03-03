@@ -10,7 +10,6 @@ from dataclasses import dataclass
 class TrainConfig:
     # Data settings
     seq_len: int = 351_000          # Max sequence length in 1-sec bars (~6 hours trading)
-    lookback_days: int = 15         # Days of historical data per sample
     
     # Training settings
     epochs: int = 50                # Number of training epochs
@@ -23,10 +22,6 @@ class TrainConfig:
     d_model: int = 256              # Model hidden dimension
     n_layers: int = 4               # Number of Mamba layers
     d_state: int = 64               # Mamba state dimension
-    
-    # Cache settings (for WSL/slow disk)
-    cache_gb: float = 80.0          # RAM cache size in GB
-    use_cache: bool = False         # Use chunked cache (set True for WSL)
     
     # Data source
     force_synthetic: bool = False   # Force synthetic data

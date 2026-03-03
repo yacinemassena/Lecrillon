@@ -6,8 +6,8 @@ No Transformer encoder.
 
 Usage:
     python train.py                    # default settings from trainconfig.py
-    python train.py --use-cache        # enable chunked cache (for WSL)
     python train.py --epochs 100       # override epochs
+    python train.py --seq-len 50000    # override sequence length
     
 Edit trainconfig.py to change default settings.
 """
@@ -377,11 +377,7 @@ def main():
     parser.add_argument('--d-model', type=int, default=cfg.d_model)
     parser.add_argument('--n-layers', type=int, default=cfg.n_layers)
     parser.add_argument('--d-state', type=int, default=cfg.d_state)
-    # lookback_days now auto-calculated from seq_len
-    parser.add_argument('--cache-gb', type=float, default=cfg.cache_gb,
-                        help='RAM cache size in GB')
-    parser.add_argument('--use-cache', action='store_true', default=cfg.use_cache,
-                        help='Use chunked RAM cache (for WSL/slow disk)')
+    # No caching - direct file loading
     parser.add_argument('--batch-size', type=int, default=cfg.batch_size,
                         help='Batch size for training')
     parser.add_argument('--num-workers', type=int, default=cfg.num_workers,
@@ -390,7 +386,7 @@ def main():
 
     # Start dashboard
     dashboard.start()
-    dashboard.log(f"[bold cyan]📦 RAM Cache:[/] {args.cache_gb:.1f} GB | Batch: {args.batch_size} | Workers: {args.num_workers}")
+    dashboard.log(f"[bold cyan]📦 Config:[/] Batch: {args.batch_size} | Workers: {args.num_workers}")
     dashboard.log(f"[bold cyan]📊 Config:[/] Seq={args.seq_len:,} | Epochs={args.epochs}")
     dashboard.state.total_epochs = args.epochs
     dashboard.state.batch_size = args.batch_size
@@ -448,7 +444,7 @@ def main():
         collate_fn = SyntheticBarDataset.collate_fn
     else:
         dashboard.log("[green]Using REAL data[/]")
-        from loader.bar_mamba_dataset import BarMambaDataset, warm_cache
+        from loader.bar_mamba_dataset import BarMambaDataset
 
         stock_path = str(data_paths['stock'])
         vix_path = str(data_paths['vix'])
@@ -460,8 +456,6 @@ def main():
             max_total_bars=args.seq_len,
             train_end='2023-11-30',
             val_end='2024-12-31',
-            cache_gb=args.cache_gb,
-            use_chunked_cache=args.use_cache,
         )
         val_dataset = BarMambaDataset(
             stock_data_path=stock_path,
@@ -470,25 +464,19 @@ def main():
             max_total_bars=args.seq_len,
             train_end='2023-11-30',
             val_end='2024-12-31',
-            cache_gb=args.cache_gb,
         )
         num_features = train_dataset.num_features
         collate_fn = BarMambaDataset.collate_fn
 
-    # Cache is incompatible with multiprocessing - force num_workers=0 when using cache
-    effective_workers = 0 if args.use_cache else args.num_workers
-    if args.use_cache and args.num_workers > 0:
-        dashboard.log("[yellow]⚠ Cache enabled: forcing num_workers=0 (cache is single-process)[/]")
-    
     train_loader = DataLoader(
         train_dataset, batch_size=args.batch_size, shuffle=False,
-        num_workers=effective_workers, collate_fn=collate_fn, pin_memory=True,
-        persistent_workers=(effective_workers > 0),
+        num_workers=args.num_workers, collate_fn=collate_fn, pin_memory=True,
+        persistent_workers=(args.num_workers > 0),
     )
     val_loader = DataLoader(
         val_dataset, batch_size=args.batch_size, shuffle=False,
-        num_workers=effective_workers, collate_fn=collate_fn, pin_memory=True,
-        persistent_workers=(effective_workers > 0),
+        num_workers=args.num_workers, collate_fn=collate_fn, pin_memory=True,
+        persistent_workers=(args.num_workers > 0),
     )
 
     # Build model
