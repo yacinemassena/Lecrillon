@@ -39,6 +39,12 @@ class DatasetConfig:
     # Streaming  # ADD
     num_workers: int = 4
 
+    # RAM Caching (async prefetch)
+    enable_ram_cache: bool = True
+    ram_cache_gb: float = 80.0        # Max GB for file cache
+    prefetch_files: int = 10          # How many files to prefetch ahead
+    cache_evict_behind: int = 2       # Keep N files behind current position
+
     def __post_init__(self):
         import platform
         # Convert Windows paths to WSL if on Linux

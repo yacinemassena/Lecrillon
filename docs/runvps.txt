@@ -1,0 +1,49 @@
+cd /workspace
+git clone https://github.com/yacinemassena/Lecrillon.git
+cd Lecrillon
+
+# Download data
+python download_vix.py --vix-dir /workspace/datasets/VIX
+python download_data.py --year 2024 --data-type stock --stock-dir /workspace/datasets/Stock_Data_1s
+
+# Run smoke test
+python smoke_mamba_only.py --train-steps 20 --val-steps 5 --epochs 1
+
+
+
+
+
+Option 1: Docker (Fastest - What You Just Set Up)
+On RunPod:
+
+bash
+# In pod creation UI, just enter:
+Container Image: yacinedaoud/mamba-vix-training:latest
+That's it! The environment is 100% ready:
+
+✅ PyTorch cu124 installed
+✅ mamba_ssm compiled
+✅ causal-conv1d compiled
+✅ All dependencies installed
+✅ CUDA 12.4 configured
+When pod starts, just:
+
+bash
+cd /workspace
+git clone https://github.com/yacinemassena/Lecrillon.git
+cd Lecrillon
+python download_vix.py --vix-dir /workspace/datasets/VIX
+python smoke_mamba_only.py
+No setup script needed!
+
+Option 2: setupvps.sh (Uses Pre-Built Wheels/Venv)
+On RunPod (without Docker):
+
+bash
+cd /workspace
+git clone https://github.com/yacinemassena/Lecrillon.git
+cd Lecrillon
+bash setupvps.sh  # Downloads pre-packaged venv from R2
+source venv/bin/activate
+python download_vix.py --vix-dir /workspace/datasets/VIX
+This will:

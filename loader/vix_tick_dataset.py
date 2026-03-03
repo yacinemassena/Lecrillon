@@ -1,9 +1,12 @@
 """
 VIX Tick-based Dataset with Chunking and Scalars.
 Yields packed tensors for efficient GPU processing.
+
+Features async RAM caching with smart prefetch/eviction.
 """
 
 import os
+import sys
 import gzip
 import torch
 import pandas as pd
@@ -12,6 +15,220 @@ from pathlib import Path
 from typing import Dict, List, Iterator, Optional, Tuple
 from torch.utils.data import IterableDataset, get_worker_info
 import logging
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from collections import OrderedDict
+import time
+
+
+class AsyncFileCache:
+    """
+    Async file cache with background prefetching and smart eviction.
+    
+    - Prefetches upcoming files in background threads
+    - Evicts old files when moving forward through dataset
+    - Never blocks training (async I/O)
+    """
+    
+    def __init__(self, max_gb: float = 100.0, prefetch_count: int = 10, 
+                 evict_behind: int = 2, num_threads: int = 4):
+        self.max_bytes = int(max_gb * 1024**3)
+        self.prefetch_count = prefetch_count
+        self.evict_behind = evict_behind
+        
+        self._cache: OrderedDict[str, pd.DataFrame] = OrderedDict()
+        self._cache_sizes: Dict[str, int] = {}
+        self._current_bytes = 0
+        self._lock = threading.RLock()
+        
+        self._executor = ThreadPoolExecutor(max_workers=num_threads)
+        self._pending_fetches: Dict[str, bool] = {}
+        self._file_list: List[Path] = []
+        self._current_index = 0
+        
+        self.logger = logging.getLogger(__name__)
+        self._stats = {'hits': 0, 'misses': 0, 'prefetches': 0, 'evictions': 0}
+    
+    def set_file_list(self, files: List[Path]):
+        """Set the ordered list of files for prefetching."""
+        with self._lock:
+            self._file_list = files
+            self._current_index = 0
+    
+    def _estimate_df_size(self, df: pd.DataFrame) -> int:
+        """Estimate DataFrame memory usage in bytes."""
+        return df.memory_usage(deep=True).sum()
+    
+    def _load_file(self, file_path: Path) -> Optional[pd.DataFrame]:
+        """Load a file from disk (called in background thread)."""
+        try:
+            if file_path.suffix.endswith('gz'):
+                with gzip.open(file_path, 'rt') as f:
+                    df = pd.read_csv(f)
+            elif file_path.suffix == '.parquet':
+                df = pd.read_parquet(file_path)
+            else:
+                df = pd.read_csv(file_path)
+            return df
+        except Exception as e:
+            self.logger.warning(f"Cache: Failed to load {file_path.name}: {e}")
+            return None
+    
+    def _prefetch_file(self, file_path: Path):
+        """Background prefetch a file into cache."""
+        key = str(file_path)
+        
+        with self._lock:
+            if key in self._cache or key in self._pending_fetches:
+                return
+            self._pending_fetches[key] = True
+        
+        df = self._load_file(file_path)
+        
+        with self._lock:
+            self._pending_fetches.pop(key, None)
+            if df is not None and key not in self._cache:
+                size = self._estimate_df_size(df)
+                
+                # Evict if needed to make room
+                while self._current_bytes + size > self.max_bytes and self._cache:
+                    oldest_key, _ = self._cache.popitem(last=False)
+                    evicted_size = self._cache_sizes.pop(oldest_key, 0)
+                    self._current_bytes -= evicted_size
+                    self._stats['evictions'] += 1
+                
+                if self._current_bytes + size <= self.max_bytes:
+                    self._cache[key] = df
+                    self._cache_sizes[key] = size
+                    self._current_bytes += size
+                    self._stats['prefetches'] += 1
+    
+    def _trigger_prefetch(self, current_idx: int):
+        """Trigger async prefetch of upcoming files."""
+        if not self._file_list:
+            return
+            
+        # Prefetch next N files
+        for i in range(1, self.prefetch_count + 1):
+            next_idx = current_idx + i
+            if next_idx < len(self._file_list):
+                self._executor.submit(self._prefetch_file, self._file_list[next_idx])
+    
+    def _evict_old_files(self, current_idx: int):
+        """Evict files that are far behind current position."""
+        if not self._file_list or current_idx <= self.evict_behind:
+            return
+            
+        # Files to keep: from (current - evict_behind) to end
+        keep_start = max(0, current_idx - self.evict_behind)
+        keep_keys = {str(self._file_list[i]) for i in range(keep_start, len(self._file_list))}
+        
+        with self._lock:
+            keys_to_remove = [k for k in self._cache.keys() if k not in keep_keys]
+            for key in keys_to_remove:
+                if key in self._cache:
+                    del self._cache[key]
+                    evicted_size = self._cache_sizes.pop(key, 0)
+                    self._current_bytes -= evicted_size
+                    self._stats['evictions'] += 1
+    
+    def get(self, file_path: Path, file_index: int = -1) -> Optional[pd.DataFrame]:
+        """
+        Get a file from cache or load it.
+        
+        Args:
+            file_path: Path to the file
+            file_index: Current position in file list (for prefetch/evict)
+            
+        Returns:
+            DataFrame or None if load failed
+        """
+        key = str(file_path)
+        
+        # Update current index for prefetch logic
+        if file_index >= 0:
+            self._current_index = file_index
+            # Trigger async prefetch of upcoming files
+            self._trigger_prefetch(file_index)
+            # Evict old files we're done with
+            self._evict_old_files(file_index)
+        
+        with self._lock:
+            if key in self._cache:
+                self._stats['hits'] += 1
+                # Move to end (most recently used)
+                self._cache.move_to_end(key)
+                return self._cache[key]
+        
+        # Cache miss - load synchronously
+        self._stats['misses'] += 1
+        df = self._load_file(file_path)
+        
+        if df is not None:
+            with self._lock:
+                size = self._estimate_df_size(df)
+                
+                # Evict if needed
+                while self._current_bytes + size > self.max_bytes and self._cache:
+                    oldest_key, _ = self._cache.popitem(last=False)
+                    evicted_size = self._cache_sizes.pop(oldest_key, 0)
+                    self._current_bytes -= evicted_size
+                    self._stats['evictions'] += 1
+                
+                if self._current_bytes + size <= self.max_bytes:
+                    self._cache[key] = df
+                    self._cache_sizes[key] = size
+                    self._current_bytes += size
+        
+        return df
+    
+    def get_stats(self) -> Dict:
+        """Return cache statistics."""
+        with self._lock:
+            return {
+                **self._stats,
+                'cached_files': len(self._cache),
+                'cache_mb': self._current_bytes / (1024**2),
+                'hit_rate': self._stats['hits'] / max(1, self._stats['hits'] + self._stats['misses'])
+            }
+    
+    def clear(self):
+        """Clear the cache."""
+        with self._lock:
+            self._cache.clear()
+            self._cache_sizes.clear()
+            self._current_bytes = 0
+    
+    def shutdown(self):
+        """Shutdown the executor."""
+        self._executor.shutdown(wait=False)
+
+
+# Global cache instance (shared across dataset instances in same process)
+_global_cache: Optional[AsyncFileCache] = None
+_cache_lock = threading.Lock()
+
+
+def get_file_cache(config) -> Optional[AsyncFileCache]:
+    """Get or create the global file cache."""
+    global _global_cache
+    
+    if not config.dataset.enable_ram_cache:
+        return None
+        
+    with _cache_lock:
+        if _global_cache is None:
+            _global_cache = AsyncFileCache(
+                max_gb=config.dataset.ram_cache_gb,
+                prefetch_count=config.dataset.prefetch_files,
+                evict_behind=config.dataset.cache_evict_behind,
+                num_threads=max(2, config.dataset.num_workers)
+            )
+            logging.getLogger(__name__).info(
+                f"Initialized async file cache: {config.dataset.ram_cache_gb}GB, "
+                f"prefetch={config.dataset.prefetch_files}, evict_behind={config.dataset.cache_evict_behind}"
+            )
+        return _global_cache
 
 
 class VIXTickDataset(IterableDataset):
@@ -22,6 +239,7 @@ class VIXTickDataset(IterableDataset):
     - 15s fixed-interval frames
     - No truncation: ticks split into chunks
     - Per-frame scalars: n_ticks, notional, vol
+    - Async RAM caching with prefetch/eviction
     - Packed tensor output
     """
     
@@ -54,6 +272,10 @@ class VIXTickDataset(IterableDataset):
             # Avoid division by zero
             self.norm_iqr[self.norm_iqr == 0] = 1.0
 
+        # Async RAM cache
+        self._file_cache = get_file_cache(config)
+        self._split_files: Optional[List[Path]] = None
+        self._file_index_map: Dict[str, int] = {}
         
     def _parse_data_sources(self) -> Dict[str, List[Path]]:
         """Parse data source paths from config."""
@@ -239,8 +461,22 @@ class VIXTickDataset(IterableDataset):
         if worker_info is None: return files
         return files[worker_info.id::worker_info.num_workers]
 
-    def _load_tick_data(self, file_path: Path) -> pd.DataFrame:
-        """Load tick data."""
+    def _load_tick_data(self, file_path: Path, file_index: int = -1) -> pd.DataFrame:
+        """
+        Load tick data, using async cache if enabled.
+        
+        Args:
+            file_path: Path to the file
+            file_index: Position in file list (for cache prefetch/evict)
+        """
+        # Use cache if available
+        if self._file_cache is not None:
+            df = self._file_cache.get(file_path, file_index)
+            if df is not None:
+                return df.copy()  # Return copy to avoid mutation
+            return pd.DataFrame()
+        
+        # Fallback: direct load
         try:
             if file_path.suffix.endswith('gz'):
                 with gzip.open(file_path, 'rt') as f: df = pd.read_csv(f)
@@ -418,12 +654,16 @@ class VIXTickDataset(IterableDataset):
             
         return df
 
-    def _generate_frames_from_file(self, file_path: Path) -> Iterator[Tuple]:
+    def _generate_frames_from_file(self, file_path: Path, file_index: int = -1) -> Iterator[Tuple]:
         """
         Yields frames one by one from a file.
         Returns: (chunks, weights, scalars, bin_time, ticker_id, rv_target)
+        
+        Args:
+            file_path: Path to the file
+            file_index: Position in file list (for cache prefetch/evict)
         """
-        df = self._load_tick_data(file_path)
+        df = self._load_tick_data(file_path, file_index)
         if df.empty: 
             return
 
@@ -592,3 +832,56 @@ class VIXTickDataset(IterableDataset):
             'target': torch.stack(batch_targets),
             'num_frames': total_frames
         }
+
+    def __iter__(self) -> Iterator[Dict]:
+        """
+        Iterate over the dataset, yielding packed samples.
+        
+        Uses async RAM cache with prefetch/eviction for fast I/O.
+        """
+        # Get files for this split
+        files = self._files_for_split()
+        if not files:
+            self.logger.warning(f"No files found for split '{self.split}'")
+            return
+        
+        # Shard across workers
+        files = self._shard_files(files)
+        if not files:
+            return
+            
+        # Initialize cache with file list for prefetching
+        if self._file_cache is not None:
+            self._file_cache.set_file_list(files)
+            # Log cache stats periodically
+            self.logger.info(f"Cache initialized with {len(files)} files for split '{self.split}'")
+        
+        # Build file index map for cache prefetch
+        self._file_index_map = {str(f): i for i, f in enumerate(files)}
+        
+        # Stream through files
+        buffer = []
+        
+        for file_idx, file_path in enumerate(files):
+            # Generate frames from this file (with file index for cache)
+            for frame_data in self._generate_frames_from_file(file_path, file_idx):
+                buffer.append(frame_data)
+                
+                # When buffer reaches num_frames, yield a sample
+                if len(buffer) >= self.num_frames:
+                    yield self._pack_sample(buffer[:self.num_frames])
+                    # Sliding window: keep last half for overlap
+                    buffer = buffer[self.num_frames // 2:]
+        
+        # Yield remaining if any
+        if len(buffer) >= self.num_frames // 2:
+            yield self._pack_sample(buffer)
+        
+        # Log cache stats at end
+        if self._file_cache is not None:
+            stats = self._file_cache.get_stats()
+            self.logger.info(
+                f"Cache stats: hits={stats['hits']}, misses={stats['misses']}, "
+                f"hit_rate={stats['hit_rate']:.2%}, cached={stats['cached_files']} files, "
+                f"size={stats['cache_mb']:.1f}MB"
+            )
