@@ -370,8 +370,7 @@ class BarMambaDataset(IterableDataset):
         vix_data_path: str,
         split: str = 'train',
         features: Optional[List[str]] = None,
-        lookback_days: int = 15,
-        max_bars_per_day: int = 5000,
+        max_bars_per_day: int = 23400,
         max_total_bars: int = 50000,
         train_end: str = '2023-11-30',
         val_end: str = '2024-12-31',
@@ -386,9 +385,12 @@ class BarMambaDataset(IterableDataset):
         self.split = split
         self.features = features or DEFAULT_FEATURES
         self.num_features = len(self.features)
-        self.lookback_days = lookback_days
         self.max_bars_per_day = max_bars_per_day
         self.max_total_bars = max_total_bars
+        
+        # Calculate days needed based on seq_len (~23,400 bars per trading day)
+        bars_per_day = 23400
+        self.lookback_days = max(1, (max_total_bars // bars_per_day) + 1)
         self.vix_normalize = vix_normalize
         self.vix_mean = vix_mean
         self.vix_std = vix_std
@@ -398,9 +400,6 @@ class BarMambaDataset(IterableDataset):
         
         # Initialize async file cache
         self._file_cache = get_bar_cache(max_gb=cache_gb, prefetch_count=prefetch_files)
-        
-        # Preprocessed array cache (file_path -> numpy array) - avoids repeated pandas ops
-        self._array_cache: Dict[str, np.ndarray] = {}
 
         # Anchor dates always start at 2005
         self.anchor_start = pd.to_datetime('2005-01-01').date()
@@ -426,7 +425,7 @@ class BarMambaDataset(IterableDataset):
         self.anchor_dates = self._build_anchor_dates()
         logger.info(
             f"BarMambaDataset [{split}]: {len(self.anchor_dates)} samples, "
-            f"lookback={lookback_days}d, features={self.num_features}"
+            f"seq={max_total_bars} (~{self.lookback_days}d), features={self.num_features}"
         )
     
     def warm_dataset_cache(self):
@@ -556,10 +555,6 @@ class BarMambaDataset(IterableDataset):
         """
         key = str(file_path)
         
-        # Check preprocessed array cache first (instant)
-        if key in self._array_cache:
-            return self._array_cache[key]
-        
         # Get DataFrame from file cache (Polars)
         df = self._file_cache.get(file_path, file_index)
         if df is None:
@@ -595,9 +590,8 @@ class BarMambaDataset(IterableDataset):
         if len(features) > self.max_bars_per_day:
             features = features[:self.max_bars_per_day]
         
-        # Cache preprocessed array for next access
-        self._array_cache[key] = features
-
+        # Don't cache numpy arrays - they duplicate memory from DataFrame cache
+        # The DataFrame cache already handles size limits
         return features
 
     def _normalize_bars(self, bars: np.ndarray) -> np.ndarray:
@@ -633,10 +627,13 @@ class BarMambaDataset(IterableDataset):
         # Use chunked cache or full shuffle
         if self.use_chunked_cache:
             # Chunked cache mode: load files in chunks, shuffle within chunks
-            # Estimate: 50GB cache / 600MB per file = ~85 files
-            # Each sample needs ~15 files, so ~5-6 samples per chunk
-            samples_per_cache = max(5, int(self.cache_gb * 1024 / 600 / self.lookback_days))
-            logger.info(f"Chunked cache: {samples_per_cache} samples per chunk")
+            # Each file is ~600MB, so 60GB cache fits ~100 files
+            # Each sample needs lookback_days files (e.g. 15)
+            # With sorted samples, adjacent samples share most files
+            # So samples_per_chunk = files_per_cache (files overlap heavily)
+            files_per_cache = int(self.cache_gb * 1024 / 600)
+            samples_per_cache = max(10, files_per_cache)
+            logger.info(f"Chunked cache: {samples_per_cache} samples per chunk (~{files_per_cache} files max)")
             chunk_iter = range(0, len(all_indices), samples_per_cache)
         else:
             # Full shuffle mode: shuffle all samples, use async prefetch
@@ -666,32 +663,22 @@ class BarMambaDataset(IterableDataset):
             # Warm cache for this chunk (only if using chunked cache)
             if self.use_chunked_cache:
                 from tqdm import tqdm
-                from concurrent.futures import as_completed
                 logger.info(f"Loading chunk {chunk_start//samples_per_cache + 1}: {len(chunk_files)} files")
                 
-                # Submit all files to thread pool for parallel loading
-                futures = {self._file_cache._executor.submit(self._file_cache._load_file, f): f 
-                          for f in chunk_files}
-                
+                # Load files sequentially with strict size check
                 loaded = 0
-                for future in tqdm(as_completed(futures), total=len(futures), desc="Caching files", leave=False):
-                    f = futures[future]
-                    df = future.result()
+                for f in tqdm(chunk_files, desc="Caching files", leave=False):
+                    # Check size BEFORE loading
+                    if self._file_cache._current_bytes >= self._file_cache.max_bytes * 0.95:
+                        logger.info(f"Cache full at {self._file_cache._current_bytes / 1e9:.1f}GB after {loaded} files")
+                        break
+                    
+                    # Use get() which has built-in size enforcement
+                    df = self._file_cache.get(f)
                     if df is not None:
-                        # Add to cache
-                        key = str(f)
-                        with self._file_cache._lock:
-                            if key not in self._file_cache._cache:
-                                size = self._file_cache._estimate_df_size(df)
-                                if self._file_cache._current_bytes + size <= self._file_cache.max_bytes:
-                                    self._file_cache._cache[key] = df
-                                    self._file_cache._cache_sizes[key] = size
-                                    self._file_cache._current_bytes += size
-                                    loaded += 1
-                                else:
-                                    logger.info(f"Cache full after {loaded} files")
-                                    break
-                logger.info(f"Loaded {loaded}/{len(chunk_files)} files into cache")
+                        loaded += 1
+                
+                logger.info(f"Loaded {loaded}/{len(chunk_files)} files into cache ({self._file_cache._current_bytes / 1e9:.1f}GB)")
             
             # Shuffle samples within this chunk (only if using chunked cache)
             if self.split == 'train' and self.use_chunked_cache:
@@ -740,7 +727,6 @@ class BarMambaDataset(IterableDataset):
             # Clear cache after chunk (only if using chunked cache)
             if self.use_chunked_cache:
                 self._file_cache.clear()
-                self._array_cache.clear()
         
         # Log final stats
         stats = self._file_cache.get_stats()

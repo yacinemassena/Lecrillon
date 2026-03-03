@@ -275,9 +275,9 @@ def train_steps(model, loader, optimizer, criterion, scaler, device, num_steps,
         torch.cuda.synchronize()
         t_total = time.time() - t_start
 
-        # VRAM stats
+        # VRAM stats - use reserved memory which shows actual GPU allocation
         mem_alloc = torch.cuda.memory_allocated() / 1e9
-        mem_res = torch.cuda.max_memory_allocated() / 1e9
+        mem_reserved = torch.cuda.memory_reserved() / 1e9
 
         # Update dashboard with per-step timing
         step_display = f"E{epoch} Step {step + 1}"
@@ -289,7 +289,7 @@ def train_steps(model, loader, optimizer, criterion, scaler, device, num_steps,
             f"loss={step_loss:.4f} | seq={seq_len:,} | "
             f"data={t_data:.2f}s fwd={t_fwd:.2f}s bwd={t_bwd:.2f}s | "
             f"[cyan]{t_total:.2f}s/it[/] | "
-            f"VRAM={mem_alloc:.1f}GB"
+            f"VRAM={mem_reserved:.1f}GB"
         )
 
     epoch_time = time.time() - epoch_start_time
@@ -377,7 +377,7 @@ def main():
     parser.add_argument('--d-model', type=int, default=cfg.d_model)
     parser.add_argument('--n-layers', type=int, default=cfg.n_layers)
     parser.add_argument('--d-state', type=int, default=cfg.d_state)
-    parser.add_argument('--lookback-days', type=int, default=cfg.lookback_days)
+    # lookback_days now auto-calculated from seq_len
     parser.add_argument('--cache-gb', type=float, default=cfg.cache_gb,
                         help='RAM cache size in GB')
     parser.add_argument('--use-cache', action='store_true', default=cfg.use_cache,
@@ -391,7 +391,7 @@ def main():
     # Start dashboard
     dashboard.start()
     dashboard.log(f"[bold cyan]📦 RAM Cache:[/] {args.cache_gb:.1f} GB | Batch: {args.batch_size} | Workers: {args.num_workers}")
-    dashboard.log(f"[bold cyan]📊 Config:[/] Seq={args.seq_len:,} | Lookback={args.lookback_days}d | Epochs={args.epochs}")
+    dashboard.log(f"[bold cyan]📊 Config:[/] Seq={args.seq_len:,} | Epochs={args.epochs}")
     dashboard.state.total_epochs = args.epochs
     dashboard.state.batch_size = args.batch_size
 
@@ -457,7 +457,6 @@ def main():
             stock_data_path=stock_path,
             vix_data_path=vix_path,
             split='train',
-            lookback_days=args.lookback_days,
             max_total_bars=args.seq_len,
             train_end='2023-11-30',
             val_end='2024-12-31',
@@ -468,7 +467,6 @@ def main():
             stock_data_path=stock_path,
             vix_data_path=vix_path,
             split='val',
-            lookback_days=args.lookback_days,
             max_total_bars=args.seq_len,
             train_end='2023-11-30',
             val_end='2024-12-31',
