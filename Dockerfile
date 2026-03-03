@@ -49,6 +49,7 @@ RUN pip install --pre torch torchvision torchaudio --index-url https://download.
 RUN pip install \
     numpy \
     pandas \
+    polars \
     pyarrow \
     boto3 \
     tqdm \

@@ -227,8 +227,8 @@ else
 
     # Install PyTorch
     if [ -n "$CUDA_HOME" ]; then
-        echo "🔥 Installing PyTorch with CUDA 12.x support..."
-        pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+        echo "🔥 Installing PyTorch nightly with CUDA 12.8 support (sm_120 / RTX 5090)..."
+        pip install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu128
     else
         echo "💻 Installing PyTorch (CPU-only)..."
         pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
@@ -236,7 +236,7 @@ else
 
     # Install other dependencies
     echo "📦 Installing additional packages..."
-    pip install numpy pandas pyarrow boto3 tqdm einops triton transformers
+    pip install numpy pandas polars pyarrow boto3 tqdm einops triton transformers
 
     # Detect GPU compute capability
     GPU_COMPUTE_CAP=""
