@@ -382,6 +382,10 @@ def main():
                         help='Batch size for training')
     parser.add_argument('--num-workers', type=int, default=cfg.num_workers,
                         help='DataLoader workers for parallel data loading')
+    parser.add_argument('--train-end', type=str, default=cfg.train_end,
+                        help='End date for training data (YYYY-MM-DD)')
+    parser.add_argument('--val-end', type=str, default=cfg.val_end,
+                        help='End date for validation data (YYYY-MM-DD)')
     args = parser.parse_args()
 
     # Start dashboard
@@ -454,16 +458,16 @@ def main():
             vix_data_path=vix_path,
             split='train',
             max_total_bars=args.seq_len,
-            train_end='2023-11-30',
-            val_end='2024-12-31',
+            train_end=args.train_end,
+            val_end=args.val_end,
         )
         val_dataset = BarMambaDataset(
             stock_data_path=stock_path,
             vix_data_path=vix_path,
             split='val',
             max_total_bars=args.seq_len,
-            train_end='2023-11-30',
-            val_end='2024-12-31',
+            train_end=args.train_end,
+            val_end=args.val_end,
         )
         num_features = train_dataset.num_features
         collate_fn = BarMambaDataset.collate_fn
