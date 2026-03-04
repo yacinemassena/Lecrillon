@@ -9,6 +9,9 @@ Usage:
     python train.py --epochs 100       # override epochs
     python train.py --seq-len 50000    # override sequence length
     
+    # Multi-GPU training (6 GPUs)
+    torchrun --nproc_per_node=6 train.py --seq-len 15000
+    
 Edit trainconfig.py to change default settings.
 """
 
@@ -25,8 +28,10 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, IterableDataset
+from torch.utils.data import DataLoader, IterableDataset, DistributedSampler
 from torch.amp import autocast, GradScaler
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 from trainconfig import DEFAULT_CONFIG as cfg
 from dashboard import SimpleDashboard
@@ -43,6 +48,35 @@ logger = logging.getLogger(__name__)
 
 # Global dashboard instance
 dashboard = SimpleDashboard()
+
+# ---------------------------------------------------------------------------
+# Distributed Training Utilities
+# ---------------------------------------------------------------------------
+def setup_distributed():
+    """Initialize distributed training if launched with torchrun."""
+    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
+        rank = int(os.environ['RANK'])
+        world_size = int(os.environ['WORLD_SIZE'])
+        local_rank = int(os.environ.get('LOCAL_RANK', 0))
+        
+        dist.init_process_group(backend='nccl', rank=rank, world_size=world_size)
+        torch.cuda.set_device(local_rank)
+        
+        return rank, world_size, local_rank
+    return 0, 1, 0  # Single GPU fallback
+
+
+def cleanup_distributed():
+    """Clean up distributed training."""
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def is_main_process():
+    """Check if this is the main process (rank 0)."""
+    if dist.is_initialized():
+        return dist.get_rank() == 0
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -388,25 +422,36 @@ def main():
                         help='End date for validation data (YYYY-MM-DD)')
     args = parser.parse_args()
 
-    # Start dashboard
-    dashboard.start()
-    dashboard.log(f"[bold cyan]📦 Config:[/] Batch: {args.batch_size} | Workers: {args.num_workers}")
-    dashboard.log(f"[bold cyan]📊 Config:[/] Seq={args.seq_len:,} | Epochs={args.epochs}")
-    dashboard.state.total_epochs = args.epochs
-    dashboard.state.batch_size = args.batch_size
+    # Setup distributed training
+    rank, world_size, local_rank = setup_distributed()
+    is_distributed = world_size > 1
+    is_main = is_main_process()
 
-    seed_everything(42)
+    # Start dashboard (only on main process)
+    if is_main:
+        dashboard.start()
+        dashboard.log(f"[bold cyan]📦 Config:[/] Batch: {args.batch_size} | Workers: {args.num_workers}")
+        dashboard.log(f"[bold cyan]📊 Config:[/] Seq={args.seq_len:,} | Epochs={args.epochs}")
+        if is_distributed:
+            dashboard.log(f"[bold magenta]🚀 Distributed:[/] {world_size} GPUs")
+        dashboard.state.total_epochs = args.epochs
+        dashboard.state.batch_size = args.batch_size
+
+    seed_everything(42 + rank)  # Different seed per rank for data augmentation
 
     # Device
-    # device = torch.device('cpu')
-    # logger.info(f"Device: {device} (forced CPU due to sm_120 incompatibility)")
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    if torch.cuda.is_available():
-        gpu_name = torch.cuda.get_device_name(0)
-        vram_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
+    if is_distributed:
+        device = torch.device(f'cuda:{local_rank}')
+        torch.cuda.set_device(device)
+    else:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    if torch.cuda.is_available() and is_main:
+        gpu_name = torch.cuda.get_device_name(local_rank)
+        vram_gb = torch.cuda.get_device_properties(local_rank).total_memory / 1e9
         dashboard.log(f"[bold green]🖥️ Device:[/] {gpu_name} ({vram_gb:.1f}GB)")
         dashboard.state.vram_total = vram_gb
-    else:
+    elif is_main:
         dashboard.log(f"[yellow]🖥️ Device:[/] CPU")
 
     # Data source selection
@@ -416,19 +461,24 @@ def main():
     if not use_synthetic and not args.real:
         # Auto-detect
         if data_paths:
-            dashboard.log("[dim]Checking data availability...[/]")
+            if is_main:
+                dashboard.log("[dim]Checking data availability...[/]")
             try:
                 has_overlap = check_data_overlap(data_paths)
                 if not has_overlap:
-                    dashboard.log("[yellow]No stock-VIX overlap → synthetic data[/]")
+                    if is_main:
+                        dashboard.log("[yellow]No stock-VIX overlap → synthetic data[/]")
                     use_synthetic = True
                 else:
-                    dashboard.log("[green]✓ Real data available[/]")
+                    if is_main:
+                        dashboard.log("[green]✓ Real data available[/]")
             except Exception as e:
-                dashboard.log(f"[yellow]Data check failed: {e} → synthetic[/]")
+                if is_main:
+                    dashboard.log(f"[yellow]Data check failed: {e} → synthetic[/]")
                 use_synthetic = True
         else:
-            dashboard.log("[yellow]No data directory → synthetic data[/]")
+            if is_main:
+                dashboard.log("[yellow]No data directory → synthetic data[/]")
             use_synthetic = True
 
     if args.real and use_synthetic:
@@ -437,17 +487,22 @@ def main():
 
     # Build datasets
     num_features = 15
+    train_sampler = None
+    val_sampler = None
+    
     if use_synthetic:
-        dashboard.log(f"[yellow]Using SYNTHETIC data[/] (seq_len={args.seq_len})")
+        if is_main:
+            dashboard.log(f"[yellow]Using SYNTHETIC data[/] (seq_len={args.seq_len})")
         train_dataset = SyntheticBarDataset(
-            num_samples=50, seq_len=args.seq_len, num_features=num_features
+            num_samples=50 * world_size, seq_len=args.seq_len, num_features=num_features
         )
         val_dataset = SyntheticBarDataset(
-            num_samples=20, seq_len=args.seq_len, num_features=num_features
+            num_samples=20 * world_size, seq_len=args.seq_len, num_features=num_features
         )
         collate_fn = SyntheticBarDataset.collate_fn
     else:
-        dashboard.log("[green]Using REAL data[/]")
+        if is_main:
+            dashboard.log("[green]Using REAL data[/]")
         from loader.bar_mamba_dataset import BarMambaDataset
 
         stock_path = str(data_paths['stock'])
@@ -472,6 +527,9 @@ def main():
         num_features = train_dataset.num_features
         collate_fn = BarMambaDataset.collate_fn
 
+    # Note: DistributedSampler not used with IterableDataset
+    # For real distributed training with map-style datasets, add sampler here
+    
     train_loader = DataLoader(
         train_dataset, batch_size=args.batch_size, shuffle=False,
         num_workers=args.num_workers, collate_fn=collate_fn, pin_memory=True,
@@ -484,7 +542,8 @@ def main():
     )
 
     # Build model
-    dashboard.log(f"[dim]Building model: d={args.d_model}, layers={args.n_layers}, state={args.d_state}[/]")
+    if is_main:
+        dashboard.log(f"[dim]Building model: d={args.d_model}, layers={args.n_layers}, state={args.d_state}[/]")
 
     from mamba_only_model import MambaOnlyVIX
     model = MambaOnlyVIX(
@@ -499,6 +558,12 @@ def main():
         head_hidden=128,
     ).to(device)
 
+    # Wrap model in DDP for multi-GPU training
+    if is_distributed:
+        model = DDP(model, device_ids=[local_rank], output_device=local_rank)
+        if is_main:
+            dashboard.log(f"[dim]Model wrapped in DistributedDataParallel[/]")
+
     # Optimizer & loss
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-5)
     criterion = nn.HuberLoss(delta=1.0)
@@ -508,17 +573,23 @@ def main():
     use_scaler = amp_dtype == torch.float16
     scaler = GradScaler(enabled=use_scaler)
 
-    dashboard.log(f"[dim]AMP: {amp_dtype}[/]")
-    dashboard.log("─" * 50)
+    if is_main:
+        dashboard.log(f"[dim]AMP: {amp_dtype}[/]")
+        dashboard.log("─" * 50)
 
     # Training loop
     for epoch in range(args.epochs):
-        dashboard.state.epoch = epoch + 1
-        dashboard.log(f"\n[bold cyan]═══ Epoch {epoch+1}/{args.epochs} ═══[/]")
-        dashboard.state.step = 0
+        if is_main:
+            dashboard.state.epoch = epoch + 1
+            dashboard.log(f"\n[bold cyan]═══ Epoch {epoch+1}/{args.epochs} ═══[/]")
+            dashboard.state.step = 0
 
         if torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats()
+
+        # Sync all processes before epoch
+        if is_distributed:
+            dist.barrier()
 
         # Train
         train_loss, train_steps_count, avg_iter_time = train_steps(
@@ -526,86 +597,96 @@ def main():
             device, args.train_steps, amp_dtype, epoch=epoch+1,
         )
 
-        # Validate
-        val_metrics = val_steps(
-            model, val_loader, criterion, device,
-            args.val_steps, amp_dtype,
-        )
+        # Validate (only on main process)
+        if is_main:
+            val_metrics = val_steps(
+                model.module if is_distributed else model,
+                val_loader, criterion, device,
+                args.val_steps, amp_dtype,
+            )
 
-        # Memory stats
-        if torch.cuda.is_available():
-            mem_alloc = torch.cuda.max_memory_allocated() / 1e9
-            mem_res = torch.cuda.max_memory_reserved() / 1e9
-        else:
-            mem_alloc = mem_res = 0.0
+            # Memory stats
+            if torch.cuda.is_available():
+                mem_alloc = torch.cuda.max_memory_allocated() / 1e9
+                mem_res = torch.cuda.max_memory_reserved() / 1e9
+            else:
+                mem_alloc = mem_res = 0.0
 
-        dashboard.state.val_loss = val_metrics['loss']
-        dashboard.state.val_mae = val_metrics['mae']
-        dashboard.log(
-            f"[green]✓ Epoch {epoch+1}/{args.epochs}:[/] "
-            f"steps={train_steps_count} | "
-            f"loss={train_loss:.4f} | "
-            f"val_loss={val_metrics['loss']:.4f} | "
-            f"val_mae={val_metrics['mae']:.4f} | "
-            f"iter={avg_iter_time:.2f}s/it | "
-            f"VRAM={mem_alloc:.1f}GB"
-        )
+            dashboard.state.val_loss = val_metrics['loss']
+            dashboard.state.val_mae = val_metrics['mae']
+            dashboard.log(
+                f"[green]✓ Epoch {epoch+1}/{args.epochs}:[/] "
+                f"steps={train_steps_count} | "
+                f"loss={train_loss:.4f} | "
+                f"val_loss={val_metrics['loss']:.4f} | "
+                f"val_mae={val_metrics['mae']:.4f} | "
+                f"iter={avg_iter_time:.2f}s/it | "
+                f"VRAM={mem_alloc:.1f}GB"
+            )
 
-    # Final checks
-    dashboard.log("\n" + "═" * 50)
-    dashboard.log("[bold]VALIDATION CHECKS[/]")
-    dashboard.log("═" * 50)
-
+    # Final checks (only on main process)
     checks_passed = 0
     total_checks = 5
+    
+    if is_main:
+        dashboard.log("\n" + "═" * 50)
+        dashboard.log("[bold]VALIDATION CHECKS[/]")
+        dashboard.log("═" * 50)
 
-    # Check 1: Model has parameters
-    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    ok = n_params > 0
-    dashboard.log(f"  [{'[green]✓' if ok else '[red]✗'}] Model has {n_params:,} parameters[/]")
-    checks_passed += ok
+        # Get underlying model for DDP
+        eval_model = model.module if is_distributed else model
 
-    # Check 2: Forward pass produces output
-    model.eval()
-    with torch.no_grad():
-        dummy = torch.randn(1, 100, num_features).to(device)
-        out = model(dummy)
-        ok = 'vix_pred' in out and out['vix_pred'].shape == (1,)
-        dashboard.log(f"  [{'[green]✓' if ok else '[red]✗'}] Forward pass correct[/]")
+        # Check 1: Model has parameters
+        n_params = sum(p.numel() for p in eval_model.parameters() if p.requires_grad)
+        ok = n_params > 0
+        dashboard.log(f"  [{'[green]✓' if ok else '[red]✗'}] Model has {n_params:,} parameters[/]")
         checks_passed += ok
 
-    # Check 3: Backward pass works
-    model.train()
-    dummy = torch.randn(1, 100, num_features, device=device, requires_grad=False)
-    out = model(dummy)
-    loss = out['vix_pred'].sum()
-    loss.backward()
-    has_grads = any(p.grad is not None and p.grad.abs().sum() > 0
-                    for p in model.parameters())
-    dashboard.log(f"  [{'[green]✓' if has_grads else '[red]✗'}] Gradients flow[/]")
-    checks_passed += has_grads
+        # Check 2: Forward pass produces output
+        eval_model.eval()
+        with torch.no_grad():
+            dummy = torch.randn(1, 100, num_features).to(device)
+            out = eval_model(dummy)
+            ok = 'vix_pred' in out and out['vix_pred'].shape == (1,)
+            dashboard.log(f"  [{'[green]✓' if ok else '[red]✗'}] Forward pass correct[/]")
+            checks_passed += ok
 
-    # Check 4: Loss is finite
-    ok = np.isfinite(train_loss) and train_loss > 0
-    dashboard.log(f"  [{'[green]✓' if ok else '[red]✗'}] Loss finite ({train_loss:.4f})[/]")
-    checks_passed += ok
+        # Check 3: Backward pass works
+        eval_model.train()
+        dummy = torch.randn(1, 100, num_features, device=device, requires_grad=False)
+        out = eval_model(dummy)
+        loss = out['vix_pred'].sum()
+        loss.backward()
+        has_grads = any(p.grad is not None and p.grad.abs().sum() > 0
+                        for p in eval_model.parameters())
+        dashboard.log(f"  [{'[green]✓' if has_grads else '[red]✗'}] Gradients flow[/]")
+        checks_passed += has_grads
 
-    # Check 5: No NaN in parameters
-    has_nan = any(torch.isnan(p).any() for p in model.parameters())
-    ok = not has_nan
-    dashboard.log(f"  [{'[green]✓' if ok else '[red]✗'}] No NaN in params[/]")
-    checks_passed += ok
+        # Check 4: Loss is finite
+        ok = np.isfinite(train_loss) and train_loss > 0
+        dashboard.log(f"  [{'[green]✓' if ok else '[red]✗'}] Loss finite ({train_loss:.4f})[/]")
+        checks_passed += ok
 
-    dashboard.log(f"\n[bold]Result: {checks_passed}/{total_checks} checks passed[/]")
-    
-    dashboard.stop()
+        # Check 5: No NaN in parameters
+        has_nan = any(torch.isnan(p).any() for p in eval_model.parameters())
+        ok = not has_nan
+        dashboard.log(f"  [{'[green]✓' if ok else '[red]✗'}] No NaN in params[/]")
+        checks_passed += ok
 
-    if checks_passed == total_checks:
-        print("\n✅ TRAINING COMPLETE")
-        return 0
-    else:
-        print("\n❌ TRAINING FAILED")
-        return 1
+        dashboard.log(f"\n[bold]Result: {checks_passed}/{total_checks} checks passed[/]")
+        dashboard.stop()
+
+    # Cleanup distributed
+    cleanup_distributed()
+
+    if is_main:
+        if checks_passed == total_checks:
+            print("\n✅ TRAINING COMPLETE")
+            return 0
+        else:
+            print("\n❌ TRAINING FAILED")
+            return 1
+    return 0
 
 
 if __name__ == '__main__':
