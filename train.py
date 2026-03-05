@@ -61,8 +61,13 @@ def setup_distributed():
         world_size = int(os.environ['WORLD_SIZE'])
         local_rank = int(os.environ.get('LOCAL_RANK', 0))
         
-        dist.init_process_group(backend='nccl', rank=rank, world_size=world_size)
         torch.cuda.set_device(local_rank)
+        dist.init_process_group(
+            backend='nccl', 
+            rank=rank, 
+            world_size=world_size,
+            device_id=torch.device(f'cuda:{local_rank}')  # Fixes barrier() warning
+        )
         
         return rank, world_size, local_rank
     return 0, 1, 0  # Single GPU fallback
@@ -586,15 +591,20 @@ def main():
     # Note: DistributedSampler not used with IterableDataset
     # For real distributed training with map-style datasets, add sampler here
     
+    # Reduce workers for multi-GPU to prevent OOM (6 GPUs × 4 workers = 24 processes)
+    effective_workers = max(1, args.num_workers // world_size) if is_distributed else args.num_workers
+    if is_main and is_distributed and effective_workers != args.num_workers:
+        dashboard.log(f"[dim]Workers reduced: {args.num_workers} → {effective_workers} per GPU[/]")
+    
     train_loader = DataLoader(
         train_dataset, batch_size=args.batch_size, shuffle=False,
-        num_workers=args.num_workers, collate_fn=collate_fn, pin_memory=True,
-        persistent_workers=(args.num_workers > 0),
+        num_workers=effective_workers, collate_fn=collate_fn, pin_memory=True,
+        persistent_workers=(effective_workers > 0),
     )
     val_loader = DataLoader(
         val_dataset, batch_size=args.batch_size, shuffle=False,
-        num_workers=args.num_workers, collate_fn=collate_fn, pin_memory=True,
-        persistent_workers=(args.num_workers > 0),
+        num_workers=effective_workers, collate_fn=collate_fn, pin_memory=True,
+        persistent_workers=(effective_workers > 0),
     )
 
     # Build model
