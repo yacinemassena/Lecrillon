@@ -29,7 +29,8 @@ VIX_PREFIX = 'datasets/VIX/'
 def download_stock_data(s3_client, year: Optional[int] = None, 
                        start_year: Optional[int] = None, 
                        end_year: Optional[int] = None,
-                       local_dir: Path = Path('datasets/Stock_Data_1s')):
+                       local_dir: Path = Path('datasets/Stock_Data_1s'),
+                       force: bool = False):
     """Download 1s stock bar data from R2."""
     local_dir.mkdir(parents=True, exist_ok=True)
     
@@ -40,7 +41,8 @@ def download_stock_data(s3_client, year: Optional[int] = None,
         print(f'   Filtering for years: {start_year}-{end_year}')
     
     paginator = s3_client.get_paginator('list_objects_v2')
-    count = 0
+    downloaded_count = 0
+    skipped_count = 0
     total_size = 0
     
     for page in paginator.paginate(Bucket=R2_BUCKET, Prefix=STOCK_PREFIX):
@@ -67,29 +69,42 @@ def download_stock_data(s3_client, year: Optional[int] = None,
                     continue
             
             local_file = local_dir / filename
-            size_mb = obj['Size'] / 1e6
+            remote_size = obj['Size']
+            size_mb = remote_size / 1e6
             
-            print(f'  [{count+1}] {filename} ({size_mb:.1f} MB)')
+            # Skip if file exists with matching size (resume capability)
+            if not force and local_file.exists():
+                local_size = local_file.stat().st_size
+                if local_size == remote_size:
+                    skipped_count += 1
+                    continue
+                else:
+                    print(f'  [{downloaded_count+1}] {filename} ({size_mb:.1f} MB) [size mismatch, re-downloading]')
+            else:
+                print(f'  [{downloaded_count+1}] {filename} ({size_mb:.1f} MB)')
+            
             s3_client.download_file(R2_BUCKET, key, str(local_file))
             
-            count += 1
-            total_size += obj['Size']
+            downloaded_count += 1
+            total_size += remote_size
     
-    print(f'✅ Stock data download complete! {count} files, {total_size/1e9:.2f} GB total')
-    return count
+    print(f'✅ Stock data: {downloaded_count} downloaded, {skipped_count} skipped (already exist), {total_size/1e9:.2f} GB transferred')
+    return downloaded_count
 
 
 def download_vix_data(s3_client, year: Optional[int] = None,
                      start_year: Optional[int] = None,
                      end_year: Optional[int] = None,
-                     local_dir: Path = Path('datasets/VIX')):
+                     local_dir: Path = Path('datasets/VIX'),
+                     force: bool = False):
     """Download VIX daily close data from R2."""
     local_dir.mkdir(parents=True, exist_ok=True)
     
     print(f'📈 Downloading VIX data from R2...')
     
     paginator = s3_client.get_paginator('list_objects_v2')
-    count = 0
+    downloaded_count = 0
+    skipped_count = 0
     total_size = 0
     
     for page in paginator.paginate(Bucket=R2_BUCKET, Prefix=VIX_PREFIX):
@@ -106,16 +121,27 @@ def download_vix_data(s3_client, year: Optional[int] = None,
             # VIX files are typically named like 'vix_daily_close.csv' or year-specific
             # Download all VIX files (they're small)
             local_file = local_dir / filename
-            size_kb = obj['Size'] / 1e3
+            remote_size = obj['Size']
+            size_kb = remote_size / 1e3
             
-            print(f'  [{count+1}] {filename} ({size_kb:.1f} KB)')
+            # Skip if file exists with matching size (resume capability)
+            if not force and local_file.exists():
+                local_size = local_file.stat().st_size
+                if local_size == remote_size:
+                    skipped_count += 1
+                    continue
+                else:
+                    print(f'  [{downloaded_count+1}] {filename} ({size_kb:.1f} KB) [size mismatch, re-downloading]')
+            else:
+                print(f'  [{downloaded_count+1}] {filename} ({size_kb:.1f} KB)')
+            
             s3_client.download_file(R2_BUCKET, key, str(local_file))
             
-            count += 1
-            total_size += obj['Size']
+            downloaded_count += 1
+            total_size += remote_size
     
-    print(f'✅ VIX data download complete! {count} files, {total_size/1e6:.2f} MB total')
-    return count
+    print(f'✅ VIX data: {downloaded_count} downloaded, {skipped_count} skipped (already exist), {total_size/1e6:.2f} MB transferred')
+    return downloaded_count
 
 
 def main():
@@ -138,6 +164,9 @@ Examples:
   
   # Download all available data
   python download_data.py --data-type both
+  
+  # Force re-download (ignore existing files)
+  python download_data.py --data-type both --force
         """
     )
     
@@ -150,6 +179,8 @@ Examples:
                        help='Local directory for stock data (default: datasets/Stock_Data_1s)')
     parser.add_argument('--vix-dir', type=Path, default=Path('datasets/VIX'),
                        help='Local directory for VIX data (default: datasets/VIX)')
+    parser.add_argument('--force', action='store_true',
+                       help='Force re-download all files (ignore existing)')
     
     args = parser.parse_args()
     
@@ -179,7 +210,8 @@ Examples:
             year=args.year,
             start_year=args.start_year,
             end_year=args.end_year,
-            local_dir=args.stock_dir
+            local_dir=args.stock_dir,
+            force=args.force
         )
         print()
     
@@ -189,7 +221,8 @@ Examples:
             year=args.year,
             start_year=args.start_year,
             end_year=args.end_year,
-            local_dir=args.vix_dir
+            local_dir=args.vix_dir,
+            force=args.force
         )
         print()
     

@@ -54,19 +54,6 @@ python train.py --seq-len 15000
 cd /workspace
 git clone https://github.com/yacinemassena/Lecrillon.git
 cd Lecrillon
-bash setupvps.sh  # Downloads pre-packaged venv from R2 or builds from source
-source /workspace/venv/bin/activate
-python train.py --seq-len 50000
-
-# Multi-GPU training (6 GPUs)
-torchrun --nproc_per_node=6 train.py --seq-len 15000
-
-# Multi-GPU with all data
-torchrun --nproc_per_node=6 train.py --seq-len 15000 --train-end 2024-09-30 --val-end 2024-12-31
-
-# Download all data (all years)
-python download_data.py --data-type both --stock-dir /workspace/datasets/Stock_Data_1s --vix-dir /workspace/datasets/VIX
-
 python download_vix.py --vix-dir /workspace/datasets/VIX
 python download_data.py --year 2024 --data-type both --stock-dir /workspace/datasets/Stock_Data_1s --vix-dir /workspace/datasets/VIX
 python train.py --seq-len 15000
@@ -74,3 +61,4 @@ python train.py --seq-len 15000 --train-end 2024-09-30 --val-end 2024-12-31
 
 all data:
 python download_data.py --data-type both --stock-dir /workspace/datasets/Stock_Data_1s --vix-dir /workspace/datasets/VIX
+torchrun --nproc_per_node=6 train.py --seq-len 15000
