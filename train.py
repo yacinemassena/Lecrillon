@@ -8,9 +8,11 @@ Usage:
     python train.py                    # default settings from trainconfig.py
     python train.py --epochs 100       # override epochs
     python train.py --seq-len 50000    # override sequence length
+    python train.py --resume           # resume from checkpoint
     
     # Multi-GPU training (6 GPUs)
     torchrun --nproc_per_node=6 train.py --seq-len 15000
+    torchrun --nproc_per_node=6 train.py --seq-len 15000 --resume  # resume multi-GPU
     
 Edit trainconfig.py to change default settings.
 """
@@ -77,6 +79,54 @@ def is_main_process():
     if dist.is_initialized():
         return dist.get_rank() == 0
     return True
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint Utilities
+# ---------------------------------------------------------------------------
+def save_checkpoint(model, optimizer, scaler, epoch, val_loss, checkpoint_dir, is_distributed):
+    """Save training checkpoint (overwrites previous)."""
+    checkpoint_path = Path(checkpoint_dir)
+    checkpoint_path.mkdir(parents=True, exist_ok=True)
+    
+    # Get underlying model for DDP
+    model_state = model.module.state_dict() if is_distributed else model.state_dict()
+    
+    checkpoint = {
+        'epoch': epoch,
+        'model_state_dict': model_state,
+        'optimizer_state_dict': optimizer.state_dict(),
+        'scaler_state_dict': scaler.state_dict(),
+        'val_loss': val_loss,
+    }
+    
+    checkpoint_file = checkpoint_path / 'checkpoint.pt'
+    torch.save(checkpoint, checkpoint_file)
+    return checkpoint_file
+
+
+def load_checkpoint(checkpoint_dir, model, optimizer, scaler, device, is_distributed):
+    """Load training checkpoint if exists. Returns start_epoch."""
+    checkpoint_file = Path(checkpoint_dir) / 'checkpoint.pt'
+    
+    if not checkpoint_file.exists():
+        return 0, None  # Start from epoch 0
+    
+    checkpoint = torch.load(checkpoint_file, map_location=device)
+    
+    # Load model state
+    if is_distributed:
+        model.module.load_state_dict(checkpoint['model_state_dict'])
+    else:
+        model.load_state_dict(checkpoint['model_state_dict'])
+    
+    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    scaler.load_state_dict(checkpoint['scaler_state_dict'])
+    
+    start_epoch = checkpoint['epoch']
+    val_loss = checkpoint.get('val_loss', None)
+    
+    return start_epoch, val_loss
 
 
 # ---------------------------------------------------------------------------
@@ -420,6 +470,12 @@ def main():
                         help='End date for training data (YYYY-MM-DD)')
     parser.add_argument('--val-end', type=str, default=cfg.val_end,
                         help='End date for validation data (YYYY-MM-DD)')
+    parser.add_argument('--checkpoint-dir', type=str, default='checkpoints',
+                        help='Directory to save checkpoints (default: checkpoints)')
+    parser.add_argument('--save-every', type=int, default=5,
+                        help='Save checkpoint every N epochs (default: 5)')
+    parser.add_argument('--resume', action='store_true',
+                        help='Resume training from latest checkpoint')
     args = parser.parse_args()
 
     # Setup distributed training
@@ -573,12 +629,24 @@ def main():
     use_scaler = amp_dtype == torch.float16
     scaler = GradScaler(enabled=use_scaler)
 
+    # Resume from checkpoint if requested
+    start_epoch = 0
+    if args.resume:
+        start_epoch, prev_val_loss = load_checkpoint(
+            args.checkpoint_dir, model, optimizer, scaler, device, is_distributed
+        )
+        if is_main:
+            if start_epoch > 0:
+                dashboard.log(f"[bold yellow]🔄 Resumed from epoch {start_epoch}[/] (val_loss={prev_val_loss:.4f if prev_val_loss else 'N/A'})")
+            else:
+                dashboard.log(f"[dim]No checkpoint found, starting fresh[/]")
+
     if is_main:
         dashboard.log(f"[dim]AMP: {amp_dtype}[/]")
         dashboard.log("─" * 50)
 
     # Training loop
-    for epoch in range(args.epochs):
+    for epoch in range(start_epoch, args.epochs):
         if is_main:
             dashboard.state.epoch = epoch + 1
             dashboard.log(f"\n[bold cyan]═══ Epoch {epoch+1}/{args.epochs} ═══[/]")
@@ -623,6 +691,22 @@ def main():
                 f"iter={avg_iter_time:.2f}s/it | "
                 f"VRAM={mem_alloc:.1f}GB"
             )
+
+            # Save checkpoint every N epochs (only on main process)
+            if (epoch + 1) % args.save_every == 0:
+                ckpt_file = save_checkpoint(
+                    model, optimizer, scaler, epoch + 1, val_metrics['loss'],
+                    args.checkpoint_dir, is_distributed
+                )
+                dashboard.log(f"[bold blue]💾 Checkpoint saved:[/] {ckpt_file}")
+
+    # Save final checkpoint
+    if is_main and args.epochs > 0:
+        ckpt_file = save_checkpoint(
+            model, optimizer, scaler, args.epochs, val_metrics['loss'],
+            args.checkpoint_dir, is_distributed
+        )
+        dashboard.log(f"[bold blue]💾 Final checkpoint saved:[/] {ckpt_file}")
 
     # Final checks (only on main process)
     checks_passed = 0
