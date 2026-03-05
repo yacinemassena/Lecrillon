@@ -475,12 +475,18 @@ def main():
                         help='End date for training data (YYYY-MM-DD)')
     parser.add_argument('--val-end', type=str, default=cfg.val_end,
                         help='End date for validation data (YYYY-MM-DD)')
+    parser.add_argument('--lr', type=float, default=1e-4,
+                        help='Learning rate (default: 1e-4)')
     parser.add_argument('--checkpoint-dir', type=str, default='checkpoints',
                         help='Directory to save checkpoints (default: checkpoints)')
     parser.add_argument('--save-every', type=int, default=5,
                         help='Save checkpoint every N epochs (default: 5)')
     parser.add_argument('--resume', action='store_true',
                         help='Resume training from latest checkpoint')
+    parser.add_argument('--exp-name', type=str, default=None,
+                        help='Experiment name for logging (default: auto-generated)')
+    parser.add_argument('--results-csv', type=str, default=None,
+                        help='CSV file to append results (for HP sweep)')
     args = parser.parse_args()
 
     # Setup distributed training
@@ -631,7 +637,9 @@ def main():
             dashboard.log(f"[dim]Model wrapped in DistributedDataParallel[/]")
 
     # Optimizer & loss
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-5)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-5)
+    if is_main:
+        dashboard.log(f"[dim]LR: {args.lr}[/]")
     criterion = nn.HuberLoss(delta=1.0)
 
     # AMP
@@ -768,6 +776,26 @@ def main():
         checks_passed += ok
 
         dashboard.log(f"\n[bold]Result: {checks_passed}/{total_checks} checks passed[/]")
+        
+        # Log results to CSV for HP sweep
+        if args.results_csv:
+            import csv
+            from pathlib import Path
+            csv_path = Path(args.results_csv)
+            write_header = not csv_path.exists()
+            with open(csv_path, 'a', newline='') as f:
+                writer = csv.writer(f)
+                if write_header:
+                    writer.writerow(['exp_name', 'lr', 'd_model', 'n_layers', 'd_state', 
+                                   'seq_len', 'epochs', 'final_train_loss', 'final_val_loss', 
+                                   'final_val_mae', 'checks_passed'])
+                exp_name = args.exp_name or f"lr_{args.lr}"
+                writer.writerow([exp_name, args.lr, args.d_model, args.n_layers, args.d_state,
+                               args.seq_len, args.epochs, f"{train_loss:.6f}", 
+                               f"{val_metrics['loss']:.6f}", f"{val_metrics['mae']:.6f}",
+                               f"{checks_passed}/{total_checks}"])
+            dashboard.log(f"[bold green]📊 Results appended to:[/] {args.results_csv}")
+        
         dashboard.stop()
 
     # Cleanup distributed
