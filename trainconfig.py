@@ -27,8 +27,11 @@ class TrainConfig:
     force_synthetic: bool = False   # Force synthetic data
     force_real: bool = False        # Force real data (fail if unavailable)
     
-    # Dates
-    train_end: str = '2023-11-30'   # End of training data
+    # Learning rate (1e-6 won HP sweep - see docs/lr_sweep_results.md)
+    lr: float = 1e-6
+    
+    # Dates (use all available data: 2004-2024)
+    train_end: str = '2024-09-30'   # End of training data
     val_end: str = '2024-12-31'     # End of validation data
 
 

@@ -475,8 +475,8 @@ def main():
                         help='End date for training data (YYYY-MM-DD)')
     parser.add_argument('--val-end', type=str, default=cfg.val_end,
                         help='End date for validation data (YYYY-MM-DD)')
-    parser.add_argument('--lr', type=float, default=1e-6,
-                        help='Learning rate (default: 1e-6)')
+    parser.add_argument('--lr', type=float, default=cfg.lr,
+                        help='Learning rate (default: 1e-6, from HP sweep)')
     parser.add_argument('--checkpoint-dir', type=str, default='checkpoints',
                         help='Directory to save checkpoints (default: checkpoints)')
     parser.add_argument('--save-every', type=int, default=5,
