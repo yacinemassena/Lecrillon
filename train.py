@@ -700,6 +700,9 @@ def main():
         dashboard.log(f"[dim]AMP: {amp_dtype}[/]")
         dashboard.log("─" * 50)
 
+    # Best model tracking
+    best_val_loss = float('inf')
+
     # Training loop
     for epoch in range(start_epoch, args.epochs):
         if is_main:
@@ -752,6 +755,16 @@ def main():
                 f"train_loss={train_loss:.4f}, val_loss={val_metrics['loss']:.4f}, "
                 f"val_mae={val_metrics['mae']:.4f}, iter={avg_iter_time:.2f}s/it, VRAM={mem_alloc:.1f}GB"
             )
+
+            # Save best model
+            if val_metrics['loss'] < best_val_loss:
+                best_val_loss = val_metrics['loss']
+                best_ckpt = save_checkpoint(
+                    model, optimizer, scaler, epoch + 1, val_metrics['loss'],
+                    args.checkpoint_dir + '/best', is_distributed
+                )
+                dashboard.log(f"[bold green]🏆 New best model![/] val_loss={best_val_loss:.4f}")
+                logger.info(f"New best model saved: val_loss={best_val_loss:.4f}")
 
             # Save checkpoint every N epochs (only on main process)
             if (epoch + 1) % args.save_every == 0:
