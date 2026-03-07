@@ -260,13 +260,17 @@ class SyntheticBarDataset(Dataset):
         return self.num_samples
 
     def __getitem__(self, idx):
+        import bisect
+        from loader.bar_mamba_dataset import VIX_BUCKET_BOUNDARIES
         bars = np.random.randn(self.seq_len, self.num_features).astype(np.float32)
-        # Synthetic VIX target: loosely correlated with bar volatility
+        # Synthetic VIX change target: loosely correlated with bar volatility
         vol = np.std(bars[:, 0])  # std of "close" feature
-        vix = vol * 5 + np.random.randn() * 0.5
+        vix_change = (vol - 1.0) * 2.0 + np.random.randn() * 0.5  # centered near 0
+        bucket = bisect.bisect_right(VIX_BUCKET_BOUNDARIES, vix_change)
         return {
             'bars': torch.from_numpy(bars),
-            'vix_target': torch.tensor(vix, dtype=torch.float32),
+            'vix_target': torch.tensor(vix_change, dtype=torch.float32),
+            'vix_bucket': torch.tensor(bucket, dtype=torch.long),
             'num_bars': self.seq_len,
             'anchor_date': '2005-01-01',
         }
@@ -283,17 +287,20 @@ class SyntheticBarDataset(Dataset):
         bars_padded = torch.zeros(B, max_len, num_features)
         bar_mask = torch.zeros(B, max_len)
         targets = torch.zeros(B)
+        buckets = torch.zeros(B, dtype=torch.long)
 
         for i, b in enumerate(batch):
             T = b['num_bars']
             bars_padded[i, :T, :] = b['bars']
             bar_mask[i, :T] = 1.0
             targets[i] = b['vix_target']
+            buckets[i] = b['vix_bucket']
 
         return {
             'bars': bars_padded,
             'bar_mask': bar_mask,
             'vix_target': targets,
+            'vix_bucket': buckets,
             'num_bars': [b['num_bars'] for b in batch],
         }
 
@@ -314,12 +321,15 @@ def seed_everything(seed: int = 42):
 # Training step
 # ---------------------------------------------------------------------------
 def train_steps(model, loader, optimizer, criterion, scaler, device, num_steps,
-                amp_dtype=torch.bfloat16, grad_accum=1, epoch=1):
+                amp_dtype=torch.bfloat16, grad_accum=1, epoch=1,
+                cls_criterion=None, cls_weight=0.5):
     """Run training iterations with detailed timing.
     
     Args:
         num_steps: Number of steps to run. 0 = full epoch (all samples).
         epoch: Current epoch number for display.
+        cls_criterion: Classification loss (CrossEntropyLoss) for bucket head.
+        cls_weight: Weight for classification loss in combined objective.
     """
     model.train()
     total_loss = 0.0
@@ -357,6 +367,7 @@ def train_steps(model, loader, optimizer, criterion, scaler, device, num_steps,
         bars = batch['bars'].to(device, non_blocking=True)
         bar_mask = batch['bar_mask'].to(device, non_blocking=True)
         target = batch['vix_target'].to(device, non_blocking=True)
+        bucket_target = batch['vix_bucket'].to(device, non_blocking=True)
         torch.cuda.synchronize()
         t_gpu = time.time() - t_gpu_start
         
@@ -367,7 +378,14 @@ def train_steps(model, loader, optimizer, criterion, scaler, device, num_steps,
         with torch.autocast(device_type='cuda', dtype=amp_dtype, enabled=True):
             outputs = model(bars, bar_mask)
             pred = outputs['vix_pred']
-            loss = criterion(pred, target) / grad_accum
+            reg_loss = criterion(pred, target)
+            # Combined loss: regression + classification
+            if cls_criterion is not None:
+                bucket_logits = outputs['bucket_logits']
+                cls_loss = cls_criterion(bucket_logits, bucket_target)
+                loss = (reg_loss + cls_weight * cls_loss) / grad_accum
+            else:
+                loss = reg_loss / grad_accum
         torch.cuda.synchronize()
         t_fwd = time.time() - t_fwd_start
 
@@ -419,17 +437,22 @@ def train_steps(model, loader, optimizer, criterion, scaler, device, num_steps,
 # Validation step
 # ---------------------------------------------------------------------------
 @torch.no_grad()
-def val_steps(model, loader, criterion, device, num_steps, amp_dtype=torch.bfloat16):
+def val_steps(model, loader, criterion, device, num_steps, amp_dtype=torch.bfloat16,
+             cls_criterion=None, cls_weight=0.5):
     """Run validation iterations.
     
     Args:
         num_steps: Number of steps to run. 0 = full validation (all samples).
+        cls_criterion: Classification loss for bucket head.
+        cls_weight: Weight for classification loss.
     """
     model.eval()
     total_loss = 0.0
     num_batches = 0
     all_preds = []
     all_targets = []
+    correct_buckets = 0
+    total_samples = 0
 
     # If num_steps=0, iterate through full validation set
     if num_steps == 0:
@@ -451,27 +474,43 @@ def val_steps(model, loader, criterion, device, num_steps, amp_dtype=torch.bfloa
         bars = batch['bars'].to(device, non_blocking=True)
         bar_mask = batch['bar_mask'].to(device, non_blocking=True)
         target = batch['vix_target'].to(device, non_blocking=True)
+        bucket_target = batch['vix_bucket'].to(device, non_blocking=True)
 
         with torch.autocast(device_type='cuda', dtype=amp_dtype, enabled=True):
             outputs = model(bars, bar_mask)
             pred = outputs['vix_pred']
-            loss = criterion(pred, target)
+            reg_loss = criterion(pred, target)
+            if cls_criterion is not None:
+                bucket_logits = outputs['bucket_logits']
+                cls_loss = cls_criterion(bucket_logits, bucket_target)
+                loss = reg_loss + cls_weight * cls_loss
+            else:
+                loss = reg_loss
+                bucket_logits = outputs.get('bucket_logits')
 
         total_loss += loss.item()
         num_batches += 1
         all_preds.append(pred.cpu())
         all_targets.append(target.cpu())
 
+        # Bucket accuracy
+        if bucket_logits is not None:
+            pred_buckets = bucket_logits.argmax(dim=-1)
+            correct_buckets += (pred_buckets == bucket_target).sum().item()
+            total_samples += bucket_target.shape[0]
+
     if num_batches == 0:
-        return {'loss': 0.0, 'mae': 0.0}
+        return {'loss': 0.0, 'mae': 0.0, 'bucket_acc': 0.0}
 
     preds = torch.cat(all_preds)
     targets = torch.cat(all_targets)
-    mae = (preds - targets).abs().mean().item()
+    mae = (preds - targets).abs().mean().item()  # now in VIX points directly
+    bucket_acc = correct_buckets / max(total_samples, 1)
 
     return {
         'loss': total_loss / num_batches,
         'mae': mae,
+        'bucket_acc': bucket_acc,
     }
 
 
@@ -655,6 +694,7 @@ def main():
         dashboard.log(f"[dim]Building model: d={args.d_model}, layers={args.n_layers}, state={args.d_state}[/]")
 
     from mamba_only_model import MambaOnlyVIX
+    from loader.bar_mamba_dataset import NUM_VIX_BUCKETS
     model = MambaOnlyVIX(
         num_features=num_features,
         d_model=args.d_model,
@@ -665,6 +705,7 @@ def main():
         dropout=0.1,
         pooling='attention',
         head_hidden=128,
+        num_buckets=NUM_VIX_BUCKETS,
     ).to(device)
 
     # Wrap model in DDP for multi-GPU training
@@ -677,7 +718,8 @@ def main():
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-5)
     if is_main:
         dashboard.log(f"[dim]LR: {args.lr}[/]")
-    criterion = nn.HuberLoss(delta=1.0)
+    criterion = nn.HuberLoss(delta=0.25)  # ~0.5 VIX points — MSE for small errors, MAE for large
+    cls_criterion = nn.CrossEntropyLoss()  # bucket classification head
 
     # AMP
     amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
@@ -721,6 +763,7 @@ def main():
         train_loss, train_steps_count, avg_iter_time = train_steps(
             model, train_loader, optimizer, criterion, scaler,
             device, args.train_steps, amp_dtype, epoch=epoch+1,
+            cls_criterion=cls_criterion, cls_weight=0.5,
         )
 
         # Validate (only on main process)
@@ -729,6 +772,7 @@ def main():
                 model.module if is_distributed else model,
                 val_loader, criterion, device,
                 args.val_steps, amp_dtype,
+                cls_criterion=cls_criterion, cls_weight=0.5,
             )
 
             # Memory stats
@@ -741,11 +785,12 @@ def main():
             dashboard.state.val_loss = val_metrics['loss']
             dashboard.state.val_mae = val_metrics['mae']
             dashboard.log(
-                f"[green]✓ Epoch {epoch+1}/{args.epochs}:[/] "
+                f"[green]\u2713 Epoch {epoch+1}/{args.epochs}:[/] "
                 f"steps={train_steps_count} | "
                 f"loss={train_loss:.4f} | "
                 f"val_loss={val_metrics['loss']:.4f} | "
-                f"val_mae={val_metrics['mae']:.4f} | "
+                f"val_mae={val_metrics['mae']:.2f}pt | "
+                f"bucket_acc={val_metrics['bucket_acc']:.1%} | "
                 f"iter={avg_iter_time:.2f}s/it | "
                 f"VRAM={mem_alloc:.1f}GB"
             )
@@ -753,7 +798,8 @@ def main():
             logger.info(
                 f"Epoch {epoch+1}/{args.epochs}: "
                 f"train_loss={train_loss:.4f}, val_loss={val_metrics['loss']:.4f}, "
-                f"val_mae={val_metrics['mae']:.4f}, iter={avg_iter_time:.2f}s/it, VRAM={mem_alloc:.1f}GB"
+                f"val_mae={val_metrics['mae']:.2f}pt, bucket_acc={val_metrics['bucket_acc']:.1%}, "
+                f"iter={avg_iter_time:.2f}s/it, VRAM={mem_alloc:.1f}GB"
             )
 
             # Save best model
@@ -800,13 +846,14 @@ def main():
         dashboard.log(f"  [{'[green]✓' if ok else '[red]✗'}] Model has {n_params:,} parameters[/]")
         checks_passed += ok
 
-        # Check 2: Forward pass produces output
+        # Check 2: Forward pass produces output (both heads)
         eval_model.eval()
         with torch.no_grad():
             dummy = torch.randn(1, 100, num_features).to(device)
             out = eval_model(dummy)
-            ok = 'vix_pred' in out and out['vix_pred'].shape == (1,)
-            dashboard.log(f"  [{'[green]✓' if ok else '[red]✗'}] Forward pass correct[/]")
+            ok = ('vix_pred' in out and out['vix_pred'].shape == (1,)
+                  and 'bucket_logits' in out and out['bucket_logits'].shape[0] == 1)
+            dashboard.log(f"  [{'[green]✓' if ok else '[red]✗'}] Forward pass correct (dual-head)[/]")
             checks_passed += ok
 
         # Check 3: Backward pass works
@@ -844,11 +891,12 @@ def main():
                 if write_header:
                     writer.writerow(['exp_name', 'lr', 'd_model', 'n_layers', 'd_state', 
                                    'seq_len', 'epochs', 'final_train_loss', 'final_val_loss', 
-                                   'final_val_mae', 'checks_passed'])
+                                   'final_val_mae_pt', 'final_bucket_acc', 'checks_passed'])
                 exp_name = args.exp_name or f"lr_{args.lr}"
                 writer.writerow([exp_name, args.lr, args.d_model, args.n_layers, args.d_state,
                                args.seq_len, args.epochs, f"{train_loss:.6f}", 
-                               f"{val_metrics['loss']:.6f}", f"{val_metrics['mae']:.6f}",
+                               f"{val_metrics['loss']:.6f}", f"{val_metrics['mae']:.4f}",
+                               f"{val_metrics['bucket_acc']:.4f}",
                                f"{checks_passed}/{total_checks}"])
             dashboard.log(f"[bold green]📊 Results appended to:[/] {args.results_csv}")
         

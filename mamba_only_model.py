@@ -4,11 +4,12 @@ Mamba-Only VIX Prediction Model.
 Simplified architecture: 1s stock bars → Linear → Mamba → Pool → VIX prediction.
 No Transformer encoder. Mamba's selective scan handles encoding + temporal dynamics.
 
-Architecture:
+Dual-head architecture:
     Bars [B, T, num_features] → BarProjection → [B, T, d_model]
                                → MambaStack (4L) → [B, T, d_model]
                                → AttentionPool → [B, d_model]
-                               → VIXHead → [B] scalar
+                               → VIXHead (regression) → [B] scalar (VIX change)
+                               → VIXBucketHead (classification) → [B, 15] logits
 """
 
 import logging
@@ -136,7 +137,7 @@ class SequencePooling(nn.Module):
 # VIX Prediction Head
 # ---------------------------------------------------------------------------
 class VIXHead(nn.Module):
-    """MLP head → single VIX scalar."""
+    """MLP regression head → single VIX change scalar (in VIX points)."""
 
     def __init__(self, d_model: int, hidden_dim: int = 128, dropout: float = 0.1):
         super().__init__()
@@ -152,7 +153,7 @@ class VIXHead(nn.Module):
             nn.Linear(hidden_dim, 1),
         )
 
-        # Initialize final layer near zero (z-score normalized VIX ≈ 0)
+        # Initialize final layer near zero (daily VIX change ≈ 0)
         with torch.no_grad():
             self.net[-1].weight.fill_(0.0)
             self.net[-1].bias.fill_(0.0)
@@ -163,14 +164,45 @@ class VIXHead(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# VIX Bucket Classification Head
+# ---------------------------------------------------------------------------
+class VIXBucketHead(nn.Module):
+    """MLP classification head → bucket logits for VIX daily change.
+    
+    Acts as regularization on the regression head by enforcing
+    decision boundaries ("is this a +1 day or a +2 day?").
+    """
+
+    def __init__(self, d_model: int, num_buckets: int = 15,
+                 hidden_dim: int = 128, dropout: float = 0.1):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(d_model, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, num_buckets),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """x: [B, D] → [B, num_buckets]"""
+        return self.net(x)
+
+
+# ---------------------------------------------------------------------------
 # Full Model
 # ---------------------------------------------------------------------------
 class MambaOnlyVIX(nn.Module):
     """
-    Mamba-only VIX prediction.
+    Mamba-only VIX prediction with dual heads.
 
-    1s stock bars → Linear projection → Mamba (selective scan) → Pool → VIX scalar.
-    No Transformer. Mamba handles encoding + temporal dynamics.
+    1s stock bars → Linear projection → Mamba (selective scan) → Pool
+        → Regression head  → VIX daily change (continuous, VIX points)
+        → Classification head → bucket logits (15 classes)
+
+    The two heads share the same backbone and apply complementary gradient
+    signals: regression pushes for precision, classification regularizes
+    by enforcing decision boundaries.
     """
 
     def __init__(
@@ -184,6 +216,7 @@ class MambaOnlyVIX(nn.Module):
         dropout: float = 0.1,
         pooling: str = 'attention',
         head_hidden: int = 128,
+        num_buckets: int = 15,
     ):
         super().__init__()
 
@@ -198,6 +231,7 @@ class MambaOnlyVIX(nn.Module):
         )
         self.pool = SequencePooling(d_model, pooling)
         self.head = VIXHead(d_model, head_hidden, dropout)
+        self.bucket_head = VIXBucketHead(d_model, num_buckets, head_hidden, dropout)
 
         num_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
         logger.info(f"MambaOnlyVIX: {num_params:,} parameters "
@@ -214,7 +248,9 @@ class MambaOnlyVIX(nn.Module):
             bar_mask: [B, T] - Optional valid bar mask (1=valid, 0=pad)
 
         Returns:
-            dict with 'vix_pred' [B]
+            dict with:
+                'vix_pred': [B] - predicted VIX daily change (VIX points)
+                'bucket_logits': [B, num_buckets] - classification logits
         """
         # Project bars to model dim
         x = self.bar_proj(bars)  # [B, T, d_model]
@@ -229,7 +265,11 @@ class MambaOnlyVIX(nn.Module):
         # Pool sequence
         h_pool = self.pool(h)  # [B, d_model]
 
-        # Predict VIX
-        vix_pred = self.head(h_pool)  # [B]
+        # Dual heads from shared representation
+        vix_pred = self.head(h_pool)           # [B] regression
+        bucket_logits = self.bucket_head(h_pool)  # [B, num_buckets] classification
 
-        return {'vix_pred': vix_pred}
+        return {
+            'vix_pred': vix_pred,
+            'bucket_logits': bucket_logits,
+        }

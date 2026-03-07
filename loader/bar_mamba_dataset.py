@@ -5,6 +5,7 @@ No caching - just load files directly, train, discard.
 Simple and clean.
 """
 
+import bisect
 import logging
 from pathlib import Path
 from typing import Dict, List, Optional, Set
@@ -60,6 +61,31 @@ def load_vix_daily_close(vix_dir: str) -> Dict:
 
 
 # ---------------------------------------------------------------------------
+# VIX change bucket definitions
+# ---------------------------------------------------------------------------
+# 15 classes: 13 interior buckets (centers at -3..+3 in 0.5-pt steps) + 2 overflow
+# Boundaries at midpoints between centers:
+#   Bucket 0:  change < -3.25       (extreme down)
+#   Bucket 1:  [-3.25, -2.75)       center = -3.0
+#   Bucket 2:  [-2.75, -2.25)       center = -2.5
+#   ...
+#   Bucket 7:  [-0.25, +0.25)       center =  0.0
+#   ...
+#   Bucket 13: [+2.75, +3.25)       center = +3.0
+#   Bucket 14: change >= +3.25      (extreme up)
+VIX_BUCKET_BOUNDARIES = [
+    -3.25, -2.75, -2.25, -1.75, -1.25, -0.75, -0.25,
+     0.25,  0.75,  1.25,  1.75,  2.25,  2.75,  3.25,
+]
+NUM_VIX_BUCKETS = len(VIX_BUCKET_BOUNDARIES) + 1  # 14 boundaries → 15 bins
+
+
+def vix_change_to_bucket(change: float) -> int:
+    """Convert a VIX daily change (points) to a bucket index."""
+    return bisect.bisect_right(VIX_BUCKET_BOUNDARIES, change)
+
+
+# ---------------------------------------------------------------------------
 # Dataset
 # ---------------------------------------------------------------------------
 class BarMambaDataset(Dataset):
@@ -71,7 +97,8 @@ class BarMambaDataset(Dataset):
 
     Each sample:
     - Input: lookback_days of 1s bars as a flat sequence [T, num_features]
-    - Target: next-day VIX close (z-score normalized)
+    - Target: next-day VIX change in raw VIX points (not normalized)
+    - Bucket: classification label for the change magnitude
     """
 
     def __init__(
@@ -84,9 +111,6 @@ class BarMambaDataset(Dataset):
         max_total_bars: int = 50000,
         train_end: str = '2023-11-30',
         val_end: str = '2024-12-31',
-        vix_normalize: str = 'zscore',
-        vix_mean: float = 19.14,
-        vix_std: float = 8.24,
         allowed_tickers_file: Optional[str] = None,
     ):
         self.split = split
@@ -98,10 +122,6 @@ class BarMambaDataset(Dataset):
         # Calculate days needed based on seq_len (~23,400 bars per trading day)
         bars_per_day = 23400
         self.lookback_days = max(1, (max_total_bars // bars_per_day) + 1)
-        self.vix_normalize = vix_normalize
-        self.vix_mean = vix_mean
-        self.vix_std = vix_std
-
         # Anchor dates always start at 2005
         self.anchor_start = pd.to_datetime('2005-01-01').date()
         self.train_end = pd.to_datetime(train_end).date()
@@ -171,6 +191,11 @@ class BarMambaDataset(Dataset):
             if split_end and d > split_end:
                 continue
 
+            # Need anchor-day VIX to compute change
+            if d not in vix_dates:
+                continue
+            anchor_vix = self.vix_daily[d]
+
             # Find target date: next trading day with VIX data
             target_date = None
             for j in range(i + 1, min(i + 10, len(all_dates))):
@@ -190,6 +215,8 @@ class BarMambaDataset(Dataset):
             if target_date is None:
                 continue
 
+            vix_change = self.vix_daily[target_date] - anchor_vix
+
             # Lookback window
             lookback_start_idx = i - self.lookback_days + 1
             if lookback_start_idx < 0:
@@ -203,7 +230,8 @@ class BarMambaDataset(Dataset):
                 'anchor_date': d,
                 'window_dates': window_dates,
                 'target_date': target_date,
-                'target_vix': self.vix_daily[target_date],
+                'vix_change': vix_change,
+                'vix_bucket': vix_change_to_bucket(vix_change),
             })
 
         return valid
@@ -254,14 +282,6 @@ class BarMambaDataset(Dataset):
         std = bars.std(axis=0, keepdims=True) + 1e-8
         return (bars - mu) / std
 
-    def _normalize_vix(self, vix: float) -> float:
-        """Normalize VIX target."""
-        if self.vix_normalize == 'zscore':
-            return (vix - self.vix_mean) / self.vix_std
-        elif self.vix_normalize == 'log':
-            return np.log(max(vix, 0.01))
-        return vix
-
     def __len__(self) -> int:
         return len(self.anchor_dates)
 
@@ -269,7 +289,8 @@ class BarMambaDataset(Dataset):
         """Get single sample by index. Data cached in RAM after first load."""
         sample = self.anchor_dates[idx]
         window_dates = sample['window_dates']
-        target_vix = sample['target_vix']
+        vix_change = sample['vix_change']
+        vix_bucket = sample['vix_bucket']
 
         # Load bars for all lookback days
         all_bars = []
@@ -286,6 +307,7 @@ class BarMambaDataset(Dataset):
             return {
                 'bars': torch.zeros(1, self.num_features),
                 'vix_target': torch.tensor(0.0, dtype=torch.float32),
+                'vix_bucket': torch.tensor(NUM_VIX_BUCKETS // 2, dtype=torch.long),
                 'num_bars': 0,
                 'anchor_date': str(sample['anchor_date']),
             }
@@ -297,13 +319,13 @@ class BarMambaDataset(Dataset):
         if len(bars) > self.max_total_bars:
             bars = bars[-self.max_total_bars:]
 
-        # Normalize
+        # Normalize bars (not targets — VIX change stays in raw points)
         bars = self._normalize_bars(bars)
-        target_norm = self._normalize_vix(target_vix)
 
         return {
             'bars': torch.from_numpy(bars),
-            'vix_target': torch.tensor(target_norm, dtype=torch.float32),
+            'vix_target': torch.tensor(vix_change, dtype=torch.float32),
+            'vix_bucket': torch.tensor(vix_bucket, dtype=torch.long),
             'num_bars': len(bars),
             'anchor_date': str(sample['anchor_date']),
         }
@@ -321,16 +343,19 @@ class BarMambaDataset(Dataset):
         bars_padded = torch.zeros(B, max_len, num_features)
         bar_mask = torch.zeros(B, max_len)
         targets = torch.zeros(B)
+        buckets = torch.zeros(B, dtype=torch.long)
 
         for i, b in enumerate(batch):
             T = b['num_bars']
             bars_padded[i, :T, :] = b['bars']
             bar_mask[i, :T] = 1.0
             targets[i] = b['vix_target']
+            buckets[i] = b['vix_bucket']
 
         return {
             'bars': bars_padded,
             'bar_mask': bar_mask,
             'vix_target': targets,
+            'vix_bucket': buckets,
             'num_bars': [b['num_bars'] for b in batch],
         }

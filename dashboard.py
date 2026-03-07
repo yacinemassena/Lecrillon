@@ -105,7 +105,7 @@ class TrainingDashboard:
         table.add_row("Step", step_str)
         table.add_row("Loss", f"{s.loss:.4f}")
         table.add_row("Val Loss", f"{s.val_loss:.4f}" if s.val_loss > 0 else "-")
-        table.add_row("Val MAE", f"{s.val_mae:.4f}" if s.val_mae > 0 else "-")
+        table.add_row("Val MAE (pt)", f"{s.val_mae:.2f}" if s.val_mae > 0 else "-")
         table.add_row("Grad Norm", f"{s.grad_norm:.2f}")
         table.add_row("", "")
         table.add_row("Seq Len", f"{s.seq_len:,}")
