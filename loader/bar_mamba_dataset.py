@@ -7,12 +7,12 @@ Simple and clean.
 
 import logging
 from pathlib import Path
-from typing import Dict, List, Optional, Iterator, Set
+from typing import Dict, List, Optional, Set
 import numpy as np
 import pandas as pd
 import polars as pl
 import torch
-from torch.utils.data import IterableDataset
+from torch.utils.data import Dataset
 
 logger = logging.getLogger(__name__)
 
@@ -62,9 +62,12 @@ def load_vix_daily_close(vix_dir: str) -> Dict:
 # ---------------------------------------------------------------------------
 # Dataset
 # ---------------------------------------------------------------------------
-class BarMambaDataset(IterableDataset):
+class BarMambaDataset(Dataset):
     """
-    Direct bar-to-Mamba dataset. No caching.
+    Map-style dataset for Mamba VIX prediction.
+    
+    Data is cached in RAM after first load - __getitem__ is just a slice.
+    Supports native DataLoader shuffling.
 
     Each sample:
     - Input: lookback_days of 1s bars as a flat sequence [T, num_features]
@@ -259,57 +262,51 @@ class BarMambaDataset(IterableDataset):
             return np.log(max(vix, 0.01))
         return vix
 
-    def __iter__(self) -> Iterator[Dict]:
-        """Iterate over samples - load each file directly, no caching."""
-        worker_info = torch.utils.data.get_worker_info()
-        all_indices = list(range(len(self.anchor_dates)))
-        
-        if worker_info is not None:
-            per_worker = len(all_indices) // worker_info.num_workers
-            wid = worker_info.id
-            start = wid * per_worker
-            end = start + per_worker if wid < worker_info.num_workers - 1 else len(all_indices)
-            all_indices = all_indices[start:end]
+    def __len__(self) -> int:
+        return len(self.anchor_dates)
 
-        # Shuffle for training
-        if self.split == 'train':
-            np.random.shuffle(all_indices)
+    def __getitem__(self, idx: int) -> Dict:
+        """Get single sample by index. Data cached in RAM after first load."""
+        sample = self.anchor_dates[idx]
+        window_dates = sample['window_dates']
+        target_vix = sample['target_vix']
 
-        for idx in all_indices:
-            sample = self.anchor_dates[idx]
-            window_dates = sample['window_dates']
-            target_vix = sample['target_vix']
-
-            # Load bars for all lookback days
-            all_bars = []
-            for d in window_dates:
-                file_path = self.stock_files.get(d)
-                if file_path is None:
-                    continue
-                day_bars = self._load_day_bars(file_path)
-                if day_bars is not None:
-                    all_bars.append(day_bars)
-
-            if not all_bars:
+        # Load bars for all lookback days
+        all_bars = []
+        for d in window_dates:
+            file_path = self.stock_files.get(d)
+            if file_path is None:
                 continue
+            day_bars = self._load_day_bars(file_path)
+            if day_bars is not None:
+                all_bars.append(day_bars)
 
-            # Concatenate all days into one sequence
-            bars = np.concatenate(all_bars, axis=0)
-
-            # Cap total sequence length
-            if len(bars) > self.max_total_bars:
-                bars = bars[-self.max_total_bars:]
-
-            # Normalize
-            bars = self._normalize_bars(bars)
-            target_norm = self._normalize_vix(target_vix)
-
-            yield {
-                'bars': torch.from_numpy(bars),
-                'vix_target': torch.tensor(target_norm, dtype=torch.float32),
-                'num_bars': len(bars),
+        if not all_bars:
+            # Return empty sample (will be filtered by collate)
+            return {
+                'bars': torch.zeros(1, self.num_features),
+                'vix_target': torch.tensor(0.0, dtype=torch.float32),
+                'num_bars': 0,
                 'anchor_date': str(sample['anchor_date']),
             }
+
+        # Concatenate all days into one sequence
+        bars = np.concatenate(all_bars, axis=0)
+
+        # Cap total sequence length
+        if len(bars) > self.max_total_bars:
+            bars = bars[-self.max_total_bars:]
+
+        # Normalize
+        bars = self._normalize_bars(bars)
+        target_norm = self._normalize_vix(target_vix)
+
+        return {
+            'bars': torch.from_numpy(bars),
+            'vix_target': torch.tensor(target_norm, dtype=torch.float32),
+            'num_bars': len(bars),
+            'anchor_date': str(sample['anchor_date']),
+        }
 
     @staticmethod
     def collate_fn(batch: List[Dict]) -> Dict:

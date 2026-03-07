@@ -30,7 +30,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, IterableDataset, DistributedSampler
+from torch.utils.data import DataLoader, Dataset
 from torch.amp import autocast, GradScaler
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -594,8 +594,8 @@ def main():
         num_features = train_dataset.num_features
         collate_fn = BarMambaDataset.collate_fn
 
-    # Note: DistributedSampler not used with IterableDataset
-    # For real distributed training with map-style datasets, add sampler here
+    # Map-style dataset now supports native shuffling
+    # For distributed training, could add DistributedSampler here
     
     # Reduce workers for multi-GPU to prevent OOM (6 GPUs × 4 workers = 24 processes)
     effective_workers = max(1, args.num_workers // world_size) if is_distributed else args.num_workers
@@ -603,7 +603,7 @@ def main():
         dashboard.log(f"[dim]Workers reduced: {args.num_workers} → {effective_workers} per GPU[/]")
     
     train_loader = DataLoader(
-        train_dataset, batch_size=args.batch_size, shuffle=False,
+        train_dataset, batch_size=args.batch_size, shuffle=True,
         num_workers=effective_workers, collate_fn=collate_fn, pin_memory=True,
         persistent_workers=(effective_workers > 0),
     )

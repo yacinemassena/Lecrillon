@@ -57,7 +57,7 @@ cd Lecrillon
 python download_vix.py --vix-dir /workspace/datasets/VIX
 python download_data.py --year 2024 --data-type both --stock-dir /workspace/datasets/Stock_Data_1s --vix-dir /workspace/datasets/VIX
 python train.py --seq-len 15000
-python train.py --seq-len 15000 --train-end 2024-09-30 --val-end 2024-12-31
+python train.py --seq-len 15000 --train-end 2024-03-30 --val-end 2024-05-31
 
 all data:
 python download_data.py --data-type both --stock-dir /workspace/datasets/Stock_Data_1s --vix-dir /workspace/datasets/VIX
