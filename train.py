@@ -248,7 +248,7 @@ def check_data_overlap(paths: Dict[str, Path]) -> bool:
 # ---------------------------------------------------------------------------
 # Synthetic Dataset (fallback)
 # ---------------------------------------------------------------------------
-class SyntheticBarDataset(IterableDataset):
+class SyntheticBarDataset(Dataset):
     """Generate synthetic bar data for smoke testing when real data unavailable."""
 
     def __init__(self, num_samples: int = 50, seq_len: int = 2000, num_features: int = 15):
@@ -256,18 +256,20 @@ class SyntheticBarDataset(IterableDataset):
         self.seq_len = seq_len
         self.num_features = num_features
 
-    def __iter__(self):
-        for _ in range(self.num_samples):
-            bars = np.random.randn(self.seq_len, self.num_features).astype(np.float32)
-            # Synthetic VIX target: loosely correlated with bar volatility
-            vol = np.std(bars[:, 0])  # std of "close" feature
-            vix = vol * 5 + np.random.randn() * 0.5
-            yield {
-                'bars': torch.from_numpy(bars),
-                'vix_target': torch.tensor(vix, dtype=torch.float32),
-                'num_bars': self.seq_len,
-                'anchor_date': '2005-01-01',
-            }
+    def __len__(self):
+        return self.num_samples
+
+    def __getitem__(self, idx):
+        bars = np.random.randn(self.seq_len, self.num_features).astype(np.float32)
+        # Synthetic VIX target: loosely correlated with bar volatility
+        vol = np.std(bars[:, 0])  # std of "close" feature
+        vix = vol * 5 + np.random.randn() * 0.5
+        return {
+            'bars': torch.from_numpy(bars),
+            'vix_target': torch.tensor(vix, dtype=torch.float32),
+            'num_bars': self.seq_len,
+            'anchor_date': '2005-01-01',
+        }
 
     @staticmethod
     def collate_fn(batch):
