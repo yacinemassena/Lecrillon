@@ -41,15 +41,42 @@ from dashboard import SimpleDashboard
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
-logging.basicConfig(
-    level=logging.WARNING,  # Reduce noise, dashboard handles display
-    format='%(asctime)s | %(levelname)s | %(message)s',
-    datefmt='%H:%M:%S',
-)
+def setup_logging(log_dir: str = 'logs') -> Path:
+    """Setup file logging for this training run. Returns log file path."""
+    log_path = Path(log_dir)
+    log_path.mkdir(parents=True, exist_ok=True)
+    
+    timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+    log_file = log_path / f'train_{timestamp}.log'
+    
+    # File handler for this run
+    file_handler = logging.FileHandler(log_file, mode='w')
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(logging.Formatter(
+        '%(asctime)s | %(levelname)s | %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    ))
+    
+    # Console handler (minimal)
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.WARNING)
+    console_handler.setFormatter(logging.Formatter('%(message)s'))
+    
+    # Root logger setup
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+    root_logger.addHandler(file_handler)
+    root_logger.addHandler(console_handler)
+    
+    return log_file
+
 logger = logging.getLogger(__name__)
 
 # Global dashboard instance
 dashboard = SimpleDashboard()
+
+# Log file path (set in main)
+LOG_FILE: Optional[Path] = None
 
 # ---------------------------------------------------------------------------
 # Distributed Training Utilities
@@ -494,11 +521,19 @@ def main():
     is_distributed = world_size > 1
     is_main = is_main_process()
 
+    # Setup logging (only on main process)
+    global LOG_FILE
+    if is_main:
+        LOG_FILE = setup_logging()
+        logger.info(f"Training started - logs saved to {LOG_FILE}")
+
     # Start dashboard (only on main process)
     if is_main:
         dashboard.start()
+        dashboard.log(f"[dim]📝 Logs: {LOG_FILE}[/]")
         dashboard.log(f"[bold cyan]📦 Config:[/] Batch: {args.batch_size} | Workers: {args.num_workers}")
         dashboard.log(f"[bold cyan]📊 Config:[/] Seq={args.seq_len:,} | Epochs={args.epochs}")
+        logger.info(f"Config: batch={args.batch_size}, workers={args.num_workers}, seq_len={args.seq_len}, epochs={args.epochs}, lr={args.lr}")
         if is_distributed:
             dashboard.log(f"[bold magenta]🚀 Distributed:[/] {world_size} GPUs")
         dashboard.state.total_epochs = args.epochs
@@ -708,6 +743,12 @@ def main():
                 f"val_mae={val_metrics['mae']:.4f} | "
                 f"iter={avg_iter_time:.2f}s/it | "
                 f"VRAM={mem_alloc:.1f}GB"
+            )
+            # Log to file
+            logger.info(
+                f"Epoch {epoch+1}/{args.epochs}: "
+                f"train_loss={train_loss:.4f}, val_loss={val_metrics['loss']:.4f}, "
+                f"val_mae={val_metrics['mae']:.4f}, iter={avg_iter_time:.2f}s/it, VRAM={mem_alloc:.1f}GB"
             )
 
             # Save checkpoint every N epochs (only on main process)
