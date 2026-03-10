@@ -9,7 +9,7 @@ from dataclasses import dataclass
 @dataclass
 class TrainConfig:
     # Data settings
-    seq_len: int = 351_000          # Max sequence length in 1-sec bars (~6 hours trading)
+    seq_len: int = 15_000           # Max sequence length in 1-sec bars (~1 hour trading)
     
     # Training settings
     epochs: int = 50                # Number of training epochs
@@ -20,15 +20,18 @@ class TrainConfig:
     
     # Model architecture
     d_model: int = 256              # Model hidden dimension
-    n_layers: int = 4               # Number of Mamba layers
+    n_layers: int = 4               # Number of Mamba layers (stock stream)
     d_state: int = 64               # Mamba state dimension
+    checkpoint_interval: int = 300  # Fusion checkpoint every N bars (300 = 5 min)
+    use_parallel_streams: bool = True  # Use ParallelMambaVIX (vs legacy MambaOnlyVIX)
+    use_macro: bool = False         # Enable macro FiLM conditioning
     
     # Data source
     force_synthetic: bool = False   # Force synthetic data
     force_real: bool = False        # Force real data (fail if unavailable)
     
-    # Learning rate (1e-6 won HP sweep - see docs/lr_sweep_results.md)
-    lr: float = 1e-6
+    # Learning rate (1e-4 for multimodal training with news/options injection)
+    lr: float = 1e-4
     
     # Dates (use all available data: 2004-2024)
     train_end: str = '2024-09-30'   # End of training data

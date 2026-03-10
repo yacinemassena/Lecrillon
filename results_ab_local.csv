@@ -1,0 +1,6 @@
+exp_name,lr,d_model,n_layers,d_state,seq_len,epochs,final_train_loss,final_val_loss,final_val_mae_pt,checks_passed
+local_stock_news,1e-06,256,4,64,15000,1,0.242129,0.256652,1.1397,5/5
+local_stock_news_options,1e-06,256,4,64,15000,1,0.242136,0.256669,1.1397,5/5
+baseline_stock_only,1e-06,256,4,64,15000,1,0.242135,0.256670,1.1397,5/5
+stock_news,1e-06,256,4,64,15000,1,0.242129,0.256652,1.1397,5/5
+stock_news_temporal,1e-06,256,4,64,15000,1,0.242132,0.256651,1.1397,5/5

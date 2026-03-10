@@ -13,20 +13,6 @@ python smoke_mamba_only.py --train-steps 20 --val-steps 5 --epochs 1
 
 
 
-Option 1: Docker (Fastest - What You Just Set Up)
-On RunPod:
-
-bash
-# In pod creation UI, just enter:
-Container Image: yacinedaoud/mamba-vix-training:latest
-That's it! The environment is 100% ready:
-
-✅ PyTorch cu124 installed
-✅ mamba_ssm compiled
-✅ causal-conv1d compiled
-✅ All dependencies installed
-✅ CUDA 12.4 configured
-When pod starts, just:
 
 bash
 cd /workspace
@@ -62,3 +48,37 @@ python train.py --seq-len 15000 --train-end 2024-03-30 --val-end 2024-05-31
 all data:
 python download_data.py --data-type both --stock-dir /workspace/datasets/Stock_Data_1s --vix-dir /workspace/datasets/VIX
 torchrun --nproc_per_node=6 train.py --seq-len 15000
+
+# =============================================================================
+# A/B EXPERIMENT: Multi-source comparison (3 GPUs, 1 epoch, 500 train / 50 val)
+# Start from 2014 to ensure all datasets have data (options/news availability)
+# =============================================================================
+
+# Experiment 1: Stock only (baseline)
+torchrun --nproc_per_node=3 train.py --seq-len 15000 --epochs 1 --train-steps 500 --val-steps 50 \
+    --train-start 2014-01-01 \
+    --exp-name "baseline_stock_only" --results-csv results_ab.csv
+
+# Experiment 2: Stock + News
+torchrun --nproc_per_node=3 train.py --seq-len 15000 --epochs 1 --train-steps 500 --val-steps 50 \
+    --train-start 2014-01-01 \
+    --use-news --news-path /workspace/datasets/benzinga_embeddings/news \
+    --exp-name "stock_news" --results-csv results_ab.csv
+
+# Experiment 3: Stock + News + Options
+torchrun --nproc_per_node=3 train.py --seq-len 15000 --epochs 1 --train-steps 500 --val-steps 50 \
+    --train-start 2014-01-01 \
+    --use-news --news-path /workspace/datasets/benzinga_embeddings/news \
+    --use-options --options-path /workspace/datasets/opt_trade_1sec \
+    --exp-name "stock_news_options" --results-csv results_ab.csv
+
+# View results
+cat results_ab.csv
+
+LOCAL 
+wsl
+cd /mnt/d/Mamba\ v2
+source venv/bin/activate
+
+# 2. Run training (adjust seq-len based on your GPU VRAM)
+python train.py --epochs 10 --train-steps 100 --val-steps 20 --seq-len 15000

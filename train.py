@@ -251,7 +251,7 @@ def check_data_overlap(paths: Dict[str, Path]) -> bool:
 class SyntheticBarDataset(Dataset):
     """Generate synthetic bar data for smoke testing when real data unavailable."""
 
-    def __init__(self, num_samples: int = 50, seq_len: int = 2000, num_features: int = 15):
+    def __init__(self, num_samples: int = 50, seq_len: int = 2000, num_features: int = 29):
         self.num_samples = num_samples
         self.seq_len = seq_len
         self.num_features = num_features
@@ -260,17 +260,13 @@ class SyntheticBarDataset(Dataset):
         return self.num_samples
 
     def __getitem__(self, idx):
-        import bisect
-        from loader.bar_mamba_dataset import VIX_BUCKET_BOUNDARIES
         bars = np.random.randn(self.seq_len, self.num_features).astype(np.float32)
         # Synthetic VIX change target: loosely correlated with bar volatility
         vol = np.std(bars[:, 0])  # std of "close" feature
         vix_change = (vol - 1.0) * 2.0 + np.random.randn() * 0.5  # centered near 0
-        bucket = bisect.bisect_right(VIX_BUCKET_BOUNDARIES, vix_change)
         return {
             'bars': torch.from_numpy(bars),
             'vix_target': torch.tensor(vix_change, dtype=torch.float32),
-            'vix_bucket': torch.tensor(bucket, dtype=torch.long),
             'num_bars': self.seq_len,
             'anchor_date': '2005-01-01',
         }
@@ -287,20 +283,17 @@ class SyntheticBarDataset(Dataset):
         bars_padded = torch.zeros(B, max_len, num_features)
         bar_mask = torch.zeros(B, max_len)
         targets = torch.zeros(B)
-        buckets = torch.zeros(B, dtype=torch.long)
 
         for i, b in enumerate(batch):
             T = b['num_bars']
             bars_padded[i, :T, :] = b['bars']
             bar_mask[i, :T] = 1.0
             targets[i] = b['vix_target']
-            buckets[i] = b['vix_bucket']
 
         return {
             'bars': bars_padded,
             'bar_mask': bar_mask,
             'vix_target': targets,
-            'vix_bucket': buckets,
             'num_bars': [b['num_bars'] for b in batch],
         }
 
@@ -321,15 +314,12 @@ def seed_everything(seed: int = 42):
 # Training step
 # ---------------------------------------------------------------------------
 def train_steps(model, loader, optimizer, criterion, scaler, device, num_steps,
-                amp_dtype=torch.bfloat16, grad_accum=1, epoch=1,
-                cls_criterion=None, cls_weight=0.5):
+                amp_dtype=torch.bfloat16, grad_accum=1, epoch=1):
     """Run training iterations with detailed timing.
     
     Args:
         num_steps: Number of steps to run. 0 = full epoch (all samples).
         epoch: Current epoch number for display.
-        cls_criterion: Classification loss (CrossEntropyLoss) for bucket head.
-        cls_weight: Weight for classification loss in combined objective.
     """
     model.train()
     total_loss = 0.0
@@ -367,7 +357,37 @@ def train_steps(model, loader, optimizer, criterion, scaler, device, num_steps,
         bars = batch['bars'].to(device, non_blocking=True)
         bar_mask = batch['bar_mask'].to(device, non_blocking=True)
         target = batch['vix_target'].to(device, non_blocking=True)
-        bucket_target = batch['vix_bucket'].to(device, non_blocking=True)
+        
+        # Optional news data
+        news_embs = batch.get('news_embs')
+        news_mask = batch.get('news_mask')
+        news_indices = batch.get('news_indices')
+        
+        if news_embs is not None:
+            news_embs = news_embs.to(device, non_blocking=True)
+        if news_mask is not None:
+            news_mask = news_mask.to(device, non_blocking=True)
+        if news_indices is not None:
+            news_indices = news_indices.to(device, non_blocking=True)
+        
+        # Optional options data
+        options = batch.get('options')
+        options_mask = batch.get('options_mask')
+        
+        if options is not None:
+            options = options.to(device, non_blocking=True)
+        if options_mask is not None:
+            options_mask = options_mask.to(device, non_blocking=True)
+        
+        # Optional macro context and bar timestamps (for FiLM)
+        macro_context = batch.get('macro_context')
+        bar_timestamps = batch.get('bar_timestamps')
+        
+        if macro_context is not None:
+            macro_context = macro_context.to(device, non_blocking=True)
+        if bar_timestamps is not None:
+            bar_timestamps = bar_timestamps.to(device, non_blocking=True)
+        
         torch.cuda.synchronize()
         t_gpu = time.time() - t_gpu_start
         
@@ -376,16 +396,40 @@ def train_steps(model, loader, optimizer, criterion, scaler, device, num_steps,
         # Forward pass
         t_fwd_start = time.time()
         with torch.autocast(device_type='cuda', dtype=amp_dtype, enabled=True):
-            outputs = model(bars, bar_mask)
+            outputs = model(
+                bars, bar_mask,
+                options=options,
+                options_mask=options_mask,
+                news_embs=news_embs,
+                news_mask=news_mask,
+                news_indices=news_indices,
+                macro_context=macro_context,
+                bar_timestamps=bar_timestamps,
+            )
             pred = outputs['vix_pred']
-            reg_loss = criterion(pred, target)
-            # Combined loss: regression + classification
-            if cls_criterion is not None:
-                bucket_logits = outputs['bucket_logits']
-                cls_loss = cls_criterion(bucket_logits, bucket_target)
-                loss = (reg_loss + cls_weight * cls_loss) / grad_accum
-            else:
-                loss = reg_loss / grad_accum
+            
+            # Combined loss from all streams
+            loss = criterion(pred, target)
+            
+            # Per-stream auxiliary losses (for monitoring)
+            stream_losses = {'combined': loss.item()}
+            
+            if 'stock_pred' in outputs:
+                stock_loss = criterion(outputs['stock_pred'], target)
+                loss = loss + 0.3 * stock_loss  # Auxiliary weight
+                stream_losses['stock'] = stock_loss.item()
+            
+            if 'news_pred' in outputs:
+                news_loss = criterion(outputs['news_pred'], target)
+                loss = loss + 0.3 * news_loss
+                stream_losses['news'] = news_loss.item()
+            
+            if 'options_pred' in outputs:
+                options_loss = criterion(outputs['options_pred'], target)
+                loss = loss + 0.3 * options_loss
+                stream_losses['options'] = options_loss.item()
+            
+            loss = loss / grad_accum
         torch.cuda.synchronize()
         t_fwd = time.time() - t_fwd_start
 
@@ -415,17 +459,27 @@ def train_steps(model, loader, optimizer, criterion, scaler, device, num_steps,
         mem_alloc = torch.cuda.memory_allocated() / 1e9
         mem_reserved = torch.cuda.memory_reserved() / 1e9
 
-        # Update dashboard with per-step timing
+        # Update dashboard with per-step timing and per-stream losses
         step_display = f"E{epoch} Step {step + 1}"
         if num_steps > 0:
             step_display += f"/{num_steps}"
         
+        # Build per-stream loss display with colors
+        loss_parts = []
+        if 'stock' in stream_losses:
+            loss_parts.append(f"[cyan]S:{stream_losses['stock']:.3f}[/]")
+        if 'news' in stream_losses:
+            loss_parts.append(f"[yellow]N:{stream_losses['news']:.3f}[/]")
+        if 'options' in stream_losses:
+            loss_parts.append(f"[magenta]O:{stream_losses['options']:.3f}[/]")
+        loss_parts.append(f"[green]C:{stream_losses['combined']:.3f}[/]")
+        
+        stream_display = " ".join(loss_parts) if loss_parts else f"loss={step_loss:.4f}"
+        
         dashboard.console.print(
-            f"[green]{step_display}[/] | "
-            f"loss={step_loss:.4f} | seq={seq_len:,} | "
-            f"data={t_data:.2f}s fwd={t_fwd:.2f}s bwd={t_bwd:.2f}s | "
-            f"[cyan]{t_total:.2f}s/it[/] | "
-            f"VRAM={mem_reserved:.1f}GB"
+            f"[bold]{step_display}[/] | {stream_display} | seq={seq_len:,} | "
+            f"fwd={t_fwd:.2f}s bwd={t_bwd:.2f}s | "
+            f"[dim]{t_total:.2f}s/it[/] | VRAM={mem_reserved:.1f}GB"
         )
 
     epoch_time = time.time() - epoch_start_time
@@ -437,22 +491,17 @@ def train_steps(model, loader, optimizer, criterion, scaler, device, num_steps,
 # Validation step
 # ---------------------------------------------------------------------------
 @torch.no_grad()
-def val_steps(model, loader, criterion, device, num_steps, amp_dtype=torch.bfloat16,
-             cls_criterion=None, cls_weight=0.5):
+def val_steps(model, loader, criterion, device, num_steps, amp_dtype=torch.bfloat16):
     """Run validation iterations.
     
     Args:
         num_steps: Number of steps to run. 0 = full validation (all samples).
-        cls_criterion: Classification loss for bucket head.
-        cls_weight: Weight for classification loss.
     """
     model.eval()
     total_loss = 0.0
     num_batches = 0
     all_preds = []
     all_targets = []
-    correct_buckets = 0
-    total_samples = 0
 
     # If num_steps=0, iterate through full validation set
     if num_steps == 0:
@@ -474,44 +523,108 @@ def val_steps(model, loader, criterion, device, num_steps, amp_dtype=torch.bfloa
         bars = batch['bars'].to(device, non_blocking=True)
         bar_mask = batch['bar_mask'].to(device, non_blocking=True)
         target = batch['vix_target'].to(device, non_blocking=True)
-        bucket_target = batch['vix_bucket'].to(device, non_blocking=True)
+        
+        # Optional news data
+        news_embs = batch.get('news_embs')
+        news_mask = batch.get('news_mask')
+        news_indices = batch.get('news_indices')
+        
+        if news_embs is not None:
+            news_embs = news_embs.to(device, non_blocking=True)
+        if news_mask is not None:
+            news_mask = news_mask.to(device, non_blocking=True)
+        if news_indices is not None:
+            news_indices = news_indices.to(device, non_blocking=True)
+        
+        # Optional options data
+        options = batch.get('options')
+        options_mask = batch.get('options_mask')
+        
+        if options is not None:
+            options = options.to(device, non_blocking=True)
+        if options_mask is not None:
+            options_mask = options_mask.to(device, non_blocking=True)
+        
+        # Optional macro context and bar timestamps (for FiLM)
+        macro_context = batch.get('macro_context')
+        bar_timestamps = batch.get('bar_timestamps')
+        
+        if macro_context is not None:
+            macro_context = macro_context.to(device, non_blocking=True)
+        if bar_timestamps is not None:
+            bar_timestamps = bar_timestamps.to(device, non_blocking=True)
 
         with torch.autocast(device_type='cuda', dtype=amp_dtype, enabled=True):
-            outputs = model(bars, bar_mask)
+            outputs = model(
+                bars, bar_mask,
+                options=options,
+                options_mask=options_mask,
+                news_embs=news_embs,
+                news_mask=news_mask,
+                news_indices=news_indices,
+                macro_context=macro_context,
+                bar_timestamps=bar_timestamps,
+            )
             pred = outputs['vix_pred']
-            reg_loss = criterion(pred, target)
-            if cls_criterion is not None:
-                bucket_logits = outputs['bucket_logits']
-                cls_loss = cls_criterion(bucket_logits, bucket_target)
-                loss = reg_loss + cls_weight * cls_loss
-            else:
-                loss = reg_loss
-                bucket_logits = outputs.get('bucket_logits')
+            loss = criterion(pred, target)
 
         total_loss += loss.item()
         num_batches += 1
         all_preds.append(pred.cpu())
         all_targets.append(target.cpu())
-
-        # Bucket accuracy
-        if bucket_logits is not None:
-            pred_buckets = bucket_logits.argmax(dim=-1)
-            correct_buckets += (pred_buckets == bucket_target).sum().item()
-            total_samples += bucket_target.shape[0]
+        
+        # Track per-stream predictions for MAE
+        if 'stock_pred' in outputs:
+            if 'stock_preds' not in locals():
+                stock_preds = []
+            stock_preds.append(outputs['stock_pred'].cpu())
+        if 'news_pred' in outputs:
+            if 'news_preds' not in locals():
+                news_preds = []
+            news_preds.append(outputs['news_pred'].cpu())
+        if 'options_pred' in outputs:
+            if 'options_preds' not in locals():
+                options_preds = []
+            options_preds.append(outputs['options_pred'].cpu())
 
     if num_batches == 0:
-        return {'loss': 0.0, 'mae': 0.0, 'bucket_acc': 0.0}
+        return {'loss': 0.0, 'mae': 0.0}
 
     preds = torch.cat(all_preds)
     targets = torch.cat(all_targets)
-    mae = (preds - targets).abs().mean().item()  # now in VIX points directly
-    bucket_acc = correct_buckets / max(total_samples, 1)
-
-    return {
+    mae = (preds - targets).abs().mean().item()
+    
+    # Accuracy metrics for VIX change prediction
+    # Directional accuracy: did we predict up/down correctly?
+    pred_sign = (preds > 0).float()
+    target_sign = (targets > 0).float()
+    dir_acc = (pred_sign == target_sign).float().mean().item() * 100
+    
+    # Within-threshold accuracy: % of predictions within X VIX points
+    abs_error = (preds - targets).abs()
+    within_1pt = (abs_error < 1.0).float().mean().item() * 100
+    within_2pt = (abs_error < 2.0).float().mean().item() * 100
+    
+    # Per-stream MAE
+    result = {
         'loss': total_loss / num_batches,
         'mae': mae,
-        'bucket_acc': bucket_acc,
+        'dir_acc': dir_acc,
+        'within_1pt': within_1pt,
+        'within_2pt': within_2pt,
     }
+    
+    if 'stock_preds' in locals() and stock_preds:
+        stock_mae = (torch.cat(stock_preds) - targets).abs().mean().item()
+        result['stock_mae'] = stock_mae
+    if 'news_preds' in locals() and news_preds:
+        news_mae = (torch.cat(news_preds) - targets).abs().mean().item()
+        result['news_mae'] = news_mae
+    if 'options_preds' in locals() and options_preds:
+        options_mae = (torch.cat(options_preds) - targets).abs().mean().item()
+        result['options_mae'] = options_mae
+
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -539,6 +652,8 @@ def main():
                         help='Batch size for training')
     parser.add_argument('--num-workers', type=int, default=cfg.num_workers,
                         help='DataLoader workers for parallel data loading')
+    parser.add_argument('--train-start', type=str, default='2005-01-01',
+                        help='Start date for training data (YYYY-MM-DD, default: 2005-01-01)')
     parser.add_argument('--train-end', type=str, default=cfg.train_end,
                         help='End date for training data (YYYY-MM-DD)')
     parser.add_argument('--val-end', type=str, default=cfg.val_end,
@@ -549,12 +664,32 @@ def main():
                         help='Directory to save checkpoints (default: checkpoints)')
     parser.add_argument('--save-every', type=int, default=5,
                         help='Save checkpoint every N epochs (default: 5)')
+    parser.add_argument('--patience', type=int, default=5,
+                        help='Early stopping patience (epochs without improvement, default: 5)')
     parser.add_argument('--resume', action='store_true',
                         help='Resume training from latest checkpoint')
     parser.add_argument('--exp-name', type=str, default=None,
                         help='Experiment name for logging (default: auto-generated)')
     parser.add_argument('--results-csv', type=str, default=None,
                         help='CSV file to append results (for HP sweep)')
+    parser.add_argument('--use-news', action='store_true',
+                        help='Enable news integration (Benzinga embeddings). Toggle off for A/B comparison.')
+    parser.add_argument('--news-path', type=str, default=None,
+                        help='Path to news embeddings directory (default: datasets/benzinga_embeddings/news)')
+    parser.add_argument('--use-options', action='store_true',
+                        help='Enable options flow integration. Toggle off for A/B comparison.')
+    parser.add_argument('--options-path', type=str, default=None,
+                        help='Path to options data directory (default: datasets/opt_trade_1sec)')
+    parser.add_argument('--use-macro', action='store_true',
+                        help='Enable macro FiLM conditioning (Fed/treasury/FOMC)')
+    parser.add_argument('--macro-path', type=str, default=None,
+                        help='Path to macro_daily.parquet (default: datasets/macro/macro_daily.parquet)')
+    parser.add_argument('--use-parallel-streams', action='store_true', default=cfg.use_parallel_streams,
+                        help='Use ParallelMambaVIX with periodic fusion (default: True)')
+    parser.add_argument('--no-parallel-streams', action='store_false', dest='use_parallel_streams',
+                        help='Use legacy MambaOnlyVIX (for comparison)')
+    parser.add_argument('--checkpoint-interval', type=int, default=cfg.checkpoint_interval,
+                        help='Fusion checkpoint interval in bars (default: 300 = 5 min)')
     args = parser.parse_args()
 
     # Setup distributed training
@@ -574,7 +709,7 @@ def main():
         dashboard.log(f"[dim]📝 Logs: {LOG_FILE}[/]")
         dashboard.log(f"[bold cyan]📦 Config:[/] Batch: {args.batch_size} | Workers: {args.num_workers}")
         dashboard.log(f"[bold cyan]📊 Config:[/] Seq={args.seq_len:,} | Epochs={args.epochs}")
-        logger.info(f"Config: batch={args.batch_size}, workers={args.num_workers}, seq_len={args.seq_len}, epochs={args.epochs}, lr={args.lr}")
+        logger.info(f"Config: batch={args.batch_size}, workers={args.num_workers}, seq_len={args.seq_len}, epochs={args.epochs}, lr={args.lr}, use_news={args.use_news}, use_options={args.use_options}")
         if is_distributed:
             dashboard.log(f"[bold magenta]🚀 Distributed:[/] {world_size} GPUs")
         dashboard.state.total_epochs = args.epochs
@@ -629,7 +764,7 @@ def main():
         sys.exit(1)
 
     # Build datasets
-    num_features = 15
+    num_features = 29  # All stock features from Stock_Data_1s
     train_sampler = None
     val_sampler = None
     
@@ -650,22 +785,104 @@ def main():
 
         stock_path = str(data_paths['stock'])
         vix_path = str(data_paths['vix'])
+        
+        # News path: use provided path or default
+        news_path = args.news_path
+        if args.use_news and news_path is None:
+            # Try default paths
+            for candidate in [
+                data_paths.get('stock', Path('.')).parent / 'benzinga_embeddings' / 'news',
+                Path('datasets/benzinga_embeddings/news'),
+            ]:
+                if candidate.exists():
+                    news_path = str(candidate)
+                    break
+        
+        # Options path: use provided path or default
+        options_path = args.options_path
+        if args.use_options and options_path is None:
+            for candidate in [
+                data_paths.get('stock', Path('.')).parent / 'opt_trade_1sec',
+                Path('datasets/opt_trade_1sec'),
+            ]:
+                if candidate.exists():
+                    options_path = str(candidate)
+                    break
+        
+        if is_main:
+            if args.use_news:
+                if news_path:
+                    dashboard.log(f"[bold cyan]📰 News:[/] {news_path}")
+                    logger.info(f"News integration ENABLED: {news_path}")
+                else:
+                    dashboard.log("[yellow]⚠️ News enabled but no news path found[/]")
+                    logger.warning("News enabled but no path found")
+            else:
+                dashboard.log("[dim]📰 News: disabled (baseline mode)[/]")
+                logger.info("News integration DISABLED (baseline A/B mode)")
+            
+            if args.use_options:
+                if options_path:
+                    dashboard.log(f"[bold cyan]📊 Options:[/] {options_path}")
+                    logger.info(f"Options integration ENABLED: {options_path}")
+                else:
+                    dashboard.log("[yellow]⚠️ Options enabled but no path found[/]")
+                    logger.warning("Options enabled but no path found")
+            else:
+                dashboard.log("[dim]📊 Options: disabled (baseline mode)[/]")
+                logger.info("Options integration DISABLED (baseline A/B mode)")
+        
+        # Macro path: use provided path or default
+        macro_path = args.macro_path
+        if args.use_macro and macro_path is None:
+            for candidate in [
+                data_paths.get('stock', Path('.')).parent / 'macro' / 'macro_daily.parquet',
+                Path('datasets/macro/macro_daily.parquet'),
+            ]:
+                if candidate.exists():
+                    macro_path = str(candidate)
+                    break
+        
+        if is_main:
+            if args.use_macro:
+                if macro_path:
+                    dashboard.log(f"[bold cyan]🏦 Macro FiLM:[/] {macro_path}")
+                    logger.info(f"Macro FiLM ENABLED: {macro_path}")
+                else:
+                    dashboard.log("[yellow]⚠️ Macro enabled but no macro_daily.parquet found[/]")
+                    logger.warning("Macro enabled but no path found")
+            else:
+                dashboard.log("[dim]🏦 Macro: disabled (baseline mode)[/]")
 
         train_dataset = BarMambaDataset(
             stock_data_path=stock_path,
             vix_data_path=vix_path,
             split='train',
             max_total_bars=args.seq_len,
+            train_start=args.train_start,
             train_end=args.train_end,
             val_end=args.val_end,
+            news_data_path=news_path,
+            use_news=args.use_news,
+            options_data_path=options_path,
+            use_options=args.use_options,
+            macro_data_path=macro_path,
+            use_macro=args.use_macro,
         )
         val_dataset = BarMambaDataset(
             stock_data_path=stock_path,
             vix_data_path=vix_path,
             split='val',
             max_total_bars=args.seq_len,
+            train_start=args.train_start,
             train_end=args.train_end,
             val_end=args.val_end,
+            news_data_path=news_path,
+            use_news=args.use_news,
+            options_data_path=options_path,
+            use_options=args.use_options,
+            macro_data_path=macro_path,
+            use_macro=args.use_macro,
         )
         num_features = train_dataset.num_features
         collate_fn = BarMambaDataset.collate_fn
@@ -693,20 +910,47 @@ def main():
     if is_main:
         dashboard.log(f"[dim]Building model: d={args.d_model}, layers={args.n_layers}, state={args.d_state}[/]")
 
-    from mamba_only_model import MambaOnlyVIX
-    from loader.bar_mamba_dataset import NUM_VIX_BUCKETS
-    model = MambaOnlyVIX(
-        num_features=num_features,
-        d_model=args.d_model,
-        n_layers=args.n_layers,
-        d_state=args.d_state,
-        d_conv=4,
-        expand=2,
-        dropout=0.1,
-        pooling='attention',
-        head_hidden=128,
-        num_buckets=NUM_VIX_BUCKETS,
-    ).to(device)
+    from mamba_only_model import MambaOnlyVIX, ParallelMambaVIX, NUM_OPTION_FEATURES
+    
+    if args.use_parallel_streams:
+        # Determine macro_dim from dataset if macro is enabled
+        macro_dim = getattr(train_dataset, 'macro_dim', 15) if args.use_macro else 15
+        
+        model = ParallelMambaVIX(
+            num_features=num_features,
+            d_model=args.d_model,
+            n_layers=args.n_layers,  # Same layers for all streams
+            d_state=args.d_state,
+            d_conv=4,
+            expand=2,
+            dropout=0.1,
+            checkpoint_interval=args.checkpoint_interval,
+            use_news=args.use_news,
+            news_dim=3072,
+            use_options=args.use_options,
+            option_features=NUM_OPTION_FEATURES,
+            head_hidden=128,
+            use_macro=args.use_macro,
+            macro_dim=macro_dim,
+        ).to(device)
+        if is_main:
+            dashboard.log(f"[bold magenta]🔀 Parallel streams:[/] checkpoint every {args.checkpoint_interval} bars")
+    else:
+        model = MambaOnlyVIX(
+            num_features=num_features,
+            d_model=args.d_model,
+            n_layers=args.n_layers,
+            d_state=args.d_state,
+            d_conv=4,
+            expand=2,
+            dropout=0.1,
+            pooling='attention',
+            head_hidden=128,
+            use_news=args.use_news,
+            news_dim=3072,
+            use_options=args.use_options,
+            option_features=NUM_OPTION_FEATURES,
+        ).to(device)
 
     # Wrap model in DDP for multi-GPU training
     if is_distributed:
@@ -714,12 +958,28 @@ def main():
         if is_main:
             dashboard.log(f"[dim]Model wrapped in DistributedDataParallel[/]")
 
-    # Optimizer & loss
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-5)
-    if is_main:
-        dashboard.log(f"[dim]LR: {args.lr}[/]")
+    # Optimizer & loss — separate param group with 10x LR for FiLM generator
+    if args.use_macro and args.use_parallel_streams and hasattr(model, 'module'):
+        # DDP wrapped
+        base_model = model.module
+    else:
+        base_model = model
+    
+    if args.use_macro and hasattr(base_model, 'film_generator'):
+        film_params = list(base_model.film_generator.parameters())
+        film_param_ids = set(id(p) for p in film_params)
+        other_params = [p for p in model.parameters() if id(p) not in film_param_ids]
+        optimizer = torch.optim.AdamW([
+            {'params': other_params, 'lr': args.lr},
+            {'params': film_params, 'lr': args.lr * 10, 'weight_decay': 1e-4},
+        ], weight_decay=1e-5)
+        if is_main:
+            dashboard.log(f"[dim]LR: {args.lr} (FiLM: {args.lr * 10})[/]")
+    else:
+        optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-5)
+        if is_main:
+            dashboard.log(f"[dim]LR: {args.lr}[/]")
     criterion = nn.HuberLoss(delta=0.25)  # ~0.5 VIX points — MSE for small errors, MAE for large
-    cls_criterion = nn.CrossEntropyLoss()  # bucket classification head
 
     # AMP
     amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
@@ -744,6 +1004,7 @@ def main():
 
     # Best model tracking
     best_val_loss = float('inf')
+    epochs_without_improvement = 0
 
     # Training loop
     for epoch in range(start_epoch, args.epochs):
@@ -763,7 +1024,6 @@ def main():
         train_loss, train_steps_count, avg_iter_time = train_steps(
             model, train_loader, optimizer, criterion, scaler,
             device, args.train_steps, amp_dtype, epoch=epoch+1,
-            cls_criterion=cls_criterion, cls_weight=0.5,
         )
 
         # Validate (only on main process)
@@ -772,7 +1032,6 @@ def main():
                 model.module if is_distributed else model,
                 val_loader, criterion, device,
                 args.val_steps, amp_dtype,
-                cls_criterion=cls_criterion, cls_weight=0.5,
             )
 
             # Memory stats
@@ -784,33 +1043,87 @@ def main():
 
             dashboard.state.val_loss = val_metrics['loss']
             dashboard.state.val_mae = val_metrics['mae']
+            
+            # Build per-stream MAE display
+            stream_mae_parts = []
+            if 'stock_mae' in val_metrics:
+                stream_mae_parts.append(f"[cyan]S:{val_metrics['stock_mae']:.2f}[/]")
+            if 'news_mae' in val_metrics:
+                stream_mae_parts.append(f"[yellow]N:{val_metrics['news_mae']:.2f}[/]")
+            if 'options_mae' in val_metrics:
+                stream_mae_parts.append(f"[magenta]O:{val_metrics['options_mae']:.2f}[/]")
+            stream_mae_display = " ".join(stream_mae_parts) if stream_mae_parts else ""
+            
+            # Accuracy metrics
+            dir_acc = val_metrics.get('dir_acc', 0)
+            within_1pt = val_metrics.get('within_1pt', 0)
+            
             dashboard.log(
-                f"[green]\u2713 Epoch {epoch+1}/{args.epochs}:[/] "
+                f"[green]✓ Epoch {epoch+1}/{args.epochs}:[/] "
                 f"steps={train_steps_count} | "
                 f"loss={train_loss:.4f} | "
                 f"val_loss={val_metrics['loss']:.4f} | "
-                f"val_mae={val_metrics['mae']:.2f}pt | "
-                f"bucket_acc={val_metrics['bucket_acc']:.1%} | "
-                f"iter={avg_iter_time:.2f}s/it | "
-                f"VRAM={mem_alloc:.1f}GB"
+                f"val_mae=[green]{val_metrics['mae']:.2f}pt[/] | "
+                f"dir_acc=[cyan]{dir_acc:.1f}%[/] | "
+                f"within_1pt=[yellow]{within_1pt:.1f}%[/]"
             )
+            dashboard.log(
+                f"  [dim]iter={avg_iter_time:.2f}s/it | VRAM={mem_alloc:.1f}GB[/]"
+            )
+            if stream_mae_parts:
+                dashboard.log(f"  [dim]Stream MAE:[/] {stream_mae_display}")
             # Log to file
             logger.info(
                 f"Epoch {epoch+1}/{args.epochs}: "
                 f"train_loss={train_loss:.4f}, val_loss={val_metrics['loss']:.4f}, "
-                f"val_mae={val_metrics['mae']:.2f}pt, bucket_acc={val_metrics['bucket_acc']:.1%}, "
+                f"val_mae={val_metrics['mae']:.2f}pt, dir_acc={dir_acc:.1f}%, within_1pt={within_1pt:.1f}%, "
                 f"iter={avg_iter_time:.2f}s/it, VRAM={mem_alloc:.1f}GB"
             )
+            
+            # Log scale parameters if present (news/options injection)
+            eval_model = model.module if is_distributed else model
+            scale_info = []
+            if hasattr(eval_model, 'news_scale'):
+                scale_info.append(f"news_scale={eval_model.news_scale.item():.4f}")
+            if hasattr(eval_model, 'option_scale'):
+                scale_info.append(f"option_scale={eval_model.option_scale.item():.4f}")
+            if scale_info:
+                logger.info(f"Scale params: {', '.join(scale_info)}")
+                dashboard.log(f"[dim]📏 Scales: {', '.join(scale_info)}[/]")
+            
+            # Log FiLM gamma/beta statistics if macro is enabled
+            if hasattr(eval_model, 'film_generator'):
+                film_stats = eval_model.film_generator.get_film_stats()
+                if film_stats:
+                    film_parts = []
+                    for i in range(eval_model.n_layers):
+                        gm = film_stats.get(f'film_gamma_L{i}_mean', 1.0)
+                        gs = film_stats.get(f'film_gamma_L{i}_std', 0.0)
+                        bm = film_stats.get(f'film_beta_L{i}_mean', 0.0)
+                        bs = film_stats.get(f'film_beta_L{i}_std', 0.0)
+                        film_parts.append(f"L{i}:γ={gm:.3f}±{gs:.3f},β={bm:.3f}±{bs:.3f}")
+                    film_display = " | ".join(film_parts)
+                    dashboard.log(f"  [dim]🏦 FiLM:[/] {film_display}")
+                    logger.info(f"FiLM stats: {film_display}")
 
-            # Save best model
+            # Save best model and track patience
             if val_metrics['loss'] < best_val_loss:
                 best_val_loss = val_metrics['loss']
+                epochs_without_improvement = 0
                 best_ckpt = save_checkpoint(
                     model, optimizer, scaler, epoch + 1, val_metrics['loss'],
                     args.checkpoint_dir + '/best', is_distributed
                 )
                 dashboard.log(f"[bold green]🏆 New best model![/] val_loss={best_val_loss:.4f}")
                 logger.info(f"New best model saved: val_loss={best_val_loss:.4f}")
+            else:
+                epochs_without_improvement += 1
+                dashboard.log(f"[dim]No improvement for {epochs_without_improvement}/{args.patience} epochs[/]")
+                
+                if epochs_without_improvement >= args.patience:
+                    dashboard.log(f"[bold yellow]⏹ Early stopping triggered after {args.patience} epochs without improvement[/]")
+                    logger.info(f"Early stopping at epoch {epoch+1} (patience={args.patience})")
+                    break
 
             # Save checkpoint every N epochs (only on main process)
             if (epoch + 1) % args.save_every == 0:
@@ -851,9 +1164,8 @@ def main():
         with torch.no_grad():
             dummy = torch.randn(1, 100, num_features).to(device)
             out = eval_model(dummy)
-            ok = ('vix_pred' in out and out['vix_pred'].shape == (1,)
-                  and 'bucket_logits' in out and out['bucket_logits'].shape[0] == 1)
-            dashboard.log(f"  [{'[green]✓' if ok else '[red]✗'}] Forward pass correct (dual-head)[/]")
+            ok = 'vix_pred' in out and out['vix_pred'].shape == (1,)
+            dashboard.log(f"  [{'[green]✓' if ok else '[red]✗'}] Forward pass correct[/]")
             checks_passed += ok
 
         # Check 3: Backward pass works
@@ -883,7 +1195,6 @@ def main():
         # Log results to CSV for HP sweep
         if args.results_csv:
             import csv
-            from pathlib import Path
             csv_path = Path(args.results_csv)
             write_header = not csv_path.exists()
             with open(csv_path, 'a', newline='') as f:
@@ -891,12 +1202,11 @@ def main():
                 if write_header:
                     writer.writerow(['exp_name', 'lr', 'd_model', 'n_layers', 'd_state', 
                                    'seq_len', 'epochs', 'final_train_loss', 'final_val_loss', 
-                                   'final_val_mae_pt', 'final_bucket_acc', 'checks_passed'])
+                                   'final_val_mae_pt', 'checks_passed'])
                 exp_name = args.exp_name or f"lr_{args.lr}"
                 writer.writerow([exp_name, args.lr, args.d_model, args.n_layers, args.d_state,
                                args.seq_len, args.epochs, f"{train_loss:.6f}", 
                                f"{val_metrics['loss']:.6f}", f"{val_metrics['mae']:.4f}",
-                               f"{val_metrics['bucket_acc']:.4f}",
                                f"{checks_passed}/{total_checks}"])
             dashboard.log(f"[bold green]📊 Results appended to:[/] {args.results_csv}")
         

@@ -1,0 +1,8 @@
+exp_name,lr,d_model,n_layers,d_state,seq_len,epochs,final_train_loss,final_val_loss,final_val_mae_pt,checks_passed
+test_stock_only,0.0001,256,4,64,15000,1,0.451913,0.211112,0.9619,5/5
+test_news_only,0.0001,256,4,64,15000,1,0.329916,0.209761,0.9573,5/5
+test_options_only,0.0001,256,4,64,15000,1,0.352343,0.211399,0.9629,5/5
+baseline_stock,0.0001,256,4,64,15000,1,0.451914,0.211112,0.9619,5/5
+stock_plus_news,0.0001,256,4,64,15000,1,0.329916,0.209762,0.9573,5/5
+stock_plus_options,0.0001,256,4,64,15000,1,0.352343,0.211399,0.9629,5/5
+stock_plus_news_plus_options,0.0001,256,4,64,15000,1,0.578806,0.209764,0.9573,5/5

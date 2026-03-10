@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """
-Download stock and VIX data from Cloudflare R2 storage.
+Download stock, VIX, options, and news data from Cloudflare R2 storage.
 
 Usage:
     python download_data.py --year 2024 --data-type stock
     python download_data.py --year 2023 --data-type vix
-    python download_data.py --year 2024 --data-type both
+    python download_data.py --year 2024 --data-type all
     python download_data.py --start-year 2023 --end-year 2024 --data-type stock
+    python download_data.py --year 2024 --data-type options
+    python download_data.py --year 2024 --data-type news
 """
 
 import argparse
@@ -24,6 +26,8 @@ R2_BUCKET = 'europe'
 # Data paths
 STOCK_PREFIX = 'datasets/Stock_Data_1s/'
 VIX_PREFIX = 'datasets/VIX/'
+OPTIONS_PREFIX = 'datasets/opt_trade_1sec/'
+NEWS_PREFIX = 'datasets/benzinga_embeddings/'
 
 
 def download_stock_data(s3_client, year: Optional[int] = None, 
@@ -144,9 +148,149 @@ def download_vix_data(s3_client, year: Optional[int] = None,
     return downloaded_count
 
 
+def download_options_data(s3_client, year: Optional[int] = None,
+                          start_year: Optional[int] = None,
+                          end_year: Optional[int] = None,
+                          local_dir: Path = Path('datasets/opt_trade_1sec'),
+                          force: bool = False):
+    """Download options trade data (contract and underlying bars) from R2."""
+    print(f'📊 Downloading opt_trade_1sec from R2...')
+    if year:
+        print(f'   Filtering for year: {year}')
+    elif start_year and end_year:
+        print(f'   Filtering for years: {start_year}-{end_year}')
+    
+    paginator = s3_client.get_paginator('list_objects_v2')
+    downloaded_count = 0
+    skipped_count = 0
+    total_size = 0
+    
+    for page in paginator.paginate(Bucket=R2_BUCKET, Prefix=OPTIONS_PREFIX):
+        if 'Contents' not in page:
+            continue
+        
+        for obj in page['Contents']:
+            key = obj['Key']
+            if key.endswith('/'):
+                continue
+            
+            # Key format: datasets/opt_trade_1sec/option_underlying_bars_1s/2024-01-02.parquet
+            parts = key.replace(OPTIONS_PREFIX, '').split('/')
+            if len(parts) < 2:
+                continue
+            
+            subdir = parts[0]  # e.g., option_underlying_bars_1s
+            filename = parts[1]  # e.g., 2024-01-02.parquet
+            
+            # Filter by year(s) - filename format: YYYY-MM-DD.parquet
+            if year:
+                if not filename.startswith(f'{year}-'):
+                    continue
+            elif start_year and end_year:
+                try:
+                    file_year = int(filename.split('-')[0])
+                    if file_year < start_year or file_year > end_year:
+                        continue
+                except (ValueError, IndexError):
+                    continue
+            
+            # Create subdirectory structure
+            subdir_path = local_dir / subdir
+            subdir_path.mkdir(parents=True, exist_ok=True)
+            
+            local_file = subdir_path / filename
+            remote_size = obj['Size']
+            size_mb = remote_size / 1e6
+            
+            # Skip if file exists with matching size
+            if not force and local_file.exists():
+                local_size = local_file.stat().st_size
+                if local_size == remote_size:
+                    skipped_count += 1
+                    continue
+                else:
+                    print(f'  [{downloaded_count+1}] {subdir}/{filename} ({size_mb:.1f} MB) [re-downloading]')
+            else:
+                print(f'  [{downloaded_count+1}] {subdir}/{filename} ({size_mb:.1f} MB)')
+            
+            s3_client.download_file(R2_BUCKET, key, str(local_file))
+            
+            downloaded_count += 1
+            total_size += remote_size
+    
+    print(f'✅ Options data: {downloaded_count} downloaded, {skipped_count} skipped (already exist), {total_size/1e9:.2f} GB transferred')
+    return downloaded_count
+
+
+def download_news_data(s3_client, year: Optional[int] = None,
+                       start_year: Optional[int] = None,
+                       end_year: Optional[int] = None,
+                       local_dir: Path = Path('datasets/benzinga_embeddings'),
+                       force: bool = False):
+    """Download Benzinga news embeddings from R2."""
+    local_dir.mkdir(parents=True, exist_ok=True)
+    
+    print(f'📰 Downloading benzinga_embeddings from R2...')
+    if year:
+        print(f'   Filtering for year: {year}')
+    elif start_year and end_year:
+        print(f'   Filtering for years: {start_year}-{end_year}')
+    
+    paginator = s3_client.get_paginator('list_objects_v2')
+    downloaded_count = 0
+    skipped_count = 0
+    total_size = 0
+    
+    for page in paginator.paginate(Bucket=R2_BUCKET, Prefix=NEWS_PREFIX):
+        if 'Contents' not in page:
+            continue
+        
+        for obj in page['Contents']:
+            key = obj['Key']
+            if key.endswith('/'):
+                continue
+            
+            filename = key.split('/')[-1]
+            
+            # Filter by year - filename format: YYYY_embedded.parquet
+            if year or (start_year and end_year):
+                try:
+                    file_year = int(filename.split('_')[0])
+                    if year and file_year != year:
+                        continue
+                    if start_year and end_year:
+                        if file_year < start_year or file_year > end_year:
+                            continue
+                except (ValueError, IndexError):
+                    continue
+            
+            local_file = local_dir / filename
+            remote_size = obj['Size']
+            size_gb = remote_size / 1e9
+            
+            # Skip if file exists with matching size
+            if not force and local_file.exists():
+                local_size = local_file.stat().st_size
+                if local_size == remote_size:
+                    skipped_count += 1
+                    continue
+                else:
+                    print(f'  [{downloaded_count+1}] {filename} ({size_gb:.2f} GB) [re-downloading]')
+            else:
+                print(f'  [{downloaded_count+1}] {filename} ({size_gb:.2f} GB)')
+            
+            s3_client.download_file(R2_BUCKET, key, str(local_file))
+            
+            downloaded_count += 1
+            total_size += remote_size
+    
+    print(f'✅ News data: {downloaded_count} downloaded, {skipped_count} skipped (already exist), {total_size/1e9:.2f} GB transferred')
+    return downloaded_count
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description='Download stock and VIX data from Cloudflare R2',
+        description='Download stock, VIX, options, and news data from Cloudflare R2',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -159,26 +303,36 @@ Examples:
   # Download VIX data
   python download_data.py --data-type vix
   
-  # Download both stock and VIX for 2024
-  python download_data.py --year 2024 --data-type both
+  # Download options data for 2024
+  python download_data.py --year 2024 --data-type options
+  
+  # Download news embeddings for 2024
+  python download_data.py --year 2024 --data-type news
+  
+  # Download all data types for 2024 (year filter applies to ALL types)
+  python download_data.py --year 2024 --data-type all
   
   # Download all available data
-  python download_data.py --data-type both
+  python download_data.py --data-type all
   
   # Force re-download (ignore existing files)
-  python download_data.py --data-type both --force
+  python download_data.py --data-type all --force
         """
     )
     
-    parser.add_argument('--year', type=int, help='Specific year to download (e.g., 2024)')
-    parser.add_argument('--start-year', type=int, help='Start year for range download')
-    parser.add_argument('--end-year', type=int, help='End year for range download')
-    parser.add_argument('--data-type', choices=['stock', 'vix', 'both'], default='both',
-                       help='Type of data to download (default: both)')
+    parser.add_argument('--year', type=int, help='Specific year to download (e.g., 2024) - applies to ALL data types')
+    parser.add_argument('--start-year', type=int, help='Start year for range download - applies to ALL data types')
+    parser.add_argument('--end-year', type=int, help='End year for range download - applies to ALL data types')
+    parser.add_argument('--data-type', choices=['stock', 'vix', 'options', 'news', 'all'], default='all',
+                       help='Type of data to download (default: all)')
     parser.add_argument('--stock-dir', type=Path, default=Path('datasets/Stock_Data_1s'),
                        help='Local directory for stock data (default: datasets/Stock_Data_1s)')
     parser.add_argument('--vix-dir', type=Path, default=Path('datasets/VIX'),
                        help='Local directory for VIX data (default: datasets/VIX)')
+    parser.add_argument('--options-dir', type=Path, default=Path('datasets/opt_trade_1sec'),
+                       help='Local directory for options data (default: datasets/opt_trade_1sec)')
+    parser.add_argument('--news-dir', type=Path, default=Path('datasets/benzinga_embeddings'),
+                       help='Local directory for news data (default: datasets/benzinga_embeddings)')
     parser.add_argument('--force', action='store_true',
                        help='Force re-download all files (ignore existing)')
     
@@ -204,7 +358,7 @@ Examples:
     print('✅ Connected to R2\n')
     
     # Download requested data
-    if args.data_type in ['stock', 'both']:
+    if args.data_type in ['stock', 'all']:
         download_stock_data(
             s3, 
             year=args.year,
@@ -215,13 +369,35 @@ Examples:
         )
         print()
     
-    if args.data_type in ['vix', 'both']:
+    if args.data_type in ['vix', 'all']:
         download_vix_data(
             s3,
             year=args.year,
             start_year=args.start_year,
             end_year=args.end_year,
             local_dir=args.vix_dir,
+            force=args.force
+        )
+        print()
+    
+    if args.data_type in ['options', 'all']:
+        download_options_data(
+            s3,
+            year=args.year,
+            start_year=args.start_year,
+            end_year=args.end_year,
+            local_dir=args.options_dir,
+            force=args.force
+        )
+        print()
+    
+    if args.data_type in ['news', 'all']:
+        download_news_data(
+            s3,
+            year=args.year,
+            start_year=args.start_year,
+            end_year=args.end_year,
+            local_dir=args.news_dir,
             force=args.force
         )
         print()
