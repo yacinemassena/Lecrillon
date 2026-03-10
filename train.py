@@ -672,12 +672,16 @@ def main():
                         help='Experiment name for logging (default: auto-generated)')
     parser.add_argument('--results-csv', type=str, default=None,
                         help='CSV file to append results (for HP sweep)')
-    parser.add_argument('--use-news', action='store_true',
-                        help='Enable news integration (Benzinga embeddings). Toggle off for A/B comparison.')
+    parser.add_argument('--use-news', action='store_true', default=cfg.use_news,
+                        help='Enable news integration (Benzinga embeddings). Enabled by default.')
+    parser.add_argument('--no-news', action='store_false', dest='use_news',
+                        help='Disable news integration for A/B comparison.')
     parser.add_argument('--news-path', type=str, default=None,
                         help='Path to news embeddings directory (default: datasets/benzinga_embeddings/news)')
-    parser.add_argument('--use-options', action='store_true',
-                        help='Enable options flow integration. Toggle off for A/B comparison.')
+    parser.add_argument('--use-options', action='store_true', default=cfg.use_options,
+                        help='Enable options flow integration. Enabled by default.')
+    parser.add_argument('--no-options', action='store_false', dest='use_options',
+                        help='Disable options flow integration for A/B comparison.')
     parser.add_argument('--options-path', type=str, default=None,
                         help='Path to options data directory (default: datasets/opt_trade_1sec)')
     parser.add_argument('--use-macro', action='store_true',

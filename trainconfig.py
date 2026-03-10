@@ -24,6 +24,8 @@ class TrainConfig:
     d_state: int = 64               # Mamba state dimension
     checkpoint_interval: int = 300  # Fusion checkpoint every N bars (300 = 5 min)
     use_parallel_streams: bool = True  # Use ParallelMambaVIX (vs legacy MambaOnlyVIX)
+    use_news: bool = True           # Enable news stream by default
+    use_options: bool = True        # Enable options stream by default
     use_macro: bool = False         # Enable macro FiLM conditioning
     
     # Data source
