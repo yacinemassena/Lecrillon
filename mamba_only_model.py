@@ -870,7 +870,7 @@ class ParallelMambaVIX(nn.Module):
         num_fusion_heads: int = 4,
         head_hidden: int = 128,
         use_macro: bool = False,
-        macro_dim: int = 15,
+        macro_dim: int = 21,  # FED/FRED macro features from datasets/macro/macro_daily.parquet
     ):
         super().__init__()
         self.d_model = d_model

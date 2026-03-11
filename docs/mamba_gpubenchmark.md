@@ -2,6 +2,8 @@
 
 ## Configuration: D=256, L=4, STATE=64, BATCH=16
 
+Note: the first table below is for 1 feed.
+
 | GPU | Seq Length | VRAM (GB) | Speed (s/it) | Cost per 1000 it |
 |-----|------------|-----------|--------------|------------------|
 | RTX 3080 Ti (unstable) | 15,000 | 9 | 0.70 | $0.05 |
@@ -28,3 +30,14 @@
 | B200 | 150,000 | 70.7 | 3.5 | $4.82 |
 | B200 | 300,000 | 130 | 6.51 | $8.96 |
 | B200 | 400,000 | 159 | 8.0 | $11.02 |
+
+## Configuration: 3 feeds (options, stock, news)
+
+| GPU | Seq Length | Batch | Layers | VRAM (GB) | Speed (s/it) |
+|-----|------------|-------|--------|-----------|--------------|
+| RTX 5080 (Local) | 15,000 | 16 | 4 | 16.1 (maxed) | 8.95 |
+| RTX 5080 (Local) | 15,000 | 8 | 4 | 12.8 | 2.86 |
+| RTX 6000 Ada | 15,000 | 16 | 4 | 16.4 | 1.0 |
+| RTX 6000 Ada | 15,000 | 32 | 4 | 31.8 | 1.72 |
+| RTX 6000 Ada | 15,000 | 16 | 6 | 22.3 | 1.7 |
+| RTX 6000 Ada | 15,000 | 48 | 4 | 49.6 (maxed) | 3.55 |

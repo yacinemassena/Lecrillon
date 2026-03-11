@@ -1,31 +1,4 @@
-cd /workspace
-git clone https://github.com/yacinemassena/Lecrillon.git
-cd Lecrillon
-
-# Download data
-python download_vix.py --vix-dir /workspace/datasets/VIX
-python download_data.py --year 2024 --data-type stock --stock-dir /workspace/datasets/Stock_Data_1s
-
-# Run smoke test
-python smoke_mamba_only.py --train-steps 20 --val-steps 5 --epochs 1
-
-
-
-
-
-
-bash
-cd /workspace
-git clone https://github.com/yacinemassena/Lecrillon.git
-cd Lecrillon
-python download_vix.py --vix-dir /workspace/datasets/VIX
-python download_data.py --year 2024 --data-type both --stock-dir /workspace/datasets/Stock_Data_1s --vix-dir /workspace/datasets/VIX
-
-python train.py
-No setup script needed!
-
-Option 2: setupvps.sh (Uses Pre-Built Wheels/Venv)
-On RunPod (without Docker):
+(without Docker):
 
 bash
 cd /workspace
@@ -37,48 +10,32 @@ python download_vix.py --vix-dir /workspace/datasets/VIX
 python download_data.py --year 2024 --data-type both --stock-dir /workspace/datasets/Stock_Data_1s --vix-dir /workspace/datasets/VIX
 python train.py --seq-len 15000
 
+
+    WITH DOCKER 
+---
 cd /workspace
 git clone https://github.com/yacinemassena/Lecrillon.git
 cd Lecrillon
 python download_vix.py --vix-dir /workspace/datasets/VIX
-python download_data.py --year 2024 --data-type both --stock-dir /workspace/datasets/Stock_Data_1s --vix-dir /workspace/datasets/VIX
-python train.py --seq-len 15000
-python train.py --seq-len 15000 --train-end 2024-03-30 --val-end 2024-05-31
+python download_data.py --year 2024 --data-type all \
+  --stock-dir /workspace/datasets/Stock_Data_1s \
+  --vix-dir /workspace/datasets/VIX \
+  --options-dir /workspace/datasets/opt_trade_1sec \
+  --news-dir /workspace/datasets/benzinga_embeddings
 
-all data:
-python download_data.py --data-type both --stock-dir /workspace/datasets/Stock_Data_1s --vix-dir /workspace/datasets/VIX
-torchrun --nproc_per_node=6 train.py --seq-len 15000
+    # Install rclone on VPS (one-time)
+curl https://rclone.org/install.sh | sudo bash
 
-# =============================================================================
-# A/B EXPERIMENT: Multi-source comparison (3 GPUs, 1 epoch, 500 train / 50 val)
-# Start from 2014 to ensure all datasets have data (options/news availability)
-# =============================================================================
+    # Download 2024 data with 32 parallel transfers
+python download_data_fast.py --year 2024 --data-type all
 
-# Experiment 1: Stock only (baseline)
-torchrun --nproc_per_node=3 train.py --seq-len 15000 --epochs 1 --train-steps 500 --val-steps 50 \
-    --train-start 2014-01-01 \
-    --exp-name "baseline_stock_only" --results-csv results_ab.csv
+---
+python train.py --seq-len 15000 --train-end 2024-03-30 --val-end 2024-11-31
 
-# Experiment 2: Stock + News
-torchrun --nproc_per_node=3 train.py --seq-len 15000 --epochs 1 --train-steps 500 --val-steps 50 \
-    --train-start 2014-01-01 \
-    --use-news --news-path /workspace/datasets/benzinga_embeddings/news \
-    --exp-name "stock_news" --results-csv results_ab.csv
+python train.py --seq-len 15000 --batch-size 8 --n-layers 6 --d-model 256 --train-start 2024-01-01 --train-end 2024-03-30 --val-end 2024-11-30
 
-# Experiment 3: Stock + News + Options
-torchrun --nproc_per_node=3 train.py --seq-len 15000 --epochs 1 --train-steps 500 --val-steps 50 \
-    --train-start 2014-01-01 \
-    --use-news --news-path /workspace/datasets/benzinga_embeddings/news \
-    --use-options --options-path /workspace/datasets/opt_trade_1sec \
-    --exp-name "stock_news_options" --results-csv results_ab.csv
-
-# View results
-cat results_ab.csv
 
 LOCAL 
 wsl
 cd /mnt/d/Mamba\ v2
 source venv/bin/activate
-
-# 2. Run training (adjust seq-len based on your GPU VRAM)
-python train.py --epochs 10 --train-steps 100 --val-steps 20 --seq-len 15000

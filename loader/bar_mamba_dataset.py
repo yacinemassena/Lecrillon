@@ -177,8 +177,13 @@ class BarMambaDataset(Dataset):
             macro_path = Path(macro_data_path)
             if macro_path.exists():
                 self.macro_data = pd.read_parquet(macro_path)
-                self.macro_data['date'] = pd.to_datetime(self.macro_data['date']).dt.date
-                self.macro_data = self.macro_data.set_index('date').sort_index()
+                # Handle both index-based and column-based date
+                if 'date' in self.macro_data.columns:
+                    self.macro_data['date'] = pd.to_datetime(self.macro_data['date']).dt.date
+                    self.macro_data = self.macro_data.set_index('date').sort_index()
+                elif self.macro_data.index.name == 'date' or self.macro_data.index.dtype == 'datetime64[ns]':
+                    self.macro_data.index = pd.to_datetime(self.macro_data.index).date
+                    self.macro_data.index.name = 'date'
                 self.macro_features = [c for c in self.macro_data.columns]
                 self.macro_dim = len(self.macro_features)
                 logger.info(f"Loaded macro data: {len(self.macro_data)} days, {self.macro_dim} features")
