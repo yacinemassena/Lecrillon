@@ -1,15 +1,15 @@
 """
-Multi-Source Mamba VIX Prediction Model.
+Parallel Mamba VIX Prediction Model.
 
-Architecture with separate encoders and cross-attention CLS fusion:
+Architecture with parallel streams and periodic fusion:
 
-    Stock Bars [B, T, 15]  → StockEncoder + CLS → [B, T+1, d_model]
-    Option Bars [B, T, 15] → OptionEncoder + CLS → [B, T+1, d_model]  (optional)
-    News Embs [B, N, 3072] → NewsEncoder + CLS → [B, N+1, d_model]   (optional)
+    Stock Bars [B, T, 29]  → StreamEncoder → StreamMamba → [B, T, d_model]
+    Option Bars [B, T, 38] → StreamEncoder → StreamMamba → [B, T, d_model]  (optional)
+    News Embs [B, N, 3072] → StreamEncoder → StreamMamba → [B, N, d_model]  (optional)
                                     ↓
-                           CrossAttentionFusion (stock CLS attends to others)
+                           FusionGate (cross-attention + gating every checkpoint_interval)
                                     ↓
-                           MambaStack → Pool → VIXHead → [B] VIX change
+                           Pool → MultiHorizonVIXHead → [B, 4] VIX change at +1d/+7d/+15d/+30d
 """
 
 import logging
@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Option features (all 38 features from option_underlying_bars_1s)
+# Option features (all 49 features from opt_trade_2min)
 # ---------------------------------------------------------------------------
 OPTION_FEATURES = [
     'call_volume', 'put_volume', 'call_trade_count', 'put_trade_count',
@@ -41,8 +41,12 @@ OPTION_FEATURES = [
     'total_volume', 'total_trade_count',
     'unique_contracts', 'unique_strikes', 'unique_expiries',
     'pc_ratio_vs_20d', 'call_volume_vs_20d', 'put_volume_vs_20d',
+    # New 2-min features
+    'net_premium_flow', 'premium_imbalance', 'large_trade_pct', 'put_large_pct',
+    'uoa_total', 'uoa_put_bias', 'deep_otm_put_pct',
+    'near_far_ratio', 'sweep_to_trade_ratio',
 ]
-NUM_OPTION_FEATURES = len(OPTION_FEATURES)  # 38
+NUM_OPTION_FEATURES = len(OPTION_FEATURES)  # 47 (49 cols - underlying - bar_timestamp)
 
 # ---------------------------------------------------------------------------
 # Mamba import
@@ -57,225 +61,6 @@ except ImportError:
             "mamba_ssm not found. Install from custom_packages/mamba_blackwell "
             "or run setupenv.sh in WSL"
         )
-
-
-# ---------------------------------------------------------------------------
-# Source Encoder (base class with CLS token)
-# ---------------------------------------------------------------------------
-class SourceEncoder(nn.Module):
-    """Encoder for a single data source with learnable CLS token.
-    
-    Projects input features to d_model and prepends a CLS token.
-    """
-
-    def __init__(self, num_features: int, d_model: int, dropout: float = 0.1, 
-                 normalize_input: bool = False):
-        super().__init__()
-        self.d_model = d_model
-        self.normalize_input = normalize_input
-        
-        # Optional input normalization (for pre-embedded inputs like news)
-        if normalize_input:
-            self.input_norm = nn.LayerNorm(num_features)
-        
-        self.proj = nn.Sequential(
-            nn.Linear(num_features, d_model),
-            nn.LayerNorm(d_model),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(d_model, d_model),
-            nn.LayerNorm(d_model),
-        )
-        # Learnable CLS token
-        self.cls_token = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
-
-    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Args:
-            x: [B, T, num_features]
-            mask: [B, T] optional validity mask
-        Returns:
-            tokens: [B, T+1, d_model] with CLS at position 0
-            mask: [B, T+1] with CLS always valid
-        """
-        B, T, _ = x.shape
-        
-        # Normalize input if enabled (for pre-embedded inputs)
-        if self.normalize_input:
-            x = self.input_norm(x)
-        
-        tokens = self.proj(x)  # [B, T, d_model]
-        
-        # Prepend CLS token
-        cls_expanded = self.cls_token.expand(B, -1, -1)  # [B, 1, d_model]
-        tokens = torch.cat([cls_expanded, tokens], dim=1)  # [B, T+1, d_model]
-        
-        # Update mask to include CLS
-        if mask is None:
-            mask = torch.ones(B, T, device=x.device)
-        cls_mask = torch.ones(B, 1, device=x.device)
-        mask = torch.cat([cls_mask, mask], dim=1)  # [B, T+1]
-        
-        return tokens, mask
-
-    def get_cls(self, tokens: torch.Tensor) -> torch.Tensor:
-        """Extract CLS token from encoded sequence."""
-        return tokens[:, 0, :]  # [B, d_model]
-
-
-# ---------------------------------------------------------------------------
-# Cross-Attention Fusion
-# ---------------------------------------------------------------------------
-class CrossAttentionFusion(nn.Module):
-    """Fuse multiple source representations using cross-attention.
-    
-    The primary CLS token (stock) attends to all other source sequences.
-    """
-
-    def __init__(self, d_model: int, num_heads: int = 4, dropout: float = 0.1):
-        super().__init__()
-        self.d_model = d_model
-        self.num_heads = num_heads
-        self.head_dim = d_model // num_heads
-        assert self.head_dim * num_heads == d_model, "d_model must be divisible by num_heads"
-        
-        self.q_proj = nn.Linear(d_model, d_model)
-        self.k_proj = nn.Linear(d_model, d_model)
-        self.v_proj = nn.Linear(d_model, d_model)
-        self.out_proj = nn.Linear(d_model, d_model)
-        
-        self.norm1 = nn.LayerNorm(d_model)
-        self.norm2 = nn.LayerNorm(d_model)
-        self.ffn = nn.Sequential(
-            nn.Linear(d_model, d_model * 4),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(d_model * 4, d_model),
-            nn.Dropout(dropout),
-        )
-        self.dropout = nn.Dropout(dropout)
-        
-        self.scale = 1.0 / math.sqrt(self.head_dim)
-
-    def forward(
-        self,
-        query_cls: torch.Tensor,           # [B, d_model] - primary CLS token
-        context_sequences: List[Tuple[torch.Tensor, torch.Tensor]],  # [(seq, mask), ...]
-    ) -> torch.Tensor:
-        """
-        Args:
-            query_cls: [B, d_model] - CLS token from primary source (stock)
-            context_sequences: list of (sequence [B, T, d_model], mask [B, T]) tuples
-        Returns:
-            fused_cls: [B, d_model] - fused representation
-        """
-        B = query_cls.shape[0]
-        device = query_cls.device
-        
-        # If no context, return query unchanged
-        if not context_sequences:
-            return query_cls
-        
-        # Concatenate all context sequences
-        all_kv = []
-        all_masks = []
-        for seq, mask in context_sequences:
-            if seq is not None and seq.shape[1] > 0:
-                all_kv.append(seq)
-                all_masks.append(mask)
-        
-        if not all_kv:
-            return query_cls
-        
-        kv = torch.cat(all_kv, dim=1)  # [B, total_ctx, d_model]
-        kv_mask = torch.cat(all_masks, dim=1)  # [B, total_ctx]
-        
-        # Cross-attention: query_cls attends to kv
-        q = self.q_proj(query_cls).unsqueeze(1)  # [B, 1, d_model]
-        k = self.k_proj(kv)  # [B, total_ctx, d_model]
-        v = self.v_proj(kv)  # [B, total_ctx, d_model]
-        
-        # Reshape for multi-head attention
-        q = q.view(B, 1, self.num_heads, self.head_dim).transpose(1, 2)  # [B, H, 1, head_dim]
-        k = k.view(B, -1, self.num_heads, self.head_dim).transpose(1, 2)  # [B, H, ctx, head_dim]
-        v = v.view(B, -1, self.num_heads, self.head_dim).transpose(1, 2)  # [B, H, ctx, head_dim]
-        
-        # Attention scores
-        attn = torch.matmul(q, k.transpose(-2, -1)) * self.scale  # [B, H, 1, ctx]
-        
-        # Apply mask (set padded positions to -inf)
-        attn_mask = kv_mask.unsqueeze(1).unsqueeze(2)  # [B, 1, 1, ctx]
-        attn = attn.masked_fill(attn_mask == 0, float('-inf'))
-        
-        attn = F.softmax(attn, dim=-1)
-        attn = self.dropout(attn)
-        
-        # Apply attention to values
-        out = torch.matmul(attn, v)  # [B, H, 1, head_dim]
-        out = out.transpose(1, 2).contiguous().view(B, self.d_model)  # [B, d_model]
-        out = self.out_proj(out)
-        
-        # Residual + LayerNorm
-        fused = self.norm1(query_cls + self.dropout(out))
-        
-        # FFN + Residual
-        fused = self.norm2(fused + self.ffn(fused))
-        
-        return fused
-
-
-# ---------------------------------------------------------------------------
-# Bar Projection (legacy alias)
-# ---------------------------------------------------------------------------
-class BarProjection(SourceEncoder):
-    """Alias for backward compatibility."""
-    pass
-
-
-# ---------------------------------------------------------------------------
-# Mamba Stack
-# ---------------------------------------------------------------------------
-class MambaStack(nn.Module):
-    """Stack of Mamba layers with residual + norm + dropout."""
-
-    def __init__(
-        self,
-        n_layers: int = 4,
-        d_model: int = 256,
-        d_state: int = 64,
-        d_conv: int = 4,
-        expand: int = 2,
-        dropout: float = 0.1,
-    ):
-        super().__init__()
-        self.layers = nn.ModuleList()
-        self.norms = nn.ModuleList()
-        self.dropouts = nn.ModuleList()
-
-        for _ in range(n_layers):
-            self.layers.append(
-                Mamba(
-                    d_model=d_model,
-                    d_state=d_state,
-                    d_conv=d_conv,
-                    expand=expand,
-                )
-            )
-            self.norms.append(nn.LayerNorm(d_model))
-            self.dropouts.append(
-                nn.Dropout(dropout) if dropout > 0 else nn.Identity()
-            )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """x: [B, T, D] → [B, T, D]"""
-        for layer, norm, drop in zip(self.layers, self.norms, self.dropouts):
-            residual = x
-            x = layer(x)
-            x = norm(x)
-            x = drop(x)
-            x = x + residual
-        return x
-
 
 # ---------------------------------------------------------------------------
 # Sequence Pooling
@@ -323,191 +108,68 @@ class VIXHead(nn.Module):
             nn.Linear(hidden_dim, 1),
         )
 
-        # Initialize final layer near zero (daily VIX change ≈ 0)
+        # Initialize final layer weights near zero (daily VIX change ≈ 0)
+        # Keep bias at PyTorch default to break symmetry between heads
         with torch.no_grad():
             self.net[-1].weight.fill_(0.0)
-            self.net[-1].bias.fill_(0.0)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """x: [B, D] → [B]"""
         return self.net(x).squeeze(-1)
 
 
-# Full Model
-# ---------------------------------------------------------------------------
-class MambaOnlyVIX(nn.Module):
-    """
-    Multi-source Mamba VIX prediction with cross-attention CLS fusion.
+# Multi-horizon prediction targets
+HORIZONS = [1, 7, 15, 30]  # +1d, +7d, +15d, +30d
+NUM_HORIZONS = len(HORIZONS)
 
-    Architecture:
-        Stock → StockEncoder + CLS → [B, T+1, d_model]
-        Options → OptionEncoder + CLS → [B, T+1, d_model]  (optional)
-        News → NewsEncoder + CLS → [B, N+1, d_model]       (optional)
-                        ↓
-        CrossAttentionFusion (stock CLS attends to option/news sequences)
-                        ↓
-        Fused CLS → MambaStack → Pool → VIXHead → [B] VIX change
+
+class MultiHorizonVIXHead(nn.Module):
+    """Multi-horizon VIX prediction: shared trunk + per-horizon heads.
+    
+    Predicts VIX change at +1d, +7d, +15d, +30d horizons.
+    Architecture: shared MLP trunk → 4 separate linear output heads.
     """
 
-    def __init__(
-        self,
-        num_features: int = 29,
-        d_model: int = 256,
-        n_layers: int = 4,
-        d_state: int = 64,
-        d_conv: int = 4,
-        expand: int = 2,
-        dropout: float = 0.1,
-        pooling: str = 'attention',
-        head_hidden: int = 128,
-        use_news: bool = False,
-        news_dim: int = 3072,
-        use_options: bool = False,
-        option_features: int = NUM_OPTION_FEATURES,
-        num_fusion_heads: int = 4,
-    ):
+    def __init__(self, d_model: int, hidden_dim: int = 128, dropout: float = 0.1, 
+                 num_horizons: int = NUM_HORIZONS):
         super().__init__()
-        self.d_model = d_model
-        self.use_news = use_news
-        self.use_options = use_options
-
-        # Stock encoder (always active)
-        self.stock_encoder = SourceEncoder(num_features, d_model, dropout)
+        self.num_horizons = num_horizons
         
-        # Option injector: projects option features to d_model for additive injection
-        # Options are already timestamp-aligned with stock bars
-        if use_options:
-            self.option_proj = nn.Sequential(
-                nn.Linear(option_features, d_model),
-                nn.GELU(),
-                nn.Dropout(dropout),
-                nn.LayerNorm(d_model),  # Normalize at the end for balanced injection
-            )
-            self.option_scale = nn.Parameter(torch.ones(1) * 0.1)  # Learnable scale, start small (options sparse)
-            logger.info(f"Options injection enabled: {option_features} → {d_model} (additive)")
-        
-        # News injector: projects news embeddings to d_model for additive injection
-        # News will be injected at their timestamp positions in the sequence
-        if use_news:
-            self.news_proj = nn.Sequential(
-                nn.LayerNorm(news_dim),  # Normalize pre-embedded inputs (scale mismatch fix)
-                nn.Linear(news_dim, d_model),
-                nn.GELU(),
-                nn.Dropout(dropout),
-                nn.LayerNorm(d_model),  # Normalize at the end for balanced injection
-            )
-            self.news_scale = nn.Parameter(torch.ones(1) * 0.5)  # Learnable scale, higher init for news
-            logger.info(f"News injection enabled: {news_dim} → {d_model} (additive at timestamps)")
-        
-        # Mamba backbone
-        self.mamba = MambaStack(
-            n_layers=n_layers,
-            d_model=d_model,
-            d_state=d_state,
-            d_conv=d_conv,
-            expand=expand,
-            dropout=dropout,
+        # Shared trunk (learns common representation)
+        self.trunk = nn.Sequential(
+            nn.Linear(d_model, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
         )
         
-        self.pool = SequencePooling(d_model, pooling)
-        self.head = VIXHead(d_model, head_hidden, dropout)
-
-        num_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
-        sources = ['stock'] + (['options'] if use_options else []) + (['news'] if use_news else [])
-        logger.info(f"MambaOnlyVIX: {num_params:,} parameters "
-                    f"(d_model={d_model}, layers={n_layers}, sources={sources})")
-
-    def forward(
-        self,
-        bars: torch.Tensor,
-        bar_mask: Optional[torch.Tensor] = None,
-        options: Optional[torch.Tensor] = None,
-        options_mask: Optional[torch.Tensor] = None,
-        news_embs: Optional[torch.Tensor] = None,
-        news_mask: Optional[torch.Tensor] = None,
-        news_indices: Optional[torch.Tensor] = None,
-        **kwargs,
-    ) -> Dict[str, torch.Tensor]:
-        """
-        Timestamp-aligned multimodal forward pass with additive injection.
+        # Per-horizon output heads
+        self.horizon_heads = nn.ModuleList([
+            nn.Linear(hidden_dim, 1) for _ in range(num_horizons)
+        ])
         
+        # Initialize output heads weights near zero (VIX change ≈ 0)
+        # Keep bias at PyTorch default to break symmetry between heads
+        with torch.no_grad():
+            for head in self.horizon_heads:
+                head.weight.fill_(0.0)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
         Args:
-            bars: [B, T, num_features] - Raw 1s stock bar features
-            bar_mask: [B, T] - Optional valid bar mask (1=valid, 0=pad)
-            options: [B, T, option_features] - Option features (timestamp-aligned with bars)
-            options_mask: [B, T] - Option validity mask (1=valid, 0=pad)
-            news_embs: [B, N, news_dim] - News embeddings
-            news_mask: [B, N] - News mask (1=valid, 0=pad)
-            news_indices: [B, N] - Bar position index for each news item
-
+            x: [B, d_model] pooled representation
         Returns:
-            dict with 'vix_pred': [B] - predicted VIX daily change
+            [B, num_horizons] predictions for each horizon
         """
-        B, T, _ = bars.shape
+        h = self.trunk(x)  # [B, hidden_dim]
         
-        # Encode stock bars
-        stock_tokens, stock_mask = self.stock_encoder(bars, bar_mask)  # [B, T+1, d_model]
-        
-        # Additive injection: options (already timestamp-aligned)
-        if self.use_options and options is not None:
-            option_proj = self.option_proj(options) * self.option_scale  # [B, T, d_model]
-            # Add to stock tokens at positions 1:T+1 (position 0 is CLS)
-            if options_mask is not None:
-                option_proj = option_proj * options_mask.unsqueeze(-1)
-            stock_tokens[:, 1:, :] = stock_tokens[:, 1:, :] + option_proj
-        
-        # Additive injection: news at specific timestamp positions
-        if self.use_news and news_embs is not None and news_indices is not None:
-            news_proj = self.news_proj(news_embs) * self.news_scale  # [B, N, d_model]
-            
-            # Debug: log news projection stats for first 5 batches
-            if not hasattr(self, '_debug_count'):
-                self._debug_count = 0
-            if self._debug_count < 5:
-                with torch.no_grad():
-                    valid_mask = news_mask.bool() if news_mask is not None else torch.ones_like(news_proj[..., 0], dtype=torch.bool)
-                    if valid_mask.sum() > 0:
-                        valid_proj = news_proj[valid_mask]
-                        print(f"[DEBUG batch {self._debug_count}] news_proj: mean={valid_proj.mean():.4f}, std={valid_proj.std():.4f}, "
-                              f"news_scale={self.news_scale.item():.4f}, n_news={valid_mask.sum().item()}")
-                self._debug_count += 1
-            
-            if news_mask is not None:
-                news_proj = news_proj * news_mask.unsqueeze(-1)
-            
-            # Scatter-add news embeddings to their timestamp positions
-            # news_indices contains the bar position (0 to T-1) for each news item
-            # We add 1 because position 0 is CLS token
-            for b in range(B):
-                if news_mask is not None:
-                    valid_news = news_mask[b].bool()
-                    if valid_news.sum() == 0:
-                        continue
-                    indices = news_indices[b, valid_news] + 1  # +1 for CLS offset
-                    indices = indices.clamp(0, T)  # Safety clamp
-                    # Use scatter_add for efficient injection
-                    stock_tokens[b].scatter_add_(
-                        0,
-                        indices.unsqueeze(-1).expand(-1, self.d_model),
-                        news_proj[b, valid_news]
-                    )
-        
-        # Zero out padded positions
-        if stock_mask is not None:
-            stock_tokens = stock_tokens * stock_mask.unsqueeze(-1)
-        
-        # Mamba selective scan - now with news/options injected at correct timestamps
-        h = self.mamba(stock_tokens)  # [B, T+1, d_model]
-        
-        # Pool sequence
-        h_pool = self.pool(h)  # [B, d_model]
-        
-        # Regression head
-        vix_pred = self.head(h_pool)  # [B]
-        
-        return {
-            'vix_pred': vix_pred,
-        }
+        # Stack predictions from each horizon head
+        preds = torch.cat([head(h) for head in self.horizon_heads], dim=-1)  # [B, 4]
+        return preds
 
 
 # ---------------------------------------------------------------------------
@@ -855,7 +517,7 @@ class ParallelMambaVIX(nn.Module):
     
     def __init__(
         self,
-        num_features: int = 29,
+        num_features: int = 45,  # Stock features from Stock_Data_2min (47 - ticker - bar_timestamp)
         d_model: int = 256,
         n_layers: int = 4,
         d_state: int = 64,
@@ -865,12 +527,15 @@ class ParallelMambaVIX(nn.Module):
         checkpoint_interval: int = 300,  # 5 minutes
         use_news: bool = False,
         news_dim: int = 3072,
+        news_n_layers: int = 2,  # Fewer layers for sparse news sequences
         use_options: bool = False,
         option_features: int = NUM_OPTION_FEATURES,
         num_fusion_heads: int = 4,
         head_hidden: int = 128,
         use_macro: bool = False,
         macro_dim: int = 21,  # FED/FRED macro features from datasets/macro/macro_daily.parquet
+        use_gdelt: bool = False,
+        gdelt_dim: int = 391,  # 384 MiniLM embedding + 7 stats
     ):
         super().__init__()
         self.d_model = d_model
@@ -879,6 +544,8 @@ class ParallelMambaVIX(nn.Module):
         self.use_news = use_news
         self.use_options = use_options
         self.use_macro = use_macro
+        self.use_gdelt = use_gdelt
+        self.gdelt_dim = gdelt_dim
         
         # Stock stream (always active)
         self.stock_encoder = StreamEncoder(num_features, d_model, dropout)
@@ -891,18 +558,42 @@ class ParallelMambaVIX(nn.Module):
             dropout=dropout,
         )
         
-        # News stream (optional) - same architecture as stock
-        if use_news:
-            self.news_encoder = StreamEncoder(news_dim, d_model, dropout, normalize_input=True)
+        # News stream (optional) - fewer layers for sparse sequences
+        if use_news or use_gdelt:
+            # Token type embedding: 0=GDELT (world state), 1=Benzinga (article event)
+            self.news_type_embedding = nn.Embedding(2, d_model)
+            # Initialize small so it doesn't dominate at start
+            nn.init.normal_(self.news_type_embedding.weight, mean=0.0, std=0.02)
+            
+            # News Mamba processes combined Benzinga + GDELT sequence (fewer layers)
             self.news_mamba = StreamMamba(
-                n_layers=n_layers,
+                n_layers=news_n_layers,
                 d_model=d_model,
                 d_state=d_state,
                 d_conv=d_conv,
                 expand=expand,
                 dropout=dropout,
             )
-            logger.info(f"News stream enabled: {news_dim} → {d_model}, {n_layers} layers")
+            logger.info(f"News Mamba: {news_n_layers} layers (vs {n_layers} for stock)")
+        
+        if use_news:
+            self.news_encoder = StreamEncoder(news_dim, d_model, dropout, normalize_input=True)
+        
+        # GDELT encoder (optional) - separate normalization for embedding vs stats
+        if use_gdelt:
+            self.gdelt_embed_dim = 384
+            self.gdelt_stats_dim = 7
+            # Separate normalization for embedding and stats
+            self.gdelt_embed_norm = nn.LayerNorm(self.gdelt_embed_dim)
+            self.gdelt_stats_norm = nn.LayerNorm(self.gdelt_stats_dim)
+            # Combined projection
+            self.gdelt_encoder = nn.Sequential(
+                nn.Linear(gdelt_dim, d_model),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.LayerNorm(d_model),
+            )
+            logger.info(f"GDELT stream enabled: {gdelt_dim} → {d_model} (into news Mamba)")
         
         # Options stream (optional) - same architecture as stock
         if use_options:
@@ -930,25 +621,94 @@ class ParallelMambaVIX(nn.Module):
         # Fusion gate for checkpoint blending
         self.fusion_gate = FusionGate(d_model, num_heads=num_fusion_heads, dropout=dropout)
         
-        # Auxiliary prediction heads (for per-stream losses)
+        # Auxiliary prediction heads (for per-stream losses) - single horizon for aux
         self.stock_aux_head = VIXHead(d_model, head_hidden, dropout)
         if use_news:
             self.news_aux_head = VIXHead(d_model, head_hidden, dropout)
         if use_options:
             self.options_aux_head = VIXHead(d_model, head_hidden, dropout)
         
-        # Final prediction head (from fused representation)
-        self.final_head = VIXHead(d_model, head_hidden, dropout)
+        # Final prediction head (from fused representation) - multi-horizon
+        self.final_head = MultiHorizonVIXHead(d_model, head_hidden, dropout)
         
         # Pooling for final states
         self.pool = SequencePooling(d_model, 'attention')
         
         num_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
-        streams = ['stock'] + (['news'] if use_news else []) + (['options'] if use_options else [])
+        # Note: GDELT feeds into news Mamba, not a separate stream
+        streams = ['stock'] + (['news+gdelt'] if (use_news or use_gdelt) else []) + (['options'] if use_options else [])
         conditioning = ['macro_film'] if use_macro else []
         logger.info(f"ParallelMambaVIX: {num_params:,} parameters "
                     f"(d_model={d_model}, n_layers={n_layers}, checkpoint={checkpoint_interval}, "
                     f"streams={streams}, conditioning={conditioning})")
+    
+    def _merge_news_sources(
+        self,
+        benzinga_encoded: Optional[torch.Tensor],
+        benzinga_ts: Optional[torch.Tensor],
+        benzinga_mask: Optional[torch.Tensor],
+        gdelt_encoded: Optional[torch.Tensor],
+        gdelt_ts: Optional[torch.Tensor],
+        gdelt_mask: Optional[torch.Tensor],
+        device: torch.device,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Merge Benzinga and GDELT encoded tokens into a single sequence sorted by timestamp.
+        
+        Args:
+            benzinga_encoded: [B, N1, d_model] - encoded Benzinga news (or None)
+            benzinga_ts: [B, N1] - Benzinga timestamps (or None)
+            benzinga_mask: [B, N1] - Benzinga validity mask (or None)
+            gdelt_encoded: [B, N2, d_model] - encoded GDELT tokens (or None)
+            gdelt_ts: [B, N2] - GDELT timestamps (or None)
+            gdelt_mask: [B, N2] - GDELT validity mask (or None)
+            device: torch device
+        
+        Returns:
+            combined_encoded: [B, N1+N2, d_model] - merged and sorted by timestamp
+            combined_ts: [B, N1+N2] - merged timestamps
+            combined_mask: [B, N1+N2] - merged validity mask
+        """
+        # Handle case where only one source exists
+        if benzinga_encoded is None and gdelt_encoded is None:
+            return None, None, None
+        
+        if benzinga_encoded is None:
+            return gdelt_encoded, gdelt_ts, gdelt_mask
+        
+        if gdelt_encoded is None:
+            return benzinga_encoded, benzinga_ts, benzinga_mask
+        
+        B = benzinga_encoded.shape[0]
+        N1 = benzinga_encoded.shape[1]
+        N2 = gdelt_encoded.shape[1]
+        N_total = N1 + N2
+        
+        # Concatenate along sequence dimension
+        combined_encoded = torch.cat([benzinga_encoded, gdelt_encoded], dim=1)  # [B, N1+N2, d_model]
+        combined_ts = torch.cat([benzinga_ts, gdelt_ts], dim=1)  # [B, N1+N2]
+        
+        # Build combined mask
+        if benzinga_mask is not None and gdelt_mask is not None:
+            combined_mask = torch.cat([benzinga_mask, gdelt_mask], dim=1)  # [B, N1+N2]
+        elif benzinga_mask is not None:
+            combined_mask = torch.cat([benzinga_mask, torch.ones(B, N2, device=device)], dim=1)
+        elif gdelt_mask is not None:
+            combined_mask = torch.cat([torch.ones(B, N1, device=device), gdelt_mask], dim=1)
+        else:
+            combined_mask = torch.ones(B, N_total, device=device)
+        
+        # Sort by timestamp for each batch item
+        sorted_indices = torch.argsort(combined_ts, dim=1)  # [B, N_total]
+        
+        # Gather to reorder
+        # Expand indices for gathering from [B, N, d_model]
+        sorted_indices_expanded = sorted_indices.unsqueeze(-1).expand(-1, -1, self.d_model)
+        combined_encoded = torch.gather(combined_encoded, 1, sorted_indices_expanded)
+        combined_ts = torch.gather(combined_ts, 1, sorted_indices)
+        combined_mask = torch.gather(combined_mask, 1, sorted_indices)
+        
+        return combined_encoded, combined_ts, combined_mask
     
     def forward(
         self,
@@ -959,6 +719,10 @@ class ParallelMambaVIX(nn.Module):
         news_embs: Optional[torch.Tensor] = None,
         news_mask: Optional[torch.Tensor] = None,
         news_indices: Optional[torch.Tensor] = None,
+        news_timestamps: Optional[torch.Tensor] = None,
+        gdelt_embs: Optional[torch.Tensor] = None,
+        gdelt_mask: Optional[torch.Tensor] = None,
+        gdelt_timestamps: Optional[torch.Tensor] = None,
         macro_context: Optional[torch.Tensor] = None,
         bar_timestamps: Optional[torch.Tensor] = None,
         **kwargs,
@@ -971,18 +735,22 @@ class ParallelMambaVIX(nn.Module):
             bar_mask: [B, T] - stock validity mask
             options: [B, T, option_features] - options features (aligned with bars)
             options_mask: [B, T] - options validity mask
-            news_embs: [B, N, news_dim] - news embeddings
-            news_mask: [B, N] - news validity mask
-            news_indices: [B, N] - bar index for each news article
+            news_embs: [B, N1, news_dim] - Benzinga news embeddings
+            news_mask: [B, N1] - Benzinga news validity mask
+            news_indices: [B, N1] - bar index for each news article
+            news_timestamps: [B, N1] - Unix timestamps for news articles
+            gdelt_embs: [B, N2, gdelt_dim] - GDELT world state embeddings (391-dim)
+            gdelt_mask: [B, N2] - GDELT validity mask
+            gdelt_timestamps: [B, N2] - Unix timestamps for GDELT buckets
             macro_context: [B, macro_dim] - macro conditioning features (T-1)
             bar_timestamps: [B, T] - Unix second timestamps for FiLM time encoding
         
         Returns:
             dict with:
-                'vix_pred': [B] - final VIX prediction
-                'stock_pred': [B] - stock-only prediction (aux loss)
-                'news_pred': [B] - news-only prediction (aux loss, if enabled)
-                'options_pred': [B] - options-only prediction (aux loss, if enabled)
+                'vix_pred': [B, 4] - final VIX prediction at +1d, +7d, +15d, +30d
+                'stock_pred': [B] - stock-only prediction (aux loss, +1d only)
+                'news_pred': [B] - news-only prediction (aux loss, +1d only, if enabled)
+                'options_pred': [B] - options-only prediction (aux loss, +1d only, if enabled)
         """
         B, T, _ = bars.shape
         device = bars.device
@@ -995,9 +763,40 @@ class ParallelMambaVIX(nn.Module):
         # Encode all streams
         stock_encoded = self.stock_encoder(bars)  # [B, T, d_model]
         
-        news_encoded = None
+        # Encode Benzinga news if present
+        benzinga_encoded = None
+        benzinga_ts = None
         if self.use_news and news_embs is not None and news_embs.shape[1] > 0:
-            news_encoded = self.news_encoder(news_embs)  # [B, N, d_model]
+            benzinga_encoded = self.news_encoder(news_embs)  # [B, N1, d_model]
+            # Add Benzinga type embedding (type=1)
+            type_emb = self.news_type_embedding(torch.ones(benzinga_encoded.shape[:2], dtype=torch.long, device=device))
+            benzinga_encoded = benzinga_encoded + type_emb
+            benzinga_ts = news_timestamps  # [B, N1]
+        
+        # Encode GDELT if present
+        gdelt_encoded = None
+        gdelt_ts = None
+        if self.use_gdelt and gdelt_embs is not None and gdelt_embs.shape[1] > 0:
+            # Separate normalize embedding and stats
+            gdelt_embed = self.gdelt_embed_norm(gdelt_embs[..., :self.gdelt_embed_dim])
+            gdelt_stats = self.gdelt_stats_norm(gdelt_embs[..., self.gdelt_embed_dim:])
+            gdelt_combined = torch.cat([gdelt_embed, gdelt_stats], dim=-1)
+            gdelt_encoded = self.gdelt_encoder(gdelt_combined)  # [B, N2, d_model]
+            # Add GDELT type embedding (type=0)
+            type_emb = self.news_type_embedding(torch.zeros(gdelt_encoded.shape[:2], dtype=torch.long, device=device))
+            gdelt_encoded = gdelt_encoded + type_emb
+            gdelt_ts = gdelt_timestamps  # [B, N2]
+        
+        # Merge Benzinga and GDELT into combined news sequence, sorted by timestamp
+        news_encoded = None
+        combined_news_ts = None
+        combined_news_mask = None
+        if benzinga_encoded is not None or gdelt_encoded is not None:
+            news_encoded, combined_news_ts, combined_news_mask = self._merge_news_sources(
+                benzinga_encoded, benzinga_ts, news_mask if self.use_news else None,
+                gdelt_encoded, gdelt_ts, gdelt_mask if self.use_gdelt else None,
+                device,
+            )
         
         options_encoded = None
         if self.use_options and options is not None:
@@ -1043,14 +842,19 @@ class ParallelMambaVIX(nn.Module):
             stock_outputs.append(stock_out)
             stock_state = self.stock_mamba.get_final_state(stock_out)
             
-            # --- News segment (articles in this checkpoint window) ---
+            # --- News segment (combined Benzinga + GDELT in this checkpoint window) ---
             news_state = None
-            if news_encoded is not None and news_indices is not None:
-                # Find news articles in this checkpoint window
-                # news_indices contains bar positions for each article
-                news_in_window = (news_indices >= start_idx) & (news_indices < end_idx)
-                if news_mask is not None:
-                    news_in_window = news_in_window & (news_mask > 0)
+            if news_encoded is not None and combined_news_ts is not None and bar_timestamps is not None:
+                # Find news tokens in this checkpoint window by timestamp
+                # Get bar timestamps for this segment to determine window boundaries
+                segment_bar_ts = bar_timestamps[:, start_idx:end_idx]  # [B, segment_len]
+                segment_start_ts = segment_bar_ts[:, 0:1]  # [B, 1]
+                segment_end_ts = segment_bar_ts[:, -1:]    # [B, 1]
+                
+                # News is in window if its timestamp falls within segment bar timestamps
+                news_in_window = (combined_news_ts >= segment_start_ts) & (combined_news_ts <= segment_end_ts)
+                if combined_news_mask is not None:
+                    news_in_window = news_in_window & (combined_news_mask > 0)
                 
                 # Process news for each batch item
                 # Note: news doesn't get FiLM (it's not time-aligned like bars)
@@ -1099,11 +903,13 @@ class ParallelMambaVIX(nn.Module):
         # Stock auxiliary prediction
         results['stock_pred'] = self.stock_aux_head(stock_pooled)
         
-        # News auxiliary prediction (if enabled)
-        if self.use_news and news_outputs:
+        # News auxiliary prediction (if news or gdelt enabled)
+        news_pooled = None
+        if (self.use_news or self.use_gdelt) and news_outputs:
             news_all = torch.stack(news_outputs, dim=1)  # [B, num_checkpoints, d_model]
             news_pooled = news_all.mean(dim=1)  # Simple mean over checkpoints
-            results['news_pred'] = self.news_aux_head(news_pooled)
+            if self.use_news:
+                results['news_pred'] = self.news_aux_head(news_pooled)
         
         # Options auxiliary prediction (if enabled)
         if self.use_options and options_outputs:
@@ -1113,7 +919,7 @@ class ParallelMambaVIX(nn.Module):
         
         # Final fused prediction
         # Fuse final states from all streams
-        final_news_state = news_pooled if (self.use_news and news_outputs) else None
+        final_news_state = news_pooled if ((self.use_news or self.use_gdelt) and news_outputs) else None
         final_options_state = options_pooled if (self.use_options and options_outputs) else None
         
         final_fused = self.fusion_gate(stock_pooled, final_news_state, final_options_state)

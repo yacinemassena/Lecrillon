@@ -4,78 +4,89 @@
 
 ## Overview
 
-**Multi-source Mamba architecture** for VIX prediction with cross-attention CLS fusion. Separate encoders for each data source (stock, options, news) fuse before the Mamba backbone.
+**Multi-stream Mamba architecture** for VIX prediction from 2-minute market data with periodic fusion across stock, options, and news-conditioned streams. GDELT is merged into the news stream, and macro data is applied through FiLM conditioning.
 
 ## Current Implementation (v2)
 
 ### Architecture Diagram
 
 ```
-Stock Bars [B, T, 15]  ─→ StockEncoder + CLS ─→ [B, T+1, d_model] ─┐
-                                                                    │
-Option Bars [B, T, 15] ─→ OptionEncoder + CLS ─→ [B, T+1, d_model] ─┼─→ CrossAttentionFusion
-                                                                    │         │
-News Embs [B, N, 3072] ─→ NewsEncoder + CLS ─→ [B, N+1, d_model] ───┘         │
-                                                                              ↓
-                                                              Fused CLS → MambaStack → Pool → VIXHead
-                                                                                                │
-                                                                              Output: VIX daily change [B]
+Stock Bars [B, T, 45] ───────────────────────────────→ Stock Mamba ───────────────┐
+                                                                                   │
+Option Flow [B, T, 47] ─→ OptionEncoder ─→ Option Mamba ───────────────────────────┤
+                                                                                   │
+News [B, N, 3072] + GDELT [B, M, 391] ─→ Merge + Type Embedding ─→ News Mamba ────┤
+                                                                                   │
+Macro Context [B, 15+] ─→ FiLM conditioning on stock stream ───────────────────────┤
+                                                                                   │
+Checkpoint fusion every N bars ─→ gated cross-stream fusion ─→ pooled head ─→ VIX targets [B, 4]
 ```
 
 ### Key Components
 
 | Component | Description |
 |-----------|-------------|
-| **SourceEncoder** | Projects features to d_model, prepends learnable CLS token |
-| **CrossAttentionFusion** | Stock CLS attends to option/news sequences (4 heads) |
-| **MambaStack** | 4 layers, d_model=256, d_state=64, selective scan |
-| **VIXHead** | MLP regression: 256 → 128 → 1, zero-initialized |
+| **Stock stream** | Main Mamba stream over 2-minute stock bars |
+| **Option stream** | Encodes 47 option-flow features and fuses periodically with stock |
+| **News stream** | Processes Benzinga embeddings and optional GDELT tokens in one shared news Mamba |
+| **Macro FiLM** | Applies macro conditioning to stock representations |
+| **ParallelMambaVIX** | 4 stock/options layers, 2 news layers, `d_model=256`, `d_state=64` |
+| **Multi-horizon head** | Predicts VIX change for `+1d`, `+7d`, `+15d`, `+30d` |
 
 ### Data Sources
 
 | Source | Features | Date Range | Path |
 |--------|----------|------------|------|
-| **Stock bars** | 15 | 2005+ | `datasets/Stock_Data_1s/` |
-| **Options flow** | 15 | 2014-06+ | `datasets/opt_trade_1sec/` |
+| **Stock bars** | 45 | 2005+ | `datasets/Stock_Data_2min/` |
+| **Options flow** | 47 | 2014-06+ | `datasets/opt_trade_2min/` |
 | **News embeddings** | 3072 | 2009+ | `datasets/benzinga_embeddings/` |
+| **GDELT world state** | 391 | configurable | `datasets/GDELT/` |
+| **Macro conditioning** | dynamic | configurable | `datasets/macro/` |
 
-### Stock Features (15)
+### Stock Features (45)
 ```python
-['close', 'volume', 'trade_count', 'price_std', 'price_range_pct', 
- 'vwap', 'avg_trade_size', 'amihud', 'buy_volume', 'sell_volume',
- 'tick_arrival_rate', 'large_trade_ratio', 'tick_burst', 'rv_intrabar', 'ofi']
+['open', 'high', 'low', 'close', 'volume', 'trade_count',
+ 'price_mean', 'price_std', 'price_range', 'price_range_pct', 'vwap',
+ 'avg_trade_size', 'std_trade_size', 'max_trade_size', 'amihud',
+ 'buy_volume', 'sell_volume', 'signed_trade_count',
+ 'tick_arrival_rate', 'large_trade_ratio', 'inter_trade_std', 'tick_burst',
+ 'rv_intrabar', 'bpv_intrabar', 'price_skew',
+ 'close_vs_vwap', 'high_vs_vwap', 'low_vs_vwap', 'ofi',
+ 'net_volume', 'volume_imbalance', 'trade_intensity', 'rv_bpv_ratio',
+ 'close_return', 'volume_per_trade', 'buy_sell_ratio', 'high_low_ratio',
+ 'close_position', 'day_of_week', 'days_to_friday', 'minute_of_day',
+ 'is_friday', 'days_to_monthly_expiry', 'days_to_weekly_expiry', 'is_expiration_day']
 ```
 
-### Option Features (15 selected from 40)
+### Option Features (47)
 ```python
-['put_call_ratio_volume', 'total_volume', 'total_trade_count',
- 'term_skew', 'skew_proxy', 'atm_concentration',
- 'sweep_intensity', 'net_large_flow',
- 'pc_ratio_vs_20d', 'call_volume_vs_20d', 'put_volume_vs_20d',
- 'near_pc_ratio', 'far_pc_ratio', 'uoa_call_count', 'uoa_put_count']
+['call_volume', 'put_volume', 'call_trade_count', 'put_trade_count',
+ 'put_call_ratio_volume', 'put_call_ratio_count',
+ 'call_premium_total', 'put_premium_total',
+ 'near_volume', 'mid_volume', 'far_volume',
+ 'near_pc_ratio', 'far_pc_ratio', 'term_skew',
+ 'otm_put_volume', 'atm_volume', 'otm_call_volume',
+ 'skew_proxy', 'atm_concentration', 'deep_otm_put_volume',
+ 'total_large_trade_count', 'call_large_count', 'put_large_count',
+ 'net_large_flow', 'large_premium_total', 'sweep_intensity',
+ 'max_volume_surprise', 'avg_volume_surprise',
+ 'uoa_call_count', 'uoa_put_count',
+ 'total_volume', 'total_trade_count', 'unique_contracts', 'unique_strikes',
+ 'unique_expiries', 'pc_ratio_vs_20d', 'call_volume_vs_20d', 'put_volume_vs_20d',
+ 'net_premium_flow', 'premium_imbalance', 'large_trade_pct', 'put_large_pct',
+ 'uoa_total', 'uoa_put_bias', 'deep_otm_put_pct', 'near_far_ratio', 'sweep_to_trade_ratio']
 ```
 
 ### Model Code
 
 ```python
-class MambaOnlyVIX(nn.Module):
-    def __init__(self, num_features=15, d_model=256, n_layers=4, d_state=64,
-                 use_news=False, news_dim=3072, use_options=False, option_features=15):
-        # Separate encoders per source
-        self.stock_encoder = SourceEncoder(num_features, d_model)
-        if use_options:
-            self.option_encoder = SourceEncoder(option_features, d_model)
-        if use_news:
-            self.news_encoder = SourceEncoder(news_dim, d_model)
-        
-        # Cross-attention fusion (stock CLS attends to others)
-        if use_news or use_options:
-            self.fusion = CrossAttentionFusion(d_model, num_heads=4)
-        
-        # Mamba backbone
-        self.mamba = MambaStack(n_layers, d_model, d_state)
-        self.pool = SequencePooling(d_model, 'attention')
-        self.head = VIXHead(d_model)
+class ParallelMambaVIX(nn.Module):
+    def __init__(self, num_features=45, d_model=256, n_layers=4, d_state=64,
+                 use_news=True, news_dim=3072, news_n_layers=2,
+                 use_options=True, option_features=47,
+                 use_macro=True, macro_dim=15,
+                 use_gdelt=False, gdelt_dim=391):
+        ...
 ```
 
 ---
@@ -114,19 +125,56 @@ python train.py --use-news               # stock + news (2009+ has news)
 python train.py --use-options --use-news # all sources (automatic per-sample)
 ```
 
+### Current Default Training Mode
+
+```bash
+python train.py
+# defaults from trainconfig.py:
+# - seq_len=1000  (~5 trading days of 2-min bars)
+# - d_model=256
+# - n_layers=4
+# - news_n_layers=2
+# - use_news=True
+# - use_options=True
+# - use_macro=True
+# - use_gdelt=True
+```
+
+### Macro Features (25 total from FED/FRED)
+
+Built from `datasets/FED/` via `tools/build_macro_from_fed.py`:
+
+- **Rates**: `DFF`, `DGS3MO`, `DGS2`, `DGS5`, `DGS10`, `DGS30`
+- **Yield curve**: `T10Y2Y`, `T10Y3M`, `ff_3m_spread`
+- **Market stress**: `VIXCLS`, `BAMLH0A0HYM2`, `BAMLC0A0CM`, `credit_spread`
+- **Inflation**: `CPIAUCSL`, `PCEPILFE`
+- **Employment**: `UNRATE`, `ICSA`
+- **Balance sheet**: `WALCL`
+- **Economic activity**: `INDPRO`, `RSAFS`, `HOUST`, `UMCSENT`
+- **FOMC calendar**: `days_since_fomc`, `days_until_fomc`, `is_fomc_week`
+
 ---
 
 ## Planned Extensions
 
-### Option A: Separate Models per Horizon
+### Implemented 
+- **Options flow data** - Market-wide option flow from 2-minute bars (47 features)
+- **News embeddings** - Benzinga article embeddings (OpenAI 3072-dim)
+- **Parallel Mamba streams** - Stock/news/options with periodic fusion checkpoints
+- **GDELT integration** - Merged into the news stream with token-type embeddings
+- **Macro FiLM conditioning** - Time-aware FiLM modulation from Fed/treasury/FOMC data
+  - 15 macro features (fed funds, yields, CPI, unemployment, FOMC calendar)
+  - Per-position gamma/beta via sinusoidal time-of-day encoding
+  - Identity init (gamma=1, beta=0), 10x LR for FiLM params
+  - Gamma/beta logging to verify macro signal is being used
 
 Train 3 independent Mamba models, each specialized for a different prediction horizon:
 
 | Model | Sequence Length | Target | Status |
 |-------|-----------------|--------|--------|
-| **Mamba-1** | 15,000 (1s bars) | VIX +1d | Training |
-| **Mamba-2** | 50,000+ (1s bars) | VIX +7d | Planned |
-| **Mamba-3** | 100,000+ (1s bars) | VIX +30d | Planned |
+| **Mamba-1** | 1,000 (2-min bars) | VIX +1d | Training |
+| **Mamba-2** | 2,000+ (2-min bars) | VIX +7d | Planned |
+| **Mamba-3** | 4,000+ (2-min bars) | VIX +30d | Planned |
 
 **Pros:** Each model optimized for its horizon, simpler training
 **Cons:** 3x compute, no shared representations
@@ -136,7 +184,7 @@ Train 3 independent Mamba models, each specialized for a different prediction ho
 One Mamba model with longer sequence, predicting all horizons simultaneously:
 
 ```
-Input: 100,000+ 1-second bars (~28 hours / ~4 trading days)
+Input: 1,000+ 2-minute bars (~5 trading days)
 
 Model: MambaMultiHorizon
        ├─ Shared Mamba backbone (6-8 layers, d_model=512)
@@ -176,14 +224,18 @@ The Mamba SSM package requires CUDA compilation with Linux toolchain.
 From `trainconfig.py`:
 
 ```python
-seq_len: int = 351_000      # Max sequence (~6 hours)
+seq_len: int = 1000
 epochs: int = 50
 batch_size: int = 16
-lr: float = 1e-6            # From HP sweep (see docs/lr_sweep_results.md)
+lr: float = 1e-4
 
 d_model: int = 256
 n_layers: int = 4
 d_state: int = 64
+news_n_layers: int = 2
+use_news: bool = True
+use_options: bool = True
+use_macro: bool = True
 
 train_end: str = '2024-09-30'  # Use all data
 val_end: str = '2024-12-31'
@@ -194,26 +246,27 @@ val_end: str = '2024-12-31'
 ## Data Pipeline
 
 ```
-Stock_Data_1s/
-├─ 2004/
-│  ├─ SPY_2004-01-02.parquet
-│  └─ ...
-├─ 2005/
-│  └─ ...
-└─ 2024/
+Stock_Data_2min/
+├─ 2024-01-02.parquet
+├─ 2024-01-03.parquet
+└─ ...
+
+opt_trade_2min/
+├─ 2024-01-02.parquet
+├─ 2024-01-03.parquet
+└─ ...
 
 VIX/
-├─ vix_daily.parquet        # VIX close prices (targets)
-└─ vix_intraday.parquet     # Optional: intraday VIX
+├─ VIX_*.csv                # VIX close extracted from intraday CSVs
+└─ ...
 ```
 
-### Features per 1-second bar:
-1. `open` - Opening price
-2. `high` - High price
-3. `low` - Low price
-4. `close` - Closing price
-5. `volume` - Trade volume
-6. `vwap` - Volume-weighted average price
+### Sequence Resolution
+
+- **Stock/options cadence**: 2-minute bars
+- **Bars per trading day**: ~195
+- **Default sequence length**: 1000 bars
+- **Default lookback**: ~5 trading days
 
 ---
 
@@ -221,20 +274,17 @@ VIX/
 
 See `docs/lr_sweep_results.md` for full details.
 
-**Winner: LR = 1e-6**
-- Best validation loss: 0.1802
-- Best validation MAE: 0.5409
-- Most stable (no overfitting)
+These results were produced on an earlier configuration and should be treated as historical only. Re-tuning is recommended after the migration to 2-minute stock and options data.
 
 ---
 
 ## Future Enhancements
 
 ### Implemented 
-- **Options flow data** - Put/call ratios, term skew, sweep intensity, UOA (38 features)
+- **Options flow data** - Market-wide option flow from 2-minute bars (47 features)
 - **News embeddings** - Benzinga article embeddings (OpenAI 3072-dim)
-- **Cross-attention fusion** - CLS tokens with multi-head attention
 - **Parallel Mamba streams** - Stock/news/options with periodic fusion checkpoints
+- **GDELT integration** - Merged into the news stream with token-type embeddings
 - **Macro FiLM conditioning** - Time-aware FiLM modulation from Fed/treasury/FOMC data
   - 15 macro features (fed funds, yields, CPI, unemployment, FOMC calendar)
   - Per-position gamma/beta via sinusoidal time-of-day encoding
@@ -244,6 +294,6 @@ See `docs/lr_sweep_results.md` for full details.
 ### Planned
 - Index bars (SPX, NDX, RUT)
 - GDELT geopolitical events
-- Longer sequences (351k+ bars)
+- Longer sequences (2-min multi-week windows)
 - Multi-resolution inputs
 - Ensemble of horizons

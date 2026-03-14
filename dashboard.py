@@ -206,7 +206,8 @@ class SimpleDashboard:
         self.console = Console()
         self.state = TrainingState()
         self.last_print = 0
-        
+        self.last_log_message: Optional[str] = None
+
     def start(self):
         self.console.print("[bold cyan]🧠 Mamba VIX Training[/]")
         self.console.print("─" * 60)
@@ -245,4 +246,7 @@ class SimpleDashboard:
             )
     
     def log(self, message: str):
+        if message == self.last_log_message:
+            return
+        self.last_log_message = message
         self.console.print(message)

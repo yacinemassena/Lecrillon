@@ -9,7 +9,7 @@ from dataclasses import dataclass
 @dataclass
 class TrainConfig:
     # Data settings
-    seq_len: int = 15_000           # Max sequence length in 1-sec bars (~1 hour trading)
+    seq_len: int = 8000             # Max sequence length in 2-min bars (~41 trading days)
     
     # Training settings
     epochs: int = 50                # Number of training epochs
@@ -19,14 +19,15 @@ class TrainConfig:
     num_workers: int = 4            # DataLoader workers (4 for VPS with 117GB RAM)
     
     # Model architecture
-    d_model: int = 256              # Model hidden dimension
-    n_layers: int = 4               # Number of Mamba layers (stock stream)
+    d_model: int = 256              # Model hidden dimension (scaled down for ~5k samples)
+    n_layers: int = 4               # Number of Mamba layers (stock/options streams)
+    news_n_layers: int = 2          # Fewer layers for sparse news sequences
     d_state: int = 64               # Mamba state dimension
     checkpoint_interval: int = 300  # Fusion checkpoint every N bars (300 = 5 min)
-    use_parallel_streams: bool = True  # Use ParallelMambaVIX (vs legacy MambaOnlyVIX)
     use_news: bool = True           # Enable news stream by default
     use_options: bool = True        # Enable options stream by default
-    use_macro: bool = False         # Enable macro FiLM conditioning
+    use_macro: bool = True          # Enable macro FiLM conditioning
+    use_gdelt: bool = True          # Enable GDELT world state integration (default on)
     
     # Data source
     force_synthetic: bool = False   # Force synthetic data
@@ -35,9 +36,9 @@ class TrainConfig:
     # Learning rate (1e-4 for multimodal training with news/options injection)
     lr: float = 1e-4
     
-    # Dates (use all available data: 2004-2024)
-    train_end: str = '2024-09-30'   # End of training data
-    val_end: str = '2024-12-31'     # End of validation data
+    # Dates (2025+ reserved as untouched test set)
+    train_end: str = '2024-03-31'   # End of training data
+    val_end: str = '2024-12-31'     # End of validation data (9 months = ~190 samples)
 
 
 # Default config instance

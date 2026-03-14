@@ -30,7 +30,7 @@ curl https://rclone.org/install.sh | sudo bash
 python download_data_fast.py --year 2024 --data-type all
 
 ---
-python train.py --seq-len 15000 --train-end 2024-03-30 --val-end 2024-11-31
+python train.py --seq-len 15000 --train-end 2024-03-30 --val-end 2024-11-30
 
 python train.py --seq-len 15000 --batch-size 8 --n-layers 6 --d-model 256 --train-start 2024-01-01 --train-end 2024-03-30 --val-end 2024-11-30
 

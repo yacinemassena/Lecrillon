@@ -28,6 +28,7 @@ def load_and_merge_fed_data(fed_path: Path) -> pd.DataFrame:
         'fred_inflation.parquet': ['CPIAUCSL', 'PCEPILFE'],  # CPI, core PCE (monthly)
         'fred_employment.parquet': ['UNRATE', 'ICSA'],  # Unemployment, initial claims (weekly)
         'fred_balance_sheet.parquet': ['WALCL'],  # Fed balance sheet (weekly)
+        'fred_economic_activity.parquet': ['INDPRO', 'RSAFS', 'HOUST', 'UMCSENT'],  # Industrial prod, retail, housing, sentiment (monthly)
     }
     
     dfs = []

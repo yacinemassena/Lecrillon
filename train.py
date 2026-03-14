@@ -114,6 +114,97 @@ def is_main_process():
 
 
 # ---------------------------------------------------------------------------
+# Multi-Horizon Spike-Weighted Loss
+# ---------------------------------------------------------------------------
+HORIZONS = [1, 7, 15, 30]  # +1d, +7d, +15d, +30d
+NUM_HORIZONS = len(HORIZONS)
+
+
+class SpikeWeightedHuberLoss(nn.Module):
+    """
+    Multi-horizon HuberLoss with tiered spike weighting.
+    
+    Tiers (points-based):
+      - Normal: |change| < spike_thresh → weight = 1.0
+      - Spike: |change| >= spike_thresh → weight = spike_weight (3×)
+      - Extreme: |change| >= extreme_thresh → weight = extreme_weight (5×)
+    
+    This encourages the model to pay more attention to VIX spikes/crushes
+    without distorting the data distribution.
+    """
+    
+    def __init__(self, delta: float = 0.25, spike_thresh: float = 2.0, 
+                 extreme_thresh: float = 4.0, spike_weight: float = 3.0, 
+                 extreme_weight: float = 5.0):
+        super().__init__()
+        self.delta = delta
+        self.spike_thresh = spike_thresh
+        self.extreme_thresh = extreme_thresh
+        self.spike_weight = spike_weight
+        self.extreme_weight = extreme_weight
+        self.huber = nn.HuberLoss(delta=delta, reduction='none')
+    
+    def forward(self, pred: torch.Tensor, target: torch.Tensor, 
+                horizon_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Args:
+            pred: [B, 4] predictions for each horizon
+            target: [B, 4] targets for each horizon
+            horizon_mask: [B, 4] validity mask (1=valid, 0=missing horizon)
+        
+        Returns:
+            Scalar loss
+        """
+        # Base Huber loss per element
+        base_loss = self.huber(pred, target)  # [B, 4]
+        
+        # Tiered weights based on absolute target change
+        abs_target = target.abs()
+        weights = torch.ones_like(target)
+        weights = torch.where(abs_target >= self.spike_thresh, 
+                              torch.tensor(self.spike_weight, device=target.device), weights)
+        weights = torch.where(abs_target >= self.extreme_thresh, 
+                              torch.tensor(self.extreme_weight, device=target.device), weights)
+        
+        # Apply spike weights
+        weighted_loss = base_loss * weights
+        
+        # Apply horizon mask if provided (mask out missing horizons)
+        if horizon_mask is not None:
+            weighted_loss = weighted_loss * horizon_mask
+            # Normalize by valid horizons only
+            valid_count = horizon_mask.sum()
+            if valid_count > 0:
+                return weighted_loss.sum() / valid_count
+            else:
+                return weighted_loss.sum()
+        
+        return weighted_loss.mean()
+    
+    def get_spike_stats(self, target: torch.Tensor, horizon_mask: Optional[torch.Tensor] = None) -> Dict[str, float]:
+        """Get statistics about spike distribution in batch."""
+        abs_target = target.abs()
+        
+        if horizon_mask is not None:
+            valid = horizon_mask.bool()
+            abs_target = abs_target[valid]
+        
+        if abs_target.numel() == 0:
+            return {'normal_pct': 0, 'spike_pct': 0, 'extreme_pct': 0}
+        
+        total = abs_target.numel()
+        normal = (abs_target < self.spike_thresh).sum().item()
+        spike = ((abs_target >= self.spike_thresh) & (abs_target < self.extreme_thresh)).sum().item()
+        extreme = (abs_target >= self.extreme_thresh).sum().item()
+        
+        return {
+            'normal_pct': normal / total * 100,
+            'spike_pct': spike / total * 100,
+            'extreme_pct': extreme / total * 100,
+        }
+
+
+# ---------------------------------------------------------------------------
 # Checkpoint Utilities
 # ---------------------------------------------------------------------------
 def save_checkpoint(model, optimizer, scaler, epoch, val_loss, checkpoint_dir, is_distributed):
@@ -179,7 +270,8 @@ def get_data_paths() -> Dict[str, Path]:
         return {}
 
     return {
-        'stock': base / 'Stock_Data_1s',
+        'stock': base / 'Stock_Data_2min',
+        'options': base / 'opt_trade_2min',
         'vix': base / 'VIX',
         'rv': base / 'SPY_daily_rv',
     }
@@ -356,7 +448,8 @@ def train_steps(model, loader, optimizer, criterion, scaler, device, num_steps,
         t_gpu_start = time.time()
         bars = batch['bars'].to(device, non_blocking=True)
         bar_mask = batch['bar_mask'].to(device, non_blocking=True)
-        target = batch['vix_target'].to(device, non_blocking=True)
+        target = batch['vix_targets'].to(device, non_blocking=True)  # [B, 4] multi-horizon
+        horizon_mask = batch['horizon_mask'].to(device, non_blocking=True)  # [B, 4]
         
         # Optional news data
         news_embs = batch.get('news_embs')
@@ -388,6 +481,21 @@ def train_steps(model, loader, optimizer, criterion, scaler, device, num_steps,
         if bar_timestamps is not None:
             bar_timestamps = bar_timestamps.to(device, non_blocking=True)
         
+        # Optional GDELT data
+        gdelt_embs = batch.get('gdelt_embs')
+        gdelt_mask = batch.get('gdelt_mask')
+        gdelt_timestamps = batch.get('gdelt_timestamps')
+        news_timestamps = batch.get('news_timestamps')
+        
+        if gdelt_embs is not None:
+            gdelt_embs = gdelt_embs.to(device, non_blocking=True)
+        if gdelt_mask is not None:
+            gdelt_mask = gdelt_mask.to(device, non_blocking=True)
+        if gdelt_timestamps is not None:
+            gdelt_timestamps = gdelt_timestamps.to(device, non_blocking=True)
+        if news_timestamps is not None:
+            news_timestamps = news_timestamps.to(device, non_blocking=True)
+        
         torch.cuda.synchronize()
         t_gpu = time.time() - t_gpu_start
         
@@ -403,29 +511,34 @@ def train_steps(model, loader, optimizer, criterion, scaler, device, num_steps,
                 news_embs=news_embs,
                 news_mask=news_mask,
                 news_indices=news_indices,
+                news_timestamps=news_timestamps,
+                gdelt_embs=gdelt_embs,
+                gdelt_mask=gdelt_mask,
+                gdelt_timestamps=gdelt_timestamps,
                 macro_context=macro_context,
                 bar_timestamps=bar_timestamps,
             )
-            pred = outputs['vix_pred']
+            pred = outputs['vix_pred']  # [B, 4] multi-horizon
             
-            # Combined loss from all streams
-            loss = criterion(pred, target)
+            # Combined loss from all streams (with spike weighting and horizon mask)
+            loss = criterion(pred, target, horizon_mask)
             
-            # Per-stream auxiliary losses (for monitoring)
+            # Per-stream auxiliary losses (for monitoring) - use +1d target only
             stream_losses = {'combined': loss.item()}
+            target_1d = target[:, 0]  # +1d target for aux losses
             
             if 'stock_pred' in outputs:
-                stock_loss = criterion(outputs['stock_pred'], target)
+                stock_loss = F.huber_loss(outputs['stock_pred'], target_1d, delta=0.25)
                 loss = loss + 0.3 * stock_loss  # Auxiliary weight
                 stream_losses['stock'] = stock_loss.item()
             
             if 'news_pred' in outputs:
-                news_loss = criterion(outputs['news_pred'], target)
+                news_loss = F.huber_loss(outputs['news_pred'], target_1d, delta=0.25)
                 loss = loss + 0.3 * news_loss
                 stream_losses['news'] = news_loss.item()
             
             if 'options_pred' in outputs:
-                options_loss = criterion(outputs['options_pred'], target)
+                options_loss = F.huber_loss(outputs['options_pred'], target_1d, delta=0.25)
                 loss = loss + 0.3 * options_loss
                 stream_losses['options'] = options_loss.item()
             
@@ -476,10 +589,11 @@ def train_steps(model, loader, optimizer, criterion, scaler, device, num_steps,
         
         stream_display = " ".join(loss_parts) if loss_parts else f"loss={step_loss:.4f}"
         
+        timestamp = datetime.datetime.now().strftime("%H:%M:%S")
         dashboard.console.print(
             f"[bold]{step_display}[/] | {stream_display} | seq={seq_len:,} | "
             f"fwd={t_fwd:.2f}s bwd={t_bwd:.2f}s | "
-            f"[dim]{t_total:.2f}s/it[/] | VRAM={mem_reserved:.1f}GB"
+            f"[dim]{t_total:.2f}s/it[/] | VRAM={mem_reserved:.1f}GB | {timestamp}"
         )
 
     epoch_time = time.time() - epoch_start_time
@@ -502,6 +616,10 @@ def val_steps(model, loader, criterion, device, num_steps, amp_dtype=torch.bfloa
     num_batches = 0
     all_preds = []
     all_targets = []
+    all_horizon_masks = []
+    stock_preds = []
+    news_preds = []
+    options_preds = []
 
     # If num_steps=0, iterate through full validation set
     if num_steps == 0:
@@ -522,7 +640,8 @@ def val_steps(model, loader, criterion, device, num_steps, amp_dtype=torch.bfloa
 
         bars = batch['bars'].to(device, non_blocking=True)
         bar_mask = batch['bar_mask'].to(device, non_blocking=True)
-        target = batch['vix_target'].to(device, non_blocking=True)
+        target = batch['vix_targets'].to(device, non_blocking=True)  # [B, 4] multi-horizon
+        horizon_mask = batch['horizon_mask'].to(device, non_blocking=True)  # [B, 4]
         
         # Optional news data
         news_embs = batch.get('news_embs')
@@ -553,6 +672,21 @@ def val_steps(model, loader, criterion, device, num_steps, amp_dtype=torch.bfloa
             macro_context = macro_context.to(device, non_blocking=True)
         if bar_timestamps is not None:
             bar_timestamps = bar_timestamps.to(device, non_blocking=True)
+        
+        # Optional GDELT data
+        gdelt_embs = batch.get('gdelt_embs')
+        gdelt_mask = batch.get('gdelt_mask')
+        gdelt_timestamps = batch.get('gdelt_timestamps')
+        news_timestamps = batch.get('news_timestamps')
+        
+        if gdelt_embs is not None:
+            gdelt_embs = gdelt_embs.to(device, non_blocking=True)
+        if gdelt_mask is not None:
+            gdelt_mask = gdelt_mask.to(device, non_blocking=True)
+        if gdelt_timestamps is not None:
+            gdelt_timestamps = gdelt_timestamps.to(device, non_blocking=True)
+        if news_timestamps is not None:
+            news_timestamps = news_timestamps.to(device, non_blocking=True)
 
         with torch.autocast(device_type='cuda', dtype=amp_dtype, enabled=True):
             outputs = model(
@@ -562,66 +696,81 @@ def val_steps(model, loader, criterion, device, num_steps, amp_dtype=torch.bfloa
                 news_embs=news_embs,
                 news_mask=news_mask,
                 news_indices=news_indices,
+                news_timestamps=news_timestamps,
+                gdelt_embs=gdelt_embs,
+                gdelt_mask=gdelt_mask,
+                gdelt_timestamps=gdelt_timestamps,
                 macro_context=macro_context,
                 bar_timestamps=bar_timestamps,
             )
-            pred = outputs['vix_pred']
-            loss = criterion(pred, target)
+            pred = outputs['vix_pred']  # [B, 4] multi-horizon
+            loss = criterion(pred, target, horizon_mask)
 
         total_loss += loss.item()
         num_batches += 1
         all_preds.append(pred.cpu())
         all_targets.append(target.cpu())
+        all_horizon_masks.append(horizon_mask.cpu())
         
-        # Track per-stream predictions for MAE
+        # Track per-stream predictions for MAE (auxiliary heads output +1d only)
         if 'stock_pred' in outputs:
-            if 'stock_preds' not in locals():
-                stock_preds = []
             stock_preds.append(outputs['stock_pred'].cpu())
         if 'news_pred' in outputs:
-            if 'news_preds' not in locals():
-                news_preds = []
             news_preds.append(outputs['news_pred'].cpu())
         if 'options_pred' in outputs:
-            if 'options_preds' not in locals():
-                options_preds = []
             options_preds.append(outputs['options_pred'].cpu())
 
     if num_batches == 0:
-        return {'loss': 0.0, 'mae': 0.0}
+        return {'loss': 0.0, 'mae_1d': 0.0}
 
-    preds = torch.cat(all_preds)
-    targets = torch.cat(all_targets)
-    mae = (preds - targets).abs().mean().item()
+    preds = torch.cat(all_preds)          # [N, 4]
+    targets = torch.cat(all_targets)      # [N, 4]
+    h_masks = torch.cat(all_horizon_masks)  # [N, 4]
     
-    # Accuracy metrics for VIX change prediction
-    # Directional accuracy: did we predict up/down correctly?
-    pred_sign = (preds > 0).float()
-    target_sign = (targets > 0).float()
-    dir_acc = (pred_sign == target_sign).float().mean().item() * 100
+    # Per-horizon metrics
+    result = {'loss': total_loss / num_batches}
     
-    # Within-threshold accuracy: % of predictions within X VIX points
-    abs_error = (preds - targets).abs()
-    within_1pt = (abs_error < 1.0).float().mean().item() * 100
-    within_2pt = (abs_error < 2.0).float().mean().item() * 100
+    for i, h in enumerate(HORIZONS):
+        valid = h_masks[:, i].bool()
+        if valid.sum() == 0:
+            continue
+        
+        pred_h = preds[:, i][valid]
+        target_h = targets[:, i][valid]
+        
+        # MAE for this horizon
+        mae_h = (pred_h - target_h).abs().mean().item()
+        result[f'mae_{h}d'] = mae_h
+        
+        # Directional accuracy for this horizon
+        pred_sign = (pred_h > 0).float()
+        target_sign = (target_h > 0).float()
+        dir_acc_h = (pred_sign == target_sign).float().mean().item() * 100
+        result[f'dir_acc_{h}d'] = dir_acc_h
+        
+        # Within-threshold accuracy for this horizon
+        abs_error = (pred_h - target_h).abs()
+        within_1pt_h = (abs_error < 1.0).float().mean().item() * 100
+        within_2pt_h = (abs_error < 2.0).float().mean().item() * 100
+        result[f'within_1pt_{h}d'] = within_1pt_h
+        result[f'within_2pt_{h}d'] = within_2pt_h
     
-    # Per-stream MAE
-    result = {
-        'loss': total_loss / num_batches,
-        'mae': mae,
-        'dir_acc': dir_acc,
-        'within_1pt': within_1pt,
-        'within_2pt': within_2pt,
-    }
+    # Legacy compatibility: overall MAE is +1d MAE
+    result['mae'] = result.get('mae_1d', 0.0)
+    result['dir_acc'] = result.get('dir_acc_1d', 0.0)
+    result['within_1pt'] = result.get('within_1pt_1d', 0.0)
+    result['within_2pt'] = result.get('within_2pt_1d', 0.0)
     
-    if 'stock_preds' in locals() and stock_preds:
-        stock_mae = (torch.cat(stock_preds) - targets).abs().mean().item()
+    # Per-stream MAE (auxiliary heads use +1d target)
+    target_1d = targets[:, 0]
+    if stock_preds:
+        stock_mae = (torch.cat(stock_preds) - target_1d).abs().mean().item()
         result['stock_mae'] = stock_mae
-    if 'news_preds' in locals() and news_preds:
-        news_mae = (torch.cat(news_preds) - targets).abs().mean().item()
+    if news_preds:
+        news_mae = (torch.cat(news_preds) - target_1d).abs().mean().item()
         result['news_mae'] = news_mae
-    if 'options_preds' in locals() and options_preds:
-        options_mae = (torch.cat(options_preds) - targets).abs().mean().item()
+    if options_preds:
+        options_mae = (torch.cat(options_preds) - target_1d).abs().mean().item()
         result['options_mae'] = options_mae
 
     return result
@@ -646,6 +795,8 @@ def main():
                         help='Max sequence length in 1-sec bars')
     parser.add_argument('--d-model', type=int, default=cfg.d_model)
     parser.add_argument('--n-layers', type=int, default=cfg.n_layers)
+    parser.add_argument('--news-n-layers', type=int, default=cfg.news_n_layers,
+                        help='Number of Mamba layers for news stream (default: 2)')
     parser.add_argument('--d-state', type=int, default=cfg.d_state)
     # No caching - direct file loading
     parser.add_argument('--batch-size', type=int, default=cfg.batch_size,
@@ -684,16 +835,27 @@ def main():
                         help='Disable options flow integration for A/B comparison.')
     parser.add_argument('--options-path', type=str, default=None,
                         help='Path to options data directory (default: datasets/opt_trade_1sec)')
-    parser.add_argument('--use-macro', action='store_true',
+    parser.add_argument('--use-macro', action='store_true', default=cfg.use_macro,
                         help='Enable macro FiLM conditioning (Fed/treasury/FOMC)')
     parser.add_argument('--macro-path', type=str, default=None,
                         help='Path to macro_daily.parquet (default: datasets/macro/macro_daily.parquet)')
-    parser.add_argument('--use-parallel-streams', action='store_true', default=cfg.use_parallel_streams,
-                        help='Use ParallelMambaVIX with periodic fusion (default: True)')
-    parser.add_argument('--no-parallel-streams', action='store_false', dest='use_parallel_streams',
-                        help='Use legacy MambaOnlyVIX (for comparison)')
+    parser.add_argument('--use-gdelt', action='store_true', default=cfg.use_gdelt,
+                        help='Enable GDELT world state integration. Enabled by default.')
+    parser.add_argument('--no-gdelt', action='store_false', dest='use_gdelt',
+                        help='Disable GDELT integration for A/B comparison.')
+    parser.add_argument('--gdelt-path', type=str, default=None,
+                        help='Path to GDELT embeddings directory (default: datasets/GDELT)')
     parser.add_argument('--checkpoint-interval', type=int, default=cfg.checkpoint_interval,
                         help='Fusion checkpoint interval in bars (default: 300 = 5 min)')
+    # Spike-weighted loss parameters
+    parser.add_argument('--spike-thresh', type=float, default=2.0,
+                        help='VIX point change threshold for spike weighting (default: 2.0)')
+    parser.add_argument('--extreme-thresh', type=float, default=4.0,
+                        help='VIX point change threshold for extreme spike weighting (default: 4.0)')
+    parser.add_argument('--spike-weight', type=float, default=3.0,
+                        help='Loss weight multiplier for spikes (default: 3.0)')
+    parser.add_argument('--extreme-weight', type=float, default=5.0,
+                        help='Loss weight multiplier for extreme spikes (default: 5.0)')
     args = parser.parse_args()
 
     # Setup distributed training
@@ -768,7 +930,7 @@ def main():
         sys.exit(1)
 
     # Build datasets
-    num_features = 29  # All stock features from Stock_Data_1s
+    num_features = 45  # Stock features from Stock_Data_2min (47 cols - ticker - bar_timestamp)
     train_sampler = None
     val_sampler = None
     
@@ -791,27 +953,33 @@ def main():
         vix_path = str(data_paths['vix'])
         
         # News path: use provided path or default
+        # Note: data loader looks for news_daily/ subdirectory internally
         news_path = args.news_path
         if args.use_news and news_path is None:
-            # Try default paths
+            # Try default paths (point to benzinga_embeddings parent dir)
             for candidate in [
-                data_paths.get('stock', Path('.')).parent / 'benzinga_embeddings' / 'news',
-                Path('datasets/benzinga_embeddings/news'),
+                data_paths.get('stock', Path('.')).parent / 'benzinga_embeddings',
+                Path('datasets/benzinga_embeddings'),
             ]:
                 if candidate.exists():
                     news_path = str(candidate)
                     break
         
-        # Options path: use provided path or default
+        # Options path: use provided path or default (2-min data)
         options_path = args.options_path
         if args.use_options and options_path is None:
-            for candidate in [
-                data_paths.get('stock', Path('.')).parent / 'opt_trade_1sec',
-                Path('datasets/opt_trade_1sec'),
-            ]:
-                if candidate.exists():
-                    options_path = str(candidate)
-                    break
+            # Try auto-detected path first, then fallback candidates
+            auto_path = data_paths.get('options')
+            if auto_path and auto_path.exists():
+                options_path = str(auto_path)
+            else:
+                for candidate in [
+                    data_paths.get('stock', Path('.')).parent / 'opt_trade_2min',
+                    Path('datasets/opt_trade_2min'),
+                ]:
+                    if candidate.exists():
+                        options_path = str(candidate)
+                        break
         
         if is_main:
             if args.use_news:
@@ -857,6 +1025,28 @@ def main():
                     logger.warning("Macro enabled but no path found")
             else:
                 dashboard.log("[dim]🏦 Macro: disabled (baseline mode)[/]")
+        
+        # GDELT path: use provided path or default
+        gdelt_path = args.gdelt_path
+        if args.use_gdelt and gdelt_path is None:
+            for candidate in [
+                data_paths.get('stock', Path('.')).parent / 'GDELT',
+                Path('datasets/GDELT'),
+            ]:
+                if candidate.exists():
+                    gdelt_path = str(candidate)
+                    break
+        
+        if is_main:
+            if args.use_gdelt:
+                if gdelt_path:
+                    dashboard.log(f"[bold cyan]🌍 GDELT:[/] {gdelt_path}")
+                    logger.info(f"GDELT world state ENABLED: {gdelt_path}")
+                else:
+                    dashboard.log("[yellow]⚠️ GDELT enabled but no GDELT path found[/]")
+                    logger.warning("GDELT enabled but no path found")
+            else:
+                dashboard.log("[dim]🌍 GDELT: disabled (baseline mode)[/]")
 
         train_dataset = BarMambaDataset(
             stock_data_path=stock_path,
@@ -872,6 +1062,8 @@ def main():
             use_options=args.use_options,
             macro_data_path=macro_path,
             use_macro=args.use_macro,
+            gdelt_data_path=gdelt_path,
+            use_gdelt=args.use_gdelt,
         )
         val_dataset = BarMambaDataset(
             stock_data_path=stock_path,
@@ -887,6 +1079,8 @@ def main():
             use_options=args.use_options,
             macro_data_path=macro_path,
             use_macro=args.use_macro,
+            gdelt_data_path=gdelt_path,
+            use_gdelt=args.use_gdelt,
         )
         num_features = train_dataset.num_features
         collate_fn = BarMambaDataset.collate_fn
@@ -910,51 +1104,50 @@ def main():
         persistent_workers=(effective_workers > 0),
     )
 
+    # Auto-calculate steps if not specified (0 = full epoch)
+    if args.train_steps == 0:
+        args.train_steps = len(train_dataset) // args.batch_size
+        if is_main:
+            dashboard.log(f"[dim]Train steps auto-calculated: {args.train_steps} ({len(train_dataset)} samples / batch {args.batch_size})[/]")
+    if args.val_steps == 0:
+        args.val_steps = len(val_dataset) // args.batch_size
+        if is_main:
+            dashboard.log(f"[dim]Val steps auto-calculated: {args.val_steps} ({len(val_dataset)} samples / batch {args.batch_size})[/]")
+
     # Build model
     if is_main:
         dashboard.log(f"[dim]Building model: d={args.d_model}, layers={args.n_layers}, state={args.d_state}[/]")
 
-    from mamba_only_model import MambaOnlyVIX, ParallelMambaVIX, NUM_OPTION_FEATURES
+    from mamba_only_model import ParallelMambaVIX, NUM_OPTION_FEATURES
     
-    if args.use_parallel_streams:
-        # Determine macro_dim from dataset if macro is enabled
-        macro_dim = getattr(train_dataset, 'macro_dim', 15) if args.use_macro else 15
-        
-        model = ParallelMambaVIX(
-            num_features=num_features,
-            d_model=args.d_model,
-            n_layers=args.n_layers,  # Same layers for all streams
-            d_state=args.d_state,
-            d_conv=4,
-            expand=2,
-            dropout=0.1,
-            checkpoint_interval=args.checkpoint_interval,
-            use_news=args.use_news,
-            news_dim=3072,
-            use_options=args.use_options,
-            option_features=NUM_OPTION_FEATURES,
-            head_hidden=128,
-            use_macro=args.use_macro,
-            macro_dim=macro_dim,
-        ).to(device)
-        if is_main:
-            dashboard.log(f"[bold magenta]🔀 Parallel streams:[/] checkpoint every {args.checkpoint_interval} bars")
-    else:
-        model = MambaOnlyVIX(
-            num_features=num_features,
-            d_model=args.d_model,
-            n_layers=args.n_layers,
-            d_state=args.d_state,
-            d_conv=4,
-            expand=2,
-            dropout=0.1,
-            pooling='attention',
-            head_hidden=128,
-            use_news=args.use_news,
-            news_dim=3072,
-            use_options=args.use_options,
-            option_features=NUM_OPTION_FEATURES,
-        ).to(device)
+    # Determine macro_dim from dataset if macro is enabled
+    macro_dim = getattr(train_dataset, 'macro_dim', 15) if args.use_macro else 15
+    
+    # Determine gdelt_dim from dataset if gdelt is enabled
+    gdelt_dim = getattr(train_dataset, 'gdelt_dim', 391) if args.use_gdelt else 391
+    
+    model = ParallelMambaVIX(
+        num_features=num_features,
+        d_model=args.d_model,
+        n_layers=args.n_layers,
+        d_state=args.d_state,
+        d_conv=4,
+        expand=2,
+        dropout=0.1,
+        checkpoint_interval=args.checkpoint_interval,
+        use_news=args.use_news,
+        news_dim=3072,
+        news_n_layers=args.news_n_layers,
+        use_options=args.use_options,
+        option_features=NUM_OPTION_FEATURES,
+        head_hidden=128,
+        use_macro=args.use_macro,
+        macro_dim=macro_dim,
+        use_gdelt=args.use_gdelt,
+        gdelt_dim=gdelt_dim,
+    ).to(device)
+    if is_main:
+        dashboard.log(f"[bold magenta]🔀 Parallel streams:[/] checkpoint every {args.checkpoint_interval} bars")
 
     # Wrap model in DDP for multi-GPU training
     if is_distributed:
@@ -963,7 +1156,7 @@ def main():
             dashboard.log(f"[dim]Model wrapped in DistributedDataParallel[/]")
 
     # Optimizer & loss — separate param group with 10x LR for FiLM generator
-    if args.use_macro and args.use_parallel_streams and hasattr(model, 'module'):
+    if args.use_macro and hasattr(model, 'module'):
         # DDP wrapped
         base_model = model.module
     else:
@@ -983,7 +1176,16 @@ def main():
         optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-5)
         if is_main:
             dashboard.log(f"[dim]LR: {args.lr}[/]")
-    criterion = nn.HuberLoss(delta=0.25)  # ~0.5 VIX points — MSE for small errors, MAE for large
+    # Spike-weighted multi-horizon loss
+    criterion = SpikeWeightedHuberLoss(
+        delta=0.25,
+        spike_thresh=args.spike_thresh,
+        extreme_thresh=args.extreme_thresh,
+        spike_weight=args.spike_weight,
+        extreme_weight=args.extreme_weight,
+    )
+    if is_main:
+        dashboard.log(f"[dim]Loss: SpikeWeighted (spike≥{args.spike_thresh}pt→{args.spike_weight}×, extreme≥{args.extreme_thresh}pt→{args.extreme_weight}×)[/]")
 
     # AMP
     amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
@@ -1058,29 +1260,33 @@ def main():
                 stream_mae_parts.append(f"[magenta]O:{val_metrics['options_mae']:.2f}[/]")
             stream_mae_display = " ".join(stream_mae_parts) if stream_mae_parts else ""
             
-            # Accuracy metrics
-            dir_acc = val_metrics.get('dir_acc', 0)
-            within_1pt = val_metrics.get('within_1pt', 0)
+            # Per-horizon metrics display
+            horizon_parts = []
+            for h in HORIZONS:
+                mae_h = val_metrics.get(f'mae_{h}d', 0)
+                dir_h = val_metrics.get(f'dir_acc_{h}d', 0)
+                horizon_parts.append(f"+{h}d:{mae_h:.2f}pt/{dir_h:.0f}%")
+            horizon_display = " | ".join(horizon_parts)
             
             dashboard.log(
                 f"[green]✓ Epoch {epoch+1}/{args.epochs}:[/] "
                 f"steps={train_steps_count} | "
                 f"loss={train_loss:.4f} | "
-                f"val_loss={val_metrics['loss']:.4f} | "
-                f"val_mae=[green]{val_metrics['mae']:.2f}pt[/] | "
-                f"dir_acc=[cyan]{dir_acc:.1f}%[/] | "
-                f"within_1pt=[yellow]{within_1pt:.1f}%[/]"
+                f"val_loss={val_metrics['loss']:.4f}"
+            )
+            dashboard.log(
+                f"  [bold]Horizons:[/] {horizon_display}"
             )
             dashboard.log(
                 f"  [dim]iter={avg_iter_time:.2f}s/it | VRAM={mem_alloc:.1f}GB[/]"
             )
             if stream_mae_parts:
                 dashboard.log(f"  [dim]Stream MAE:[/] {stream_mae_display}")
-            # Log to file
+            # Log to file with per-horizon details
             logger.info(
                 f"Epoch {epoch+1}/{args.epochs}: "
                 f"train_loss={train_loss:.4f}, val_loss={val_metrics['loss']:.4f}, "
-                f"val_mae={val_metrics['mae']:.2f}pt, dir_acc={dir_acc:.1f}%, within_1pt={within_1pt:.1f}%, "
+                f"horizons=[{horizon_display}], "
                 f"iter={avg_iter_time:.2f}s/it, VRAM={mem_alloc:.1f}GB"
             )
             
@@ -1166,16 +1372,38 @@ def main():
         # Check 2: Forward pass produces output (both heads)
         eval_model.eval()
         with torch.no_grad():
-            dummy = torch.randn(1, 100, num_features).to(device)
-            out = eval_model(dummy)
-            ok = 'vix_pred' in out and out['vix_pred'].shape == (1,)
+            # Build proper dummy inputs for all streams
+            dummy_bars = torch.randn(1, 100, num_features).to(device)
+            dummy_mask = torch.ones(1, 100, dtype=torch.bool, device=device)
+            dummy_opts = torch.randn(1, 100, NUM_OPTION_FEATURES).to(device) if args.use_options else None
+            dummy_opts_mask = torch.ones(1, 100, dtype=torch.bool, device=device) if args.use_options else None
+            dummy_news = torch.randn(1, 10, 3072).to(device) if args.use_news else None
+            dummy_news_mask = torch.ones(1, 10, dtype=torch.bool, device=device) if args.use_news else None
+            dummy_news_idx = torch.zeros(1, 10, dtype=torch.long, device=device) if args.use_news else None
+            dummy_news_ts = torch.arange(10, device=device).unsqueeze(0) * 1000 if args.use_news else None
+            dummy_gdelt = torch.randn(1, 5, gdelt_dim).to(device) if args.use_gdelt else None
+            dummy_gdelt_mask = torch.ones(1, 5, dtype=torch.bool, device=device) if args.use_gdelt else None
+            dummy_gdelt_ts = torch.arange(5, device=device).unsqueeze(0) * 1000 if args.use_gdelt else None
+            dummy_macro = torch.randn(1, macro_dim).to(device) if args.use_macro else None
+            dummy_bar_ts = torch.arange(100, device=device).unsqueeze(0)
+            out = eval_model(
+                dummy_bars, dummy_mask, dummy_opts, dummy_opts_mask,
+                dummy_news, dummy_news_mask, dummy_news_idx, dummy_news_ts,
+                dummy_gdelt, dummy_gdelt_mask, dummy_gdelt_ts,
+                dummy_macro, dummy_bar_ts
+            )
+            ok = 'vix_pred' in out and out['vix_pred'].shape == (1, 4)
             dashboard.log(f"  [{'[green]✓' if ok else '[red]✗'}] Forward pass correct[/]")
             checks_passed += ok
 
         # Check 3: Backward pass works
         eval_model.train()
-        dummy = torch.randn(1, 100, num_features, device=device, requires_grad=False)
-        out = eval_model(dummy)
+        out = eval_model(
+            dummy_bars, dummy_mask, dummy_opts, dummy_opts_mask,
+            dummy_news, dummy_news_mask, dummy_news_idx, dummy_news_ts,
+            dummy_gdelt, dummy_gdelt_mask, dummy_gdelt_ts,
+            dummy_macro, dummy_bar_ts
+        )
         loss = out['vix_pred'].sum()
         loss.backward()
         has_grads = any(p.grad is not None and p.grad.abs().sum() > 0

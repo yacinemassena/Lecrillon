@@ -1,5 +1,8 @@
 """
-Bar-to-Mamba Dataset: Direct 1s bar sequences for Mamba-only VIX prediction.
+Bar-to-Mamba Dataset: Direct 2-min bar sequences for Mamba-only VIX prediction.
+
+Multi-horizon targets: +1d, +7d, +15d, +30d VIX change prediction.
+Spike-weighted loss support via per-sample VIX change magnitudes.
 
 No caching - just load files directly, train, discard.
 Simple and clean.
@@ -7,7 +10,7 @@ Simple and clean.
 
 import logging
 from pathlib import Path
-from datetime import date
+from datetime import date, timedelta
 from typing import Dict, List, Optional, Set, Tuple
 import numpy as np
 import pandas as pd
@@ -19,7 +22,7 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Default bar features (all 29 features from Stock_Data_1s parquet columns)
+# Default bar features (all 47 features from Stock_Data_2min parquet columns)
 # ---------------------------------------------------------------------------
 DEFAULT_FEATURES = [
     'open', 'high', 'low', 'close', 'volume', 'trade_count',
@@ -29,9 +32,14 @@ DEFAULT_FEATURES = [
     'tick_arrival_rate', 'large_trade_ratio', 'inter_trade_std', 'tick_burst',
     'rv_intrabar', 'bpv_intrabar', 'price_skew',
     'close_vs_vwap', 'high_vs_vwap', 'low_vs_vwap', 'ofi',
+    # New 2-min features
+    'net_volume', 'volume_imbalance', 'trade_intensity', 'rv_bpv_ratio',
+    'close_return', 'volume_per_trade', 'buy_sell_ratio', 'high_low_ratio',
+    'close_position', 'day_of_week', 'days_to_friday', 'minute_of_day',
+    'is_friday', 'days_to_monthly_expiry', 'days_to_weekly_expiry', 'is_expiration_day',
 ]
 
-# Option features (all 38 features from option_underlying_bars_1s)
+# Option features (all 49 features from opt_trade_2min)
 OPTION_FEATURES = [
     'call_volume', 'put_volume', 'call_trade_count', 'put_trade_count',
     'put_call_ratio_volume', 'put_call_ratio_count',
@@ -47,8 +55,16 @@ OPTION_FEATURES = [
     'total_volume', 'total_trade_count',
     'unique_contracts', 'unique_strikes', 'unique_expiries',
     'pc_ratio_vs_20d', 'call_volume_vs_20d', 'put_volume_vs_20d',
+    # New 2-min features
+    'net_premium_flow', 'premium_imbalance', 'large_trade_pct', 'put_large_pct',
+    'uoa_total', 'uoa_put_bias', 'deep_otm_put_pct',
+    'near_far_ratio', 'sweep_to_trade_ratio',
 ]
 NUM_OPTION_FEATURES = len(OPTION_FEATURES)
+
+# Multi-horizon prediction targets (days ahead)
+HORIZONS = [1, 7, 15, 30]  # +1d, +7d, +15d, +30d
+NUM_HORIZONS = len(HORIZONS)
 
 # Class-level news cache (shared across all dataset instances/workers)
 # Loaded once in main process, shared via copy-on-write in workers
@@ -142,8 +158,8 @@ class BarMambaDataset(Dataset):
         vix_data_path: str,
         split: str = 'train',
         features: Optional[List[str]] = None,
-        max_bars_per_day: int = 23400,
-        max_total_bars: int = 50000,
+        max_bars_per_day: int = 195,  # ~195 bars per day at 2-min resolution
+        max_total_bars: int = 1000,   # ~5 days at 2-min resolution
         train_start: str = '2005-01-01',
         train_end: str = '2023-11-30',
         val_end: str = '2024-12-31',
@@ -154,6 +170,8 @@ class BarMambaDataset(Dataset):
         use_options: bool = False,
         macro_data_path: Optional[str] = None,
         use_macro: bool = False,
+        gdelt_data_path: Optional[str] = None,
+        use_gdelt: bool = False,
     ):
         self.split = split
         self.features = features or DEFAULT_FEATURES
@@ -163,11 +181,18 @@ class BarMambaDataset(Dataset):
         self.use_news = use_news
         self.use_options = use_options
         self.use_macro = use_macro
+        self.use_gdelt = use_gdelt
         
         # News data (Benzinga embeddings)
         self.news_path = Path(news_data_path) if news_data_path else None
         self.news_cache: Dict[int, pd.DataFrame] = {}  # year -> DataFrame
         self.news_dim = 3072  # OpenAI embedding dimension
+        
+        # GDELT data (world state embeddings every 15 min)
+        self.gdelt_path = Path(gdelt_data_path) if gdelt_data_path else None
+        self.gdelt_embed_dim = 384  # MiniLM embedding dimension
+        self.gdelt_stats_dim = 7    # Summary stats (article_count, goldstein, tone, etc.)
+        self.gdelt_dim = self.gdelt_embed_dim + self.gdelt_stats_dim  # 391 total
         
         # Macro conditioning data (FiLM)
         self.macro_data: Optional[pd.DataFrame] = None
@@ -196,8 +221,8 @@ class BarMambaDataset(Dataset):
         self.num_option_features = NUM_OPTION_FEATURES
         self.option_files: Dict = {}  # date -> file path
         
-        # Calculate days needed based on seq_len (~23,400 bars per trading day)
-        bars_per_day = 23400
+        # Calculate days needed based on seq_len (~195 bars per trading day at 2-min)
+        bars_per_day = 195
         self.lookback_days = max(1, (max_total_bars // bars_per_day) + 1)
         # Anchor dates
         self.anchor_start = pd.to_datetime(train_start).date()
@@ -250,8 +275,9 @@ class BarMambaDataset(Dataset):
         logger.info(f"Indexed {len(self.stock_files)} stock data files")
 
     def _index_option_files(self):
-        """Build date → file path mapping for option underlying bars."""
-        option_dir = self.options_path / 'option_underlying_bars_1s'
+        """Build date → file path mapping for option 2-min bars."""
+        # 2-min data: files directly in options_path (not in subdirectory)
+        option_dir = self.options_path
         if not option_dir.exists():
             logger.warning(f"Option directory not found: {option_dir}")
             return
@@ -267,10 +293,29 @@ class BarMambaDataset(Dataset):
                 continue
         logger.info(f"Indexed {len(self.option_files)} option data files")
 
+    def _find_vix_at_horizon(self, anchor_date: date, horizon_days: int, 
+                               vix_dates: set, all_dates: List[date], date_to_idx: Dict[date, int]) -> Optional[float]:
+        """Find VIX value at approximately horizon_days ahead.
+        
+        Searches for the nearest trading day with VIX data around the target date.
+        """
+        target_date = anchor_date + timedelta(days=horizon_days)
+        
+        # Search window: +/- 5 trading days from target
+        for offset in range(0, 10):
+            for sign in [0, 1, -1]:
+                if offset == 0 and sign != 0:
+                    continue
+                candidate = target_date + timedelta(days=offset * sign if sign else 0)
+                if candidate in vix_dates:
+                    return self.vix_daily[candidate]
+        return None
+
     def _build_anchor_dates(self) -> List[Dict]:
-        """Build valid anchor dates for this split."""
+        """Build valid anchor dates with multi-horizon targets."""
         all_dates = sorted(self.stock_files.keys())
         vix_dates = set(self.vix_daily.keys())
+        date_to_idx = {d: i for i, d in enumerate(all_dates)}
 
         # Determine split range for anchor dates
         if self.split == 'train':
@@ -301,26 +346,22 @@ class BarMambaDataset(Dataset):
                 continue
             anchor_vix = self.vix_daily[d]
 
-            # Find target date: next trading day with VIX data
-            target_date = None
-            for j in range(i + 1, min(i + 10, len(all_dates))):
-                candidate = all_dates[j]
-                if candidate in vix_dates:
-                    target_date = candidate
-                    break
-
-            if target_date is None:
-                from datetime import timedelta
-                for offset in range(1, 10):
-                    candidate = d + timedelta(days=offset)
-                    if candidate in vix_dates:
-                        target_date = candidate
-                        break
-
-            if target_date is None:
+            # Compute multi-horizon targets: +1d, +7d, +15d, +30d
+            vix_targets = []  # [num_horizons] VIX changes in points
+            horizon_mask = []  # [num_horizons] 1.0 if target exists, 0.0 otherwise
+            
+            for h in HORIZONS:
+                target_vix = self._find_vix_at_horizon(d, h, vix_dates, all_dates, date_to_idx)
+                if target_vix is not None:
+                    vix_targets.append(target_vix - anchor_vix)
+                    horizon_mask.append(1.0)
+                else:
+                    vix_targets.append(0.0)  # Placeholder, will be masked
+                    horizon_mask.append(0.0)
+            
+            # Must have at least +1d target (first horizon)
+            if horizon_mask[0] == 0.0:
                 continue
-
-            vix_change = self.vix_daily[target_date] - anchor_vix
 
             # Lookback window
             lookback_start_idx = i - self.lookback_days + 1
@@ -334,8 +375,9 @@ class BarMambaDataset(Dataset):
             valid.append({
                 'anchor_date': d,
                 'window_dates': window_dates,
-                'target_date': target_date,
-                'vix_change': vix_change,
+                'vix_targets': vix_targets,      # [4] VIX changes for each horizon
+                'horizon_mask': horizon_mask,    # [4] validity mask
+                'anchor_vix': anchor_vix,        # For reference/debugging
             })
 
         return valid
@@ -479,6 +521,95 @@ class BarMambaDataset(Dataset):
 
         return embeddings, timestamps
 
+    def _load_gdelt(self, window_dates: List[date]) -> Tuple[np.ndarray, np.ndarray]:
+        """Load GDELT world-state embeddings for window dates.
+        
+        Returns (features [N, 391], timestamps [N] as Unix seconds).
+        Features = concat(embedding[384], stats[7]).
+        Uses bucket_end as timestamp (when bucket becomes visible - no data leakage).
+        
+        Stats extracted (7 dims):
+            - log1p(article_count)
+            - goldstein_scale_mean
+            - goldstein_scale_min  
+            - tone_mean
+            - tone_negative_max
+            - tone_polarity_mean
+            - num_sources_mean
+        """
+        if not self.use_gdelt or self.gdelt_path is None:
+            return np.zeros((0, self.gdelt_dim), dtype=np.float32), np.zeros(0, dtype=np.int64)
+        
+        all_gdelt = []
+        
+        for d in window_dates:
+            year = d.year
+            month = d.month
+            day = d.day
+            path = self.gdelt_path / str(year) / f"{month:02d}" / f"{day:02d}.parquet"
+            
+            if not path.exists():
+                continue
+            
+            try:
+                df = pd.read_parquet(path)
+            except Exception as e:
+                logger.warning(f"Failed to load GDELT for {d}: {e}")
+                continue
+            
+            if len(df) == 0:
+                continue
+            
+            all_gdelt.append(df)
+        
+        if not all_gdelt:
+            return np.zeros((0, self.gdelt_dim), dtype=np.float32), np.zeros(0, dtype=np.int64)
+        
+        df = pd.concat(all_gdelt, ignore_index=True)
+        
+        if len(df) == 0:
+            return np.zeros((0, self.gdelt_dim), dtype=np.float32), np.zeros(0, dtype=np.int64)
+        
+        # Sort by bucket_end (when each bucket becomes visible)
+        df = df.sort_values('bucket_end')
+        
+        # Extract embeddings [N, 384]
+        embeddings = np.stack(df['embedding'].values).astype(np.float32)
+        
+        # Extract stats [N, 7] - select available columns with fallbacks
+        stats_cols = [
+            ('article_count', 'article_count', np.log1p),  # log-transform
+            ('goldstein_scale_mean', 'goldstein_scale_mean', None),
+            ('goldstein_scale_min', 'goldstein_scale_min', None),
+            ('tone_mean', 'tone_mean', None),
+            ('tone_negative_max', 'tone_negative_max', None),
+            ('tone_polarity_mean', 'tone_polarity_mean', None),
+            ('num_sources_mean', 'num_sources_mean', None),
+        ]
+        
+        stats = np.zeros((len(df), self.gdelt_stats_dim), dtype=np.float32)
+        for i, (col_name, _, transform) in enumerate(stats_cols):
+            if col_name in df.columns:
+                vals = df[col_name].values.astype(np.float32)
+                vals = np.nan_to_num(vals, nan=0.0, posinf=0.0, neginf=0.0)
+                if transform is not None:
+                    vals = transform(vals)
+                stats[:, i] = vals
+        
+        # Combine: [N, 384 + 7] = [N, 391]
+        features = np.concatenate([embeddings, stats], axis=1)
+        
+        # Convert bucket_end to Unix seconds
+        bucket_end = pd.to_datetime(df['bucket_end'])
+        # Handle timezone - convert to UTC if needed
+        if bucket_end.dt.tz is None:
+            bucket_end = bucket_end.dt.tz_localize('UTC')
+        else:
+            bucket_end = bucket_end.dt.tz_convert('UTC')
+        timestamps = (bucket_end.astype(np.int64) // 1_000_000_000).values
+        
+        return features, timestamps
+
     def _load_day_options(self, d: date, num_bars: int) -> Optional[np.ndarray]:
         """Load option features for a day, aggregated to match stock bar count.
         
@@ -583,10 +714,11 @@ class BarMambaDataset(Dataset):
         """Get single sample by index. Data cached in RAM after first load."""
         sample = self.anchor_dates[idx]
         window_dates = sample['window_dates']
-        vix_change = sample['vix_change']
+        vix_targets = sample['vix_targets']      # [4] multi-horizon targets
+        horizon_mask = sample['horizon_mask']    # [4] validity mask
 
-        # Load bars for all lookback days (with timestamps if using news or macro)
-        need_timestamps = self.use_news or self.use_macro
+        # Load bars for all lookback days (with timestamps if using news, macro, or gdelt)
+        need_timestamps = self.use_news or self.use_macro or self.use_gdelt
         all_bars = []
         all_bar_ts = []
         for d in window_dates:
@@ -607,7 +739,8 @@ class BarMambaDataset(Dataset):
             # Return empty sample (will be filtered by collate)
             result = {
                 'bars': torch.zeros(1, self.num_features),
-                'vix_target': torch.tensor(0.0, dtype=torch.float32),
+                'vix_targets': torch.zeros(NUM_HORIZONS, dtype=torch.float32),
+                'horizon_mask': torch.zeros(NUM_HORIZONS, dtype=torch.float32),
                 'num_bars': 0,
                 'anchor_date': str(sample['anchor_date']),
             }
@@ -616,8 +749,14 @@ class BarMambaDataset(Dataset):
                 result['news_embs'] = torch.zeros(0, self.news_dim)
                 result['news_timestamps'] = torch.zeros(0, dtype=torch.long)
                 result['num_news'] = 0
+            if self.use_gdelt:
+                if 'bar_timestamps' not in result:
+                    result['bar_timestamps'] = torch.zeros(1, dtype=torch.long)
+                result['gdelt_embs'] = torch.zeros(0, self.gdelt_dim)
+                result['gdelt_timestamps'] = torch.zeros(0, dtype=torch.long)
+                result['num_gdelt'] = 0
             if self.use_macro:
-                if not self.use_news:
+                if 'bar_timestamps' not in result:
                     result['bar_timestamps'] = torch.zeros(1, dtype=torch.long)
                 result['macro_context'] = torch.zeros(max(self.macro_dim, 1), dtype=torch.float32)
             return result
@@ -638,7 +777,8 @@ class BarMambaDataset(Dataset):
 
         result = {
             'bars': torch.from_numpy(bars),
-            'vix_target': torch.tensor(vix_change, dtype=torch.float32),
+            'vix_targets': torch.tensor(vix_targets, dtype=torch.float32),      # [4] horizons
+            'horizon_mask': torch.tensor(horizon_mask, dtype=torch.float32),    # [4] validity
             'num_bars': len(bars),
             'anchor_date': str(sample['anchor_date']),
         }
@@ -663,6 +803,13 @@ class BarMambaDataset(Dataset):
                 result['news_indices'] = torch.from_numpy(news_indices.astype(np.int64))
             else:
                 result['news_indices'] = torch.zeros(len(news_embs), dtype=torch.long)
+        
+        # Add GDELT data if enabled
+        if self.use_gdelt:
+            gdelt_embs, gdelt_ts = self._load_gdelt(window_dates)
+            result['gdelt_embs'] = torch.from_numpy(gdelt_embs.copy())
+            result['gdelt_timestamps'] = torch.from_numpy(gdelt_ts.copy())
+            result['num_gdelt'] = len(gdelt_embs)
         
         # Add macro context if enabled (T-1 lookup)
         if self.use_macro and self.macro_data is not None:
@@ -728,18 +875,21 @@ class BarMambaDataset(Dataset):
 
         bars_padded = torch.zeros(B, max_len, num_features)
         bar_mask = torch.zeros(B, max_len)
-        targets = torch.zeros(B)
+        
+        # Multi-horizon targets: [B, 4] and horizon validity mask
+        vix_targets = torch.stack([b['vix_targets'] for b in batch])  # [B, 4]
+        horizon_mask = torch.stack([b['horizon_mask'] for b in batch])  # [B, 4]
 
         for i, b in enumerate(batch):
             T = b['num_bars']
             bars_padded[i, :T, :] = b['bars']
             bar_mask[i, :T] = 1.0
-            targets[i] = b['vix_target']
 
         result = {
             'bars': bars_padded,
             'bar_mask': bar_mask,
-            'vix_target': targets,
+            'vix_targets': vix_targets,      # [B, 4] multi-horizon targets
+            'horizon_mask': horizon_mask,    # [B, 4] validity mask
             'num_bars': [b['num_bars'] for b in batch],
         }
 
@@ -776,6 +926,36 @@ class BarMambaDataset(Dataset):
             result['news_timestamps'] = news_ts_padded
             result['news_indices'] = news_indices_padded
             result['num_news'] = [b['num_news'] for b in batch]
+        
+        # Handle GDELT data if present
+        if 'gdelt_embs' in batch[0]:
+            gdelt_dim = batch[0]['gdelt_embs'].shape[-1] if batch[0]['gdelt_embs'].numel() > 0 else 391
+            max_gdelt = max(b.get('num_gdelt', 0) for b in batch) if any(b.get('num_gdelt', 0) > 0 for b in batch) else 1
+            
+            gdelt_padded = torch.zeros(B, max_gdelt, gdelt_dim)
+            gdelt_mask = torch.zeros(B, max_gdelt)
+            gdelt_ts_padded = torch.zeros(B, max_gdelt, dtype=torch.long)
+            
+            # Ensure bar_timestamps exists
+            if 'bar_timestamps' not in result:
+                bar_ts_padded = torch.zeros(B, max_len, dtype=torch.long)
+                for i, b in enumerate(batch):
+                    T = b['num_bars']
+                    if 'bar_timestamps' in b and b['bar_timestamps'].numel() > 0:
+                        bar_ts_padded[i, :T] = b['bar_timestamps'][:T]
+                result['bar_timestamps'] = bar_ts_padded
+            
+            for i, b in enumerate(batch):
+                G = b.get('num_gdelt', 0)
+                if G > 0:
+                    gdelt_padded[i, :G] = b['gdelt_embs']
+                    gdelt_mask[i, :G] = 1.0
+                    gdelt_ts_padded[i, :G] = b['gdelt_timestamps']
+            
+            result['gdelt_embs'] = gdelt_padded
+            result['gdelt_mask'] = gdelt_mask
+            result['gdelt_timestamps'] = gdelt_ts_padded
+            result['num_gdelt'] = [b.get('num_gdelt', 0) for b in batch]
         
         # Handle bar_timestamps for macro (when news isn't present but macro is)
         if 'bar_timestamps' in batch[0] and 'bar_timestamps' not in result:
