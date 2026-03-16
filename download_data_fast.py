@@ -36,6 +36,10 @@ PATHS = {
     'vix': f'{DATASETS_ROOT}/VIX',
     'options': f'{DATASETS_ROOT}/opt_trade_2min',
     'news': f'{DATASETS_ROOT}/benzinga_embeddings/news_daily',
+    'macro': f'{DATASETS_ROOT}/MACRO',
+    'gdelt': f'{DATASETS_ROOT}/GDELT',
+    'econ': f'{DATASETS_ROOT}/econ_calendar',
+    'fundamentals': f'{DATASETS_ROOT}/fundamentals',
     'full': DATASETS_ROOT,
 }
 
@@ -238,7 +242,7 @@ Performance Tips:
                         help='Start year for range download')
     parser.add_argument('--end-year', type=int, 
                         help='End year for range download')
-    parser.add_argument('--data-type', choices=['stock', 'vix', 'options', 'news', 'all', 'full'], 
+    parser.add_argument('--data-type', choices=['stock', 'vix', 'options', 'news', 'macro', 'gdelt', 'econ', 'fundamentals', 'all', 'full'], 
                         default='all', help='Type of data to download (default: all)')
     
     # Directory options
@@ -292,12 +296,16 @@ Performance Tips:
         'vix': args.vix_dir,
         'options': args.options_dir,
         'news': args.news_dir,
+        'macro': Path('datasets/MACRO'),
+        'gdelt': Path('datasets/GDELT'),
+        'econ': Path('datasets/econ_calendar'),
+        'fundamentals': Path('datasets/fundamentals'),
         'full': Path('datasets'),
     }
     
     # Determine which data types to download
     if args.data_type == 'all':
-        data_types = ['stock', 'vix', 'options', 'news']
+        data_types = ['stock', 'vix', 'options', 'news', 'macro', 'gdelt', 'econ', 'fundamentals']
     else:
         data_types = [args.data_type]
     
