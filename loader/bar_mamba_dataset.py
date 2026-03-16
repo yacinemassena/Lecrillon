@@ -1628,6 +1628,10 @@ class BarMambaDataset(Dataset):
         if 'macro_context' in batch[0]:
             result['macro_context'] = torch.stack([b['macro_context'] for b in batch])
         
+        # Handle fundamentals context if present
+        if 'fundamentals_context' in batch[0]:
+            result['fundamentals_context'] = torch.stack([b['fundamentals_context'] for b in batch])
+        
         # Handle econ calendar data if present
         if 'econ_event_ids' in batch[0]:
             max_econ = max(b.get('num_econ', 0) for b in batch) if any(b.get('num_econ', 0) > 0 for b in batch) else 1

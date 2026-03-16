@@ -470,6 +470,18 @@ def train_steps(model, loader, optimizer, criterion, scaler, device, num_steps,
         if fundamentals_context is not None:
             fundamentals_context = fundamentals_context.to(device, non_blocking=True)
         
+        # Optional VIX features (extended hours)
+        vix_features = batch.get('vix_features')
+        vix_mask = batch.get('vix_mask')
+        vix_timestamps = batch.get('vix_timestamps')
+        
+        if vix_features is not None:
+            vix_features = vix_features.to(device, non_blocking=True)
+        if vix_mask is not None:
+            vix_mask = vix_mask.to(device, non_blocking=True)
+        if vix_timestamps is not None:
+            vix_timestamps = vix_timestamps.to(device, non_blocking=True)
+        
         torch.cuda.synchronize()
         t_gpu = time.time() - t_gpu_start
         
@@ -497,6 +509,9 @@ def train_steps(model, loader, optimizer, criterion, scaler, device, num_steps,
                 econ_mask=econ_mask,
                 econ_timestamps=econ_timestamps,
                 fundamentals_context=fundamentals_context,
+                vix_features=vix_features,
+                vix_mask=vix_mask,
+                vix_timestamps=vix_timestamps,
             )
             pred = outputs['vix_pred']  # [B, 4] multi-horizon
             
@@ -690,6 +705,18 @@ def val_steps(model, loader, criterion, device, num_steps, amp_dtype=torch.bfloa
         fundamentals_context = batch.get('fundamentals_context')
         if fundamentals_context is not None:
             fundamentals_context = fundamentals_context.to(device, non_blocking=True)
+        
+        # Optional VIX features (extended hours)
+        vix_features = batch.get('vix_features')
+        vix_mask = batch.get('vix_mask')
+        vix_timestamps = batch.get('vix_timestamps')
+        
+        if vix_features is not None:
+            vix_features = vix_features.to(device, non_blocking=True)
+        if vix_mask is not None:
+            vix_mask = vix_mask.to(device, non_blocking=True)
+        if vix_timestamps is not None:
+            vix_timestamps = vix_timestamps.to(device, non_blocking=True)
 
         with torch.autocast(device_type='cuda', dtype=amp_dtype, enabled=True):
             outputs = model(
@@ -711,6 +738,9 @@ def val_steps(model, loader, criterion, device, num_steps, amp_dtype=torch.bfloa
                 econ_mask=econ_mask,
                 econ_timestamps=econ_timestamps,
                 fundamentals_context=fundamentals_context,
+                vix_features=vix_features,
+                vix_mask=vix_mask,
+                vix_timestamps=vix_timestamps,
             )
             pred = outputs['vix_pred']  # [B, 4] multi-horizon
             loss = criterion(pred, target, horizon_mask)
