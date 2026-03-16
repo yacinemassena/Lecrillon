@@ -1417,11 +1417,15 @@ def main():
         train_dataset, batch_size=args.batch_size, shuffle=True,
         num_workers=effective_workers, collate_fn=collate_fn, pin_memory=True,
         persistent_workers=(effective_workers > 0),
+        prefetch_factor=2 if effective_workers > 0 else None,
+        timeout=300 if effective_workers > 0 else 0,  # 5min timeout per batch
     )
     val_loader = DataLoader(
         val_dataset, batch_size=args.batch_size, shuffle=False,
         num_workers=effective_workers, collate_fn=collate_fn, pin_memory=True,
         persistent_workers=(effective_workers > 0),
+        prefetch_factor=2 if effective_workers > 0 else None,
+        timeout=300 if effective_workers > 0 else 0,
     )
 
     # Auto-calculate steps if not specified (0 = full epoch)
