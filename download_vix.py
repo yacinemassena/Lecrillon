@@ -50,6 +50,9 @@ def download_vix_data(s3_client, local_dir: Path = Path('datasets/VIX')):
             local_file = local_dir / filename
             size_kb = obj['Size'] / 1e3
             
+            # Create parent directories for nested files (e.g., Vix_features/)
+            local_file.parent.mkdir(parents=True, exist_ok=True)
+            
             print(f'  [{count+1}] {filename} ({size_kb:.1f} KB)')
             s3_client.download_file(R2_BUCKET, key, str(local_file))
             
