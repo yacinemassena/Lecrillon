@@ -1295,6 +1295,7 @@ class BarMambaDataset(Dataset):
         need_timestamps = self.use_news or self.use_macro or self.use_gdelt or self.use_econ
         all_bars = []
         all_bar_ts = []
+        loaded_days = []  # Track which days were successfully loaded
         for d in window_dates:
             file_path = self.stock_files.get(d)
             if file_path is None:
@@ -1304,10 +1305,12 @@ class BarMambaDataset(Dataset):
                 if result is not None:
                     all_bars.append(result[0])
                     all_bar_ts.append(result[1])
+                    loaded_days.append((d, len(result[0])))
             else:
                 day_bars = self._load_day_bars(file_path)
                 if day_bars is not None:
                     all_bars.append(day_bars)
+                    loaded_days.append((d, len(day_bars)))
 
         if not all_bars:
             # Return empty sample (will be filtered by collate)
@@ -1444,9 +1447,8 @@ class BarMambaDataset(Dataset):
         # Add option data if enabled
         if self.use_options:
             all_options = []
-            for i, d in enumerate(window_dates):
-                # Get stock bar count for this day to match option length
-                day_bar_count = len(all_bars[i]) if i < len(all_bars) else 0
+            for d, day_bar_count in loaded_days:
+                # Use loaded_days which tracks actual days with stock data
                 if day_bar_count > 0:
                     day_options = self._load_day_options(d, day_bar_count)
                     if day_options is not None:
