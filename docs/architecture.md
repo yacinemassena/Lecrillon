@@ -1,23 +1,27 @@
 # VIX Prediction Architecture
 
-> **Last Updated:** March 2026
+> **Last Updated:** March 16, 2026
 
 ## Overview
 
-**Multi-stream Mamba architecture** for VIX prediction from 2-minute market data with periodic fusion across stock, options, and news-conditioned streams. GDELT is merged into the news stream, and macro data is applied through FiLM conditioning.
+**Multi-stream Mamba architecture** for VIX prediction from 2-minute market data with periodic fusion across stock, options, news, and VIX streams. GDELT is merged into the news stream, macro data is applied through FiLM conditioning, and VIX features provide extended-hours market context.
 
 ## Current Implementation (v2)
 
 ### Architecture Diagram
 
 ```
-Stock Bars [B, T, 45] ───────────────────────────────→ Stock Mamba ───────────────┐
+Stock Bars [B, T, 51] ───────────────────────────────→ Stock Mamba (d=256) ────────┐
                                                                                    │
-Option Flow [B, T, 47] ─→ OptionEncoder ─→ Option Mamba ───────────────────────────┤
+Option Flow [B, T, 48] ─→ OptionEncoder ─→ Option Mamba (d=256) ───────────────────┤
                                                                                    │
-News [B, N, 3072] + GDELT [B, M, 391] ─→ Merge + Type Embedding ─→ News Mamba ────┤
+News [B, N, 3072] + GDELT [B, M, 391] ─→ Merge + Type Embed ─→ News Mamba (d=256) ─┤
                                                                                    │
-Macro Context [B, 15+] ─→ FiLM conditioning on stock stream ───────────────────────┤
+VIX Features [B, V, 21] ─→ VixEncoder ─→ VIX Mamba (d=64) ─→ proj ─────────────────┤
+                                                                                   │
+Macro Context [B, 25] ─→ FiLM conditioning on stock stream ────────────────────────┤
+                                                                                   │
+Fundamentals [B, 130] ─→ Linear projection ─→ cross-attention state ───────────────┤
                                                                                    │
 Checkpoint fusion every N bars ─→ gated cross-stream fusion ─→ pooled head ─→ VIX targets [B, 4]
 ```
@@ -26,25 +30,31 @@ Checkpoint fusion every N bars ─→ gated cross-stream fusion ─→ pooled he
 
 | Component | Description |
 |-----------|-------------|
-| **Stock stream** | Main Mamba stream over 2-minute stock bars |
-| **Option stream** | Encodes 47 option-flow features and fuses periodically with stock |
-| **News stream** | Processes Benzinga embeddings and optional GDELT tokens in one shared news Mamba |
-| **Macro FiLM** | Applies macro conditioning to stock representations |
-| **ParallelMambaVIX** | 4 stock/options layers, 2 news layers, `d_model=256`, `d_state=64` |
+| **Stock stream** | Main Mamba stream over 2-minute stock bars (d=256, 4 layers) |
+| **Option stream** | Encodes 48 option-flow features, fuses with stock (d=256, 4 layers) |
+| **News stream** | Benzinga + GDELT + Econ tokens merged by timestamp (d=256, 2 layers) |
+| **VIX stream** | Extended hours VIX/VVIX features, ~540 bars/day (d=64, 2 layers) |
+| **Macro FiLM** | Time-aware conditioning on stock representations |
+| **Fundamentals** | 130-dim sector state via cross-attention |
 | **Multi-horizon head** | Predicts VIX change for `+1d`, `+7d`, `+15d`, `+30d` |
 
 ### Data Sources
 
 | Source | Features | Date Range | Path |
 |--------|----------|------------|------|
-| **Stock bars** | 45 | 2005+ | `datasets/Stock_Data_2min/` |
-| **Options flow** | 47 | 2014-06+ | `datasets/opt_trade_2min/` |
+| **Stock bars** | 51 | 2005+ | `datasets/Stock_Data_2min/` |
+| **Options flow** | 48 | 2014-06+ | `datasets/opt_trade_2min/` |
 | **News embeddings** | 3072 | 2009+ | `datasets/benzinga_embeddings/` |
 | **GDELT world state** | 391 | configurable | `datasets/GDELT/` |
-| **Macro conditioning** | dynamic | configurable | `datasets/macro/` |
+| **VIX features** | 21 | 2005+ | `datasets/VIX/Vix_features/` |
+| **Macro conditioning** | 25 | 2000+ | `datasets/MACRO/macro_daily.parquet` |
+| **Econ calendar** | 13 | 2007+ | `datasets/econ_calendar/` |
+| **Fundamentals state** | 130 | 2010+ | `datasets/fundamentals/fundamentals_state.parquet` |
+| **Cross-asset** | ~30 | 2000+ | `datasets/cross_asset/` (optional, via FRED API) |
 
-### Stock Features (45)
+### Stock Features (51)
 ```python
+# Core OHLCV + microstructure (46 from parquet)
 ['open', 'high', 'low', 'close', 'volume', 'trade_count',
  'price_mean', 'price_std', 'price_range', 'price_range_pct', 'vwap',
  'avg_trade_size', 'std_trade_size', 'max_trade_size', 'amihud',
@@ -55,10 +65,47 @@ Checkpoint fusion every N bars ─→ gated cross-stream fusion ─→ pooled he
  'net_volume', 'volume_imbalance', 'trade_intensity', 'rv_bpv_ratio',
  'close_return', 'volume_per_trade', 'buy_sell_ratio', 'high_low_ratio',
  'close_position', 'day_of_week', 'days_to_friday', 'minute_of_day',
- 'is_friday', 'days_to_monthly_expiry', 'days_to_weekly_expiry', 'is_expiration_day']
+ 'is_friday', 'days_to_monthly_expiry', 'days_to_weekly_expiry', 'is_expiration_day',
+
+# Derived features (computed on-the-fly in dataloader, 5 new)
+ 'liquidity_stress',    # zscore(amihud) + zscore(inter_trade_std) - zscore(tick_arrival_rate)
+ 'ofi_acceleration',    # OFI(t) - OFI(t-10)
+ 'abs_ofi',             # |OFI|
+ 'intraday_vol_skew',   # rv_last_hour / rv_first_hour
+ 'ticker_dispersion']   # std(close_return) across tickers per timestamp
 ```
 
-### Option Features (47)
+### VIX Features (21)
+
+Extended hours VIX/VVIX features (~540 bars/day, 04:00-22:00 ET):
+
+```python
+['open', 'high', 'low', 'close',           # VIX OHLC
+ 'vvix',                                    # VVIX close (market hours only, ~18% coverage)
+ '5dMA', '10dMA', '20dMA',                  # Moving averages (trading bar windows)
+ 'rv_5m', 'rv_30m', 'rv_2h',                # Realized volatility windows
+ 'rv_acceleration', 'rv_change_5', 'rv_change_30', 'rv_ratio',  # RV dynamics
+ 'vix_vvix_ratio',                          # VIX/VVIX relationship
+ 'vix_zscore_20d', 'vix_percentile_252d',   # VIX level context
+ 'distance_from_20dMA',                     # Mean reversion signal
+ 'vix_velocity_15', 'vix_velocity_75',      # 30min and 2.5h momentum
+ 'vix_acceleration_15', 'vix_acceleration_75',  # Second derivatives
+ 'rv_ratio_to_vix']                         # Variance risk premium proxy (SPY RV / VIX)
+```
+
+**VIX Mamba Architecture**:
+- **d_model=64** (smaller than stock's 256, since only 21 features)
+- **d_state=16** (smaller state dimension)
+- **2 layers** (lightweight)
+- Projects to main d_model (256) via linear layer for fusion
+
+**Extended Hours Processing**:
+- VIX trades 04:00-22:00 ET (~18h vs stock's 6.5h)
+- ~540 bars/day vs stock's 195 bars
+- At each checkpoint, VIX Mamba processes all VIX bars within timestamp window
+- **Pre-market accumulation**: First checkpoint (09:30) processes ALL overnight VIX bars
+
+### Option Features (48)
 ```python
 ['call_volume', 'put_volume', 'call_trade_count', 'put_trade_count',
  'put_call_ratio_volume', 'put_call_ratio_count',
@@ -74,18 +121,24 @@ Checkpoint fusion every N bars ─→ gated cross-stream fusion ─→ pooled he
  'total_volume', 'total_trade_count', 'unique_contracts', 'unique_strikes',
  'unique_expiries', 'pc_ratio_vs_20d', 'call_volume_vs_20d', 'put_volume_vs_20d',
  'net_premium_flow', 'premium_imbalance', 'large_trade_pct', 'put_large_pct',
- 'uoa_total', 'uoa_put_bias', 'deep_otm_put_pct', 'near_far_ratio', 'sweep_to_trade_ratio']
+ 'uoa_total', 'uoa_put_bias', 'deep_otm_put_pct', 'near_far_ratio', 'sweep_to_trade_ratio',
+
+# Derived (computed on-the-fly)
+ 'skew_change']          # skew_proxy(t) - skew_proxy(t-30)
 ```
 
 ### Model Code
 
 ```python
 class ParallelMambaVIX(nn.Module):
-    def __init__(self, num_features=45, d_model=256, n_layers=4, d_state=64,
+    def __init__(self, num_features=51, d_model=256, n_layers=4, d_state=64,
                  use_news=True, news_dim=3072, news_n_layers=2,
-                 use_options=True, option_features=47,
-                 use_macro=True, macro_dim=15,
-                 use_gdelt=False, gdelt_dim=391):
+                 use_options=True, option_features=48,
+                 use_macro=True, macro_dim=58,  # 54 base + 4 derived
+                 use_gdelt=False, gdelt_dim=391,
+                 use_vix_features=True, vix_features_dim=21, vix_n_layers=2,
+                 vix_d_model=64, vix_d_state=16,
+                 use_fundamentals=True, fundamentals_dim=130):
         ...
 ```
 
@@ -97,7 +150,7 @@ Data sources are **automatically included based on sample date** within a single
 
 | Sample Date | Stock | Options | News |
 |-------------|-------|---------|------|
-| 2005-2008   | ✓     | ✗ (zeros, masked) | ✗ (zeros, masked) |
+| 2003-2008   | ✓     | ✗ (zeros, masked) | ✗ (zeros, masked) |
 | 2009-2013   | ✓     | ✗ (zeros, masked) | ✓ |
 | 2014+       | ✓     | ✓ | ✓ |
 
@@ -111,7 +164,7 @@ Data sources are **automatically included based on sample date** within a single
 **Single run trains on all data with automatic source availability:**
 ```bash
 python train.py --use-options --use-news --epochs 50
-# 2005-2008: stock only
+# 2003-2008: stock only
 # 2009-2013: stock + news
 # 2014+: stock + options + news
 ```
@@ -134,70 +187,255 @@ python train.py
 # - d_model=256
 # - n_layers=4
 # - news_n_layers=2
+# - vix_n_layers=2
 # - use_news=True
 # - use_options=True
-# - use_macro=True
+# - use_macro=True (auto-detects enhanced macro)
 # - use_gdelt=True
+# - use_vix_features=True
 ```
 
-### Macro Features (25 total from FED/FRED)
+### Enhanced Macro Features (58 total from FED/FRED)
 
-Built from `datasets/FED/` via `tools/build_macro_from_fed.py`:
+Built from `datasets/FED/` via `tools/build_enhanced_macro.py` + derived features:
 
-- **Rates**: `DFF`, `DGS3MO`, `DGS2`, `DGS5`, `DGS10`, `DGS30`
-- **Yield curve**: `T10Y2Y`, `T10Y3M`, `ff_3m_spread`
-- **Market stress**: `VIXCLS`, `BAMLH0A0HYM2`, `BAMLC0A0CM`, `credit_spread`
-- **Inflation**: `CPIAUCSL`, `PCEPILFE`
-- **Employment**: `UNRATE`, `ICSA`
-- **Balance sheet**: `WALCL`
+- **Treasury yields**: `DGS1MO`, `DGS3MO`, `DGS2`, `DGS5`, `DGS10`, `DGS30`
+- **Yield curve**: `yield_2s10s`, `yield_3m10y`, `yield_curve_steepness`, `T10Y2Y`, `T10Y3M`
+- **Yield curve inversions**: `yc_2s10s_inverted`, `yc_3m10y_inverted`
+- **Fed funds rates**: `DFF`, `DFEDTARL`, `DFEDTARU`, `FEDFUNDS`, `IORB`, `fed_funds_vs_target`
+- **Inflation**: `CPIAUCSL`, `CPILFESL`, `PCEPI`, `PCEPILFE`, `MICH` + YoY changes
+- **Employment**: `UNRATE`, `PAYEMS`, `ICSA`, `JTSJOL`, `CLF16OV`, `ICSA_4wma`, `ICSA_vs_4wma`
+- **Balance sheet**: `WALCL`, `WSHOSHO`, `WRESBAL`, `RESPPLLOPNWW`, `WALCL_mom`
+- **Market stress**: `VIXCLS`, `BAMLH0A0HYM2` (HY OAS), `BAMLC0A0CM` (IG OAS), `STLFSI4`
 - **Economic activity**: `INDPRO`, `RSAFS`, `HOUST`, `UMCSENT`
 - **FOMC calendar**: `days_since_fomc`, `days_until_fomc`, `is_fomc_week`
+- **Spreads**: `ff_3m_spread`
+
+**Derived features (computed on-the-fly in dataloader):**
+- `credit_spread`: `BAMLH0A0HYM2 - BAMLC0A0CM` (HY-IG spread)
+- `yield_curve_velocity`: `T10Y2Y(t) - T10Y2Y(t-5)` (5-day change)
+- `stlfsi4_change`: `STLFSI4(t) - STLFSI4(t-1)` (daily Δ stress index)
+- `fomc_proximity`: `exp(-days_until_fomc / 5)` (exponential decay)
+
+**Data shift**: All macro features are shifted by T-1 to avoid lookahead bias.
+
+### Cross-Asset Data (Optional)
+
+Downloaded from FRED via `tools/download_cross_asset.py` (requires `FRED_API_KEY`):
+
+- **Commodities**: Gold price, oil (WTI), gold/oil momentum
+- **Credit spreads**: HY OAS, IG OAS, BBB spread, AAA spread, HY-IG differential
+- **Real yields**: TIPS 5Y/10Y, breakeven inflation
+- **Market stress**: VIX, STL Financial Stress Index, Chicago Fed NFCI
+- **Dollar/FX**: DXY index, USD momentum
+- **Derived**: Z-scores, momentum (5d/20d), regime flags
+
+---
+
+## Fundamentals Architecture
+
+Comprehensive fundamentals integration with **130-dim cross-attention state** and **event tokens** for mega-caps.
+
+### Cross-Attention State (130 dims, updates daily)
+
+```
+fundamentals_state.parquet (3,794 daily files)
+├── Income/Earnings (~60 dims)
+│   ├── Revenue growth by sector (QoQ)
+│   ├── Margin trends (gross, operating, net) by sector
+│   └── Profitability rate by sector
+├── Balance Sheet/Leverage (~30 dims)
+│   ├── Debt/equity ratio by sector
+│   ├── Current ratio by sector
+│   └── Cash ratio by sector
+└── Short Interest (~10 dims)
+    ├── SI level (days to cover) by sector
+    └── SI change by sector
+```
+
+**IMPORTANT**: Uses `filing_date` (when data became public), NOT `period_date` (leakage prevention).
+
+### News Mamba Tokens (Event-Driven)
+
+| Token Type | Files | Trigger |
+|------------|-------|---------|
+| **Mega-cap earnings** | 771 | Top 50 quarterly filings |
+| **Mega-cap SI changes** | 192 | SI shifts >10% |
+
+**Earnings token features**: `ticker`, `sector`, `revenue_z`, `eps_z`, `gross_margin`, `net_margin`
+
+**SI token features**: `ticker`, `sector`, `si_level_z`, `si_change`, `si_percentile`
+
+### Data Sources
+
+| Source | Coverage | Cadence | Used For |
+|--------|----------|---------|----------|
+| `income_statements.csv` | 2010-2026 | Quarterly | Margins, profitability |
+| `balance_sheets.csv` | 2010-2026 | Quarterly | Leverage, liquidity |
+| `cash_flow_statements.csv` | 2010-2026 | Quarterly | FCF, buybacks |
+| `short_interest.csv` | 2017-2025 | Bi-weekly | SI aggregates + tokens |
+
+### Build Scripts
+
+```bash
+python tools/build_fundamentals_state.py  # Main builder
+```
+
+### Output Files
+
+```
+datasets/fundamentals/
+├── fundamentals_state.parquet       # 130-dim daily state
+├── state_daily/YYYY-MM-DD.parquet   # Daily cross-attention files
+├── earnings_tokens/YYYY-MM-DD.parquet  # Mega-cap earnings events
+└── si_tokens/YYYY-MM-DD.parquet     # Mega-cap SI change events
+```
+
+---
+
+## Earnings Data Architecture
+
+Dual-path earnings integration for capturing both **events** (individual reports) and **state** (sector aggregates):
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         EARNINGS DATA FLOW                                   │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  SEC EDGAR (19K companies)                                                   │
+│  └─ companyfacts/*.json ─────────┐                                          │
+│  └─ submissions/*.json ──────────┼──→ build_sec_fundamentals.py             │
+│                                  │                                          │
+│  Polygon REST API                │                                          │
+│  └─ rest_data/income_statements ─┤                                          │
+│  └─ rest_data/balance_sheets ────┤                                          │
+│  └─ rest_data/cash_flow_statements                                          │
+│                                  ↓                                          │
+│                    ┌─────────────────────────────┐                          │
+│                    │  company_fundamentals.parquet│ (all metrics, all cos)  │
+│                    └─────────────────────────────┘                          │
+│                                  │                                          │
+│                    ┌─────────────┴─────────────┐                            │
+│                    ↓                           ↓                            │
+│     ┌──────────────────────────┐  ┌──────────────────────────┐              │
+│     │  EARNINGS TOKENS (events) │  │  SECTOR STATE (context)  │              │
+│     │  Top 50 mega-caps         │  │  All 19K companies       │              │
+│     │  → News Mamba stream      │  │  → Cross-attention state │              │
+│     │  Daily: YYYY-MM-DD.parquet│  │  Daily: sector_daily/    │              │
+│     └──────────────────────────┘  └──────────────────────────┘              │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Earnings Tokens (News Mamba Stream)
+
+**Purpose**: Capture immediate market reaction to individual earnings events.
+
+| Field | Description |
+|-------|-------------|
+| `ticker` | Company ticker |
+| `timestamp` | Filing datetime (Unix seconds) |
+| `embedding` | Normalized fundamentals vector (15-dim) |
+| `revenues`, `net_income`, `eps` | Raw values |
+| `revenues_yoy`, `net_income_yoy` | YoY surprise |
+
+**Model integration**: Fed into news Mamba as tokens alongside Benzinga/GDELT.
+
+### Sector State (Cross-Attention)
+
+**Purpose**: Provide broader context that persists across sequence.
+
+| Feature | Description |
+|---------|-------------|
+| `n_reported` | Companies reported in sector |
+| `total_revenue`, `avg_revenue` | Sector revenue aggregates |
+| `total_net_income`, `pct_profitable` | Earnings aggregates |
+| `avg_gross_margin`, `avg_net_margin` | Margin aggregates |
+
+**Model integration**: Cross-attention conditioning at checkpoint intervals (every 300 steps).
+
+### Raw Data Sources
+
+#### SEC EDGAR (`datasets/MACRO/sec_data/`)
+- **companyfacts/** - 19K JSON files with US-GAAP metrics per company
+- **submissions/** - 951K JSON files with CIK→ticker mapping + filing metadata
+- **Excluded from upload** - raw files not needed after processing
+
+#### Polygon REST API (`datasets/MACRO/rest_data/`)
+- Pre-processed financial statements from Polygon.io:
+  - `income_statements/` - Revenue, net income, EPS, margins
+  - `balance_sheets/` - Assets, liabilities, equity
+  - `cash_flow_statements/` - Operating, investing, financing flows
+  - `ratios/` - P/E, P/B, ROE, ROA
+  - `short_interest/`, `short_volume/` - Short selling data
+  - `dividends/`, `splits/` - Corporate actions
+  - `treasury_yields/`, `inflation/` - Macro indicators
+- **Cleaner format** than SEC EDGAR, easier to parse
+- **Excluded from upload** - use processed parquets instead
+
+---
+
+## Data Normalization
+
+All inputs are normalized to prevent gradient scale imbalances across different data sources.
+
+| Source | Method | Details |
+|--------|--------|---------|
+| **Stock bars** | Per-sequence z-score | `(x - μ) / σ` computed over sequence |
+| **Options** | Per-sequence z-score | Same as stock, with mask for valid data |
+| **VIX features** | Per-sequence z-score | Same as stock, with mask for valid data |
+| **News embeddings** | Pre-normalized | OpenAI embeddings already unit-normalized |
+| **GDELT embeddings** | Pre-normalized | MiniLM embeddings already unit-normalized |
+| **Macro (FiLM)** | Global z-score | Stats from training period only |
+| **Fundamentals** | Global z-score | Stats from training period only |
+| **Econ calendar** | Field-specific scaling | See below |
+| **VIX targets** | Raw points | Intentionally unscaled |
+
+### Macro & Fundamentals Global Z-Score
+
+```python
+# During dataset init (training period only)
+train_mask = data.index <= train_end
+self.macro_mean = train_data.mean(axis=0)
+self.macro_std = train_data.std(axis=0) + 1e-8
+
+# At load time
+macro_normalized = (macro_vec - self.macro_mean) / self.macro_std
+```
+
+This prevents features like Fed funds rate (5.0), credit spread (0.04), and STLFSI (-1.5) from having wildly different gradient contributions.
+
+### Econ Calendar Field Scaling
+
+| Field | Raw Range | Scaling | Output Range |
+|-------|-----------|---------|--------------|
+| `impact_ord` | 0-3 | `/3.0` | [0, 1] |
+| `days_until` | ~-40 to +15 | `/15.0` | [~-3, 1] |
+| `time_of_day` | 0-24 | `/24.0` | [0, 1] |
+| `actual_z`, `forecast_z`, `previous_z` | z-scored | none | [~-3, 3] |
+| Binary flags | 0-1 | none | [0, 1] |
 
 ---
 
 ## Planned Extensions
 
 ### Implemented 
-- **Options flow data** - Market-wide option flow from 2-minute bars (47 features)
+- **Options flow data** - Market-wide option flow from 2-minute bars (48 features)
 - **News embeddings** - Benzinga article embeddings (OpenAI 3072-dim)
-- **Parallel Mamba streams** - Stock/news/options with periodic fusion checkpoints
+- **Parallel Mamba streams** - Stock/news/options/VIX with periodic fusion checkpoints
 - **GDELT integration** - Merged into the news stream with token-type embeddings
-- **Macro FiLM conditioning** - Time-aware FiLM modulation from Fed/treasury/FOMC data
-  - 15 macro features (fed funds, yields, CPI, unemployment, FOMC calendar)
-  - Per-position gamma/beta via sinusoidal time-of-day encoding
-  - Identity init (gamma=1, beta=0), 10x LR for FiLM params
-  - Gamma/beta logging to verify macro signal is being used
+- **Enhanced Macro FiLM conditioning** - 58 features from FED/FRED data + 4 derived
+- **VIX Mamba stream** - Dedicated stream for VIX features (21 dims) including extended hours
+- **Cross-asset data pipeline** - Gold, bonds, credit spreads from FRED API
+- **Derived stock features** - liquidity_stress, ofi_acceleration, abs_ofi, intraday_vol_skew, ticker_dispersion
+- **Derived option features** - skew_change
+- **Global z-score normalization** - Macro and fundamentals normalized using training period stats
 
-Train 3 independent Mamba models, each specialized for a different prediction horizon:
-
-| Model | Sequence Length | Target | Status |
-|-------|-----------------|--------|--------|
-| **Mamba-1** | 1,000 (2-min bars) | VIX +1d | Training |
-| **Mamba-2** | 2,000+ (2-min bars) | VIX +7d | Planned |
-| **Mamba-3** | 4,000+ (2-min bars) | VIX +30d | Planned |
-
-**Pros:** Each model optimized for its horizon, simpler training
-**Cons:** 3x compute, no shared representations
-
-### Option B: Multi-Target Single Model
-
-One Mamba model with longer sequence, predicting all horizons simultaneously:
-
-```
-Input: 1,000+ 2-minute bars (~5 trading days)
-
-Model: MambaMultiHorizon
-       ├─ Shared Mamba backbone (6-8 layers, d_model=512)
-       └─ Multi-head output:
-           ├─ VIX +1d head
-           ├─ VIX +7d head
-           └─ VIX +30d head
-
-Loss: weighted sum of all horizon losses
-```
-
-**Pros:** Shared representations, single model, potentially better generalization
-**Cons:** Harder to train, may need curriculum learning
+### Planned
+- Index bars (SPX, NDX, RUT)
+- Longer sequences (2-min multi-week windows)
+- Multi-resolution inputs
+- Ensemble of horizons
 
 ---
 
@@ -233,6 +471,7 @@ d_model: int = 256
 n_layers: int = 4
 d_state: int = 64
 news_n_layers: int = 2
+vix_n_layers: int = 2
 use_news: bool = True
 use_options: bool = True
 use_macro: bool = True
@@ -280,20 +519,21 @@ These results were produced on an earlier configuration and should be treated as
 
 ## Future Enhancements
 
-### Implemented 
-- **Options flow data** - Market-wide option flow from 2-minute bars (47 features)
-- **News embeddings** - Benzinga article embeddings (OpenAI 3072-dim)
-- **Parallel Mamba streams** - Stock/news/options with periodic fusion checkpoints
-- **GDELT integration** - Merged into the news stream with token-type embeddings
-- **Macro FiLM conditioning** - Time-aware FiLM modulation from Fed/treasury/FOMC data
-  - 15 macro features (fed funds, yields, CPI, unemployment, FOMC calendar)
-  - Per-position gamma/beta via sinusoidal time-of-day encoding
-  - Identity init (gamma=1, beta=0), 10x LR for FiLM params
-  - Gamma/beta logging to verify macro signal is being used
-
 ### Planned
 - Index bars (SPX, NDX, RUT)
-- GDELT geopolitical events
 - Longer sequences (2-min multi-week windows)
 - Multi-resolution inputs
 - Ensemble of horizons
+
+---
+
+## Build Tools
+
+| Tool | Purpose |
+|------|---------|
+| `tools/build_enhanced_macro.py` | Merge FED data into enhanced macro parquet (54 features) |
+| `tools/download_cross_asset.py` | Download cross-asset data from FRED API |
+| `tools/build_intraday_rv.py` | Add rolling RV features to stock bars |
+| `tools/build_vix_features.py` | Build VIX feature parquets from raw CSVs |
+| `tools/aggregate_2min.py` | Aggregate 1-second bars to 2-minute bars |
+| `tools/build_fundamentals_state.py` | Build fundamentals cross-attention state |

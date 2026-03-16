@@ -30,11 +30,13 @@ R2_BUCKET = "europe"
 RCLONE_REMOTE = "r2mamba"
 
 # R2 paths
+DATASETS_ROOT = 'datasets'
 PATHS = {
-    'stock': 'datasets/Stock_Data_1s',
-    'vix': 'datasets/VIX',
-    'options': 'datasets/opt_trade_1sec',
-    'news': 'datasets/benzinga_embeddings',
+    'stock': f'{DATASETS_ROOT}/Stock_Data_2min',
+    'vix': f'{DATASETS_ROOT}/VIX',
+    'options': f'{DATASETS_ROOT}/opt_trade_2min',
+    'news': f'{DATASETS_ROOT}/benzinga_embeddings/news_daily',
+    'full': DATASETS_ROOT,
 }
 
 
@@ -60,7 +62,7 @@ def setup_rclone_remote():
     # Create rclone config via environment variables approach
     config_content = f"""[{RCLONE_REMOTE}]
 type = s3
-provider = Cloudflare
+provider = Other
 access_key_id = {R2_ACCESS_KEY}
 secret_access_key = {R2_SECRET_KEY}
 endpoint = {R2_ENDPOINT}
@@ -91,14 +93,14 @@ def build_include_filters(year: Optional[int] = None,
     filters = []
     
     if data_type == 'news':
-        # News files: YYYY_embedded.parquet
+        # Daily news files: YYYY-MM-DD.parquet
         if year:
-            filters.extend(['--include', f'{year}_embedded.parquet'])
+            filters.extend(['--include', f'{year}-*.parquet'])
         elif start_year and end_year:
             for y in range(start_year, end_year + 1):
-                filters.extend(['--include', f'{y}_embedded.parquet'])
+                filters.extend(['--include', f'{y}-*.parquet'])
         else:
-            filters.extend(['--include', '*_embedded.parquet'])
+            filters.extend(['--include', '*.parquet'])
     elif data_type in ['stock', 'options']:
         # Date-based files: YYYY-MM-DD.parquet
         if year:
@@ -197,7 +199,7 @@ def download_data_type(data_type: str,
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Fast parallel download of datasets from R2 using rclone',
+        description='Fast parallel download of datasets or the full datasets tree from R2 using rclone',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -212,6 +214,9 @@ Examples:
   
   # Download all news embeddings
   python download_data_fast.py --data-type news
+
+  # Mirror the full datasets tree into ./datasets
+  python download_data_fast.py --data-type full
   
   # Dry run (see what would be downloaded)
   python download_data_fast.py --year 2024 --data-type all --dry-run
@@ -233,17 +238,17 @@ Performance Tips:
                         help='Start year for range download')
     parser.add_argument('--end-year', type=int, 
                         help='End year for range download')
-    parser.add_argument('--data-type', choices=['stock', 'vix', 'options', 'news', 'all'], 
+    parser.add_argument('--data-type', choices=['stock', 'vix', 'options', 'news', 'all', 'full'], 
                         default='all', help='Type of data to download (default: all)')
     
     # Directory options
-    parser.add_argument('--stock-dir', type=Path, default=Path('datasets/Stock_Data_1s'),
+    parser.add_argument('--stock-dir', type=Path, default=Path('datasets/Stock_Data_2min'),
                         help='Local directory for stock data')
     parser.add_argument('--vix-dir', type=Path, default=Path('datasets/VIX'),
                         help='Local directory for VIX data')
-    parser.add_argument('--options-dir', type=Path, default=Path('datasets/opt_trade_1sec'),
+    parser.add_argument('--options-dir', type=Path, default=Path('datasets/opt_trade_2min'),
                         help='Local directory for options data')
-    parser.add_argument('--news-dir', type=Path, default=Path('datasets/benzinga_embeddings'),
+    parser.add_argument('--news-dir', type=Path, default=Path('datasets/benzinga_embeddings/news_daily'),
                         help='Local directory for news data')
     
     # Performance options
@@ -287,6 +292,7 @@ Performance Tips:
         'vix': args.vix_dir,
         'options': args.options_dir,
         'news': args.news_dir,
+        'full': Path('datasets'),
     }
     
     # Determine which data types to download

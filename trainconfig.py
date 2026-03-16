@@ -28,6 +28,12 @@ class TrainConfig:
     use_options: bool = True        # Enable options stream by default
     use_macro: bool = True          # Enable macro FiLM conditioning
     use_gdelt: bool = True          # Enable GDELT world state integration (default on)
+    use_econ: bool = True           # Enable economic calendar integration (default on)
+    use_fundamentals: bool = True   # Enable fundamentals cross-attention (sector state)
+    use_vix_features: bool = True   # Enable VIX Mamba stream (extended hours, ~540 bars/day)
+    vix_n_layers: int = 2           # Lightweight VIX Mamba (2 layers vs 4 for stock)
+    vix_d_model: int = 64           # Smaller d_model for VIX (21 features vs stock's 45)
+    vix_d_state: int = 16           # Smaller state for VIX
     
     # Data source
     force_synthetic: bool = False   # Force synthetic data

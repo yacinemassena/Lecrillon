@@ -29,10 +29,12 @@ BUCKET_NAME = "europe"
 # Dataset paths (relative to project root)
 LOCAL_OPTIONS_DIR = "datasets/opt_trade_1sec"
 LOCAL_NEWS_DIR = "datasets/benzinga_embeddings/news"
+LOCAL_VIX_DIR = "datasets/VIX/Vix_features"
 
 # R2 prefixes (matching data loader expectations)
 R2_OPTIONS_PREFIX = "datasets/opt_trade_1sec/"
 R2_NEWS_PREFIX = "datasets/benzinga_embeddings/"
+R2_VIX_PREFIX = "datasets/VIX/Vix_features/"
 
 
 def get_s3_client():
@@ -168,6 +170,61 @@ def upload_news_data(s3_client, project_dir: Path, year: Optional[int] = None,
     return total_uploaded
 
 
+def upload_vix_data(s3_client, project_dir: Path, year: Optional[int] = None,
+                    start_year: Optional[int] = None, end_year: Optional[int] = None):
+    """Upload VIX feature parquet files."""
+    print("🔄 Uploading VIX feature data to R2...")
+
+    vix_dir = project_dir / LOCAL_VIX_DIR
+    if not vix_dir.exists():
+        print(f"❌ VIX features directory not found: {vix_dir}")
+        return 0
+
+    parquet_files = sorted(vix_dir.glob('*.parquet'))
+    print(f"  📁 Found {len(parquet_files)} VIX feature files")
+
+    total_uploaded = 0
+    total_skipped = 0
+
+    for file_path in parquet_files:
+        filename = file_path.name
+
+        if year or (start_year and end_year):
+            try:
+                file_year = int(filename.split('-')[0])
+                if year and file_year != year:
+                    continue
+                if start_year and end_year:
+                    if file_year < start_year or file_year > end_year:
+                        continue
+            except (ValueError, IndexError):
+                continue
+
+        s3_key = f"{R2_VIX_PREFIX}{filename}"
+
+        try:
+            head = s3_client.head_object(Bucket=BUCKET_NAME, Key=s3_key)
+            remote_size = head['ContentLength']
+            local_size = file_path.stat().st_size
+            if remote_size == local_size:
+                total_skipped += 1
+                continue
+        except ClientError:
+            pass
+
+        size_mb = file_path.stat().st_size / 1e6
+        print(f"    [{total_uploaded+1}] {filename} ({size_mb:.1f} MB)")
+
+        try:
+            s3_client.upload_file(str(file_path), BUCKET_NAME, s3_key)
+            total_uploaded += 1
+        except ClientError as e:
+            print(f"    ❌ Failed: {e}")
+
+    print(f"✅ VIX feature data: {total_uploaded} uploaded, {total_skipped} skipped (already exist)")
+    return total_uploaded
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='Upload datasets to Cloudflare R2',
@@ -179,6 +236,9 @@ Examples:
   
   # Upload only 2024 options data
   python tools/upload_datasets.py --data-type options --year 2024
+
+  # Upload only 2025 VIX features
+  python tools/upload_datasets.py --data-type vix --year 2025
   
   # Upload news embeddings for 2023-2024
   python tools/upload_datasets.py --data-type news --start-year 2023 --end-year 2024
@@ -188,7 +248,7 @@ Examples:
         """
     )
     
-    parser.add_argument('--data-type', choices=['options', 'news', 'both'], default='both',
+    parser.add_argument('--data-type', choices=['options', 'news', 'vix', 'both'], default='both',
                        help='Type of data to upload (default: both)')
     parser.add_argument('--year', type=int, help='Specific year to upload')
     parser.add_argument('--start-year', type=int, help='Start year for range upload')
@@ -218,6 +278,10 @@ Examples:
     
     if args.data_type in ['news', 'both']:
         upload_news_data(s3, project_dir, args.year, args.start_year, args.end_year)
+        print()
+
+    if args.data_type in ['vix', 'both']:
+        upload_vix_data(s3, project_dir, args.year, args.start_year, args.end_year)
         print()
     
     print("🎉 All uploads complete!")

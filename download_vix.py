@@ -17,7 +17,7 @@ R2_ENDPOINT = 'https://2a139e9393f803634546ad9d541d37b9.r2.cloudflarestorage.com
 R2_ACCESS_KEY = 'fdfa18bf64b18c61bbee64fda98ca20b'
 R2_SECRET_KEY = '394c88a7aaf0027feabe74ae20da9b2f743ab861336518a09972bc39534596d8'
 R2_BUCKET = 'europe'
-VIX_PREFIX = 'VIX/'
+VIX_PREFIX = 'datasets/VIX/'
 
 
 def download_vix_data(s3_client, local_dir: Path = Path('datasets/VIX')):

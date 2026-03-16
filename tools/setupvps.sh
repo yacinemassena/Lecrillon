@@ -380,9 +380,11 @@ echo ""
 echo "🧪 To download data:"
 if [ -d "/workspace" ]; then
     echo "  cd /workspace"
-    echo "  python $PROJECT_DIR/download_data.py --year 2024 --data-type both --stock-dir /workspace/datasets/Stock_Data_1s --vix-dir /workspace/datasets/VIX"
+    echo "  python $PROJECT_DIR/download_data.py --year 2024 --data-type all --stock-dir /workspace/datasets/Stock_Data_2min --vix-dir /workspace/datasets/VIX --options-dir /workspace/datasets/opt_trade_2min --news-dir /workspace/datasets/benzinga_embeddings/news_daily"
+    echo "  python $PROJECT_DIR/download_data_fast.py --year 2024 --data-type full"
 else
-    echo "  python download_data.py --year 2024 --data-type both"
+    echo "  python download_data.py --year 2024 --data-type all"
+    echo "  python download_data_fast.py --year 2024 --data-type full"
 fi
 echo ""
 echo "🏃 To run smoke test:"

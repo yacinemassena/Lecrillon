@@ -3,8 +3,8 @@ Parallel Mamba VIX Prediction Model.
 
 Architecture with parallel streams and periodic fusion:
 
-    Stock Bars [B, T, 29]  → StreamEncoder → StreamMamba → [B, T, d_model]
-    Option Bars [B, T, 38] → StreamEncoder → StreamMamba → [B, T, d_model]  (optional)
+    Stock Bars [B, T, F]   → StreamEncoder → StreamMamba → [B, T, d_model]  (F = num_features, auto-detected)
+    Option Bars [B, T, 47] → StreamEncoder → StreamMamba → [B, T, d_model]  (optional)
     News Embs [B, N, 3072] → StreamEncoder → StreamMamba → [B, N, d_model]  (optional)
                                     ↓
                            FusionGate (cross-attention + gating every checkpoint_interval)
@@ -19,34 +19,10 @@ from typing import Optional, Dict, Tuple, List
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from loader.bar_mamba_dataset import NUM_OPTION_FEATURES
 
 logger = logging.getLogger(__name__)
 
-
-# ---------------------------------------------------------------------------
-# Option features (all 49 features from opt_trade_2min)
-# ---------------------------------------------------------------------------
-OPTION_FEATURES = [
-    'call_volume', 'put_volume', 'call_trade_count', 'put_trade_count',
-    'put_call_ratio_volume', 'put_call_ratio_count',
-    'call_premium_total', 'put_premium_total',
-    'near_volume', 'mid_volume', 'far_volume',
-    'near_pc_ratio', 'far_pc_ratio', 'term_skew',
-    'otm_put_volume', 'atm_volume', 'otm_call_volume',
-    'skew_proxy', 'atm_concentration', 'deep_otm_put_volume',
-    'total_large_trade_count', 'call_large_count', 'put_large_count',
-    'net_large_flow', 'large_premium_total', 'sweep_intensity',
-    'max_volume_surprise', 'avg_volume_surprise',
-    'uoa_call_count', 'uoa_put_count',
-    'total_volume', 'total_trade_count',
-    'unique_contracts', 'unique_strikes', 'unique_expiries',
-    'pc_ratio_vs_20d', 'call_volume_vs_20d', 'put_volume_vs_20d',
-    # New 2-min features
-    'net_premium_flow', 'premium_imbalance', 'large_trade_pct', 'put_large_pct',
-    'uoa_total', 'uoa_put_bias', 'deep_otm_put_pct',
-    'near_far_ratio', 'sweep_to_trade_ratio',
-]
-NUM_OPTION_FEATURES = len(OPTION_FEATURES)  # 47 (49 cols - underlying - bar_timestamp)
 
 # ---------------------------------------------------------------------------
 # Mamba import
@@ -445,14 +421,18 @@ class FusionGate(nn.Module):
         stock_state: torch.Tensor,
         news_state: Optional[torch.Tensor] = None,
         options_state: Optional[torch.Tensor] = None,
+        fundamentals_state: Optional[torch.Tensor] = None,
+        vix_state: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
-        Fuse stock state with news and options states via cross-attention + gating.
+        Fuse stock state with news, options, fundamentals, and VIX states via cross-attention + gating.
         
         Args:
             stock_state: [B, d_model] - stock Mamba final state
             news_state: [B, d_model] - news Mamba final state (optional)
             options_state: [B, d_model] - options Mamba final state (optional)
+            fundamentals_state: [B, d_model] - fundamentals projected state (optional)
+            vix_state: [B, d_model] - VIX Mamba final state (optional, extended hours)
         
         Returns:
             [B, d_model] - gated fusion of all states
@@ -465,6 +445,10 @@ class FusionGate(nn.Module):
             aux_states.append(news_state)
         if options_state is not None:
             aux_states.append(options_state)
+        if fundamentals_state is not None:
+            aux_states.append(fundamentals_state)
+        if vix_state is not None:
+            aux_states.append(vix_state)
         
         if not aux_states:
             return stock_state
@@ -501,6 +485,65 @@ class FusionGate(nn.Module):
         return fused
 
 
+# ---------------------------------------------------------------------------
+# Economic Calendar Encoder
+# ---------------------------------------------------------------------------
+class EconEncoder(nn.Module):
+    """Encode economic calendar events into d_model representations.
+    
+    Each event token = event_embedding(32) + currency_embedding(8) + numeric(13) = 53 dims
+    → MLP → d_model
+    """
+    
+    def __init__(
+        self,
+        d_model: int = 256,
+        num_event_types: int = 413,  # 412 + 1 for padding idx 0
+        num_currencies: int = 5,     # 4 + 1 for padding idx 0
+        event_embed_dim: int = 32,
+        currency_embed_dim: int = 8,
+        num_numeric_features: int = 13,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.event_embedding = nn.Embedding(num_event_types, event_embed_dim, padding_idx=0)
+        self.currency_embedding = nn.Embedding(num_currencies, currency_embed_dim, padding_idx=0)
+        
+        input_dim = event_embed_dim + currency_embed_dim + num_numeric_features  # 53
+        self.mlp = nn.Sequential(
+            nn.Linear(input_dim, d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.LayerNorm(d_model),
+        )
+        
+        # Initialize embeddings small so they don't dominate at start
+        nn.init.normal_(self.event_embedding.weight, mean=0.0, std=0.02)
+        nn.init.normal_(self.currency_embedding.weight, mean=0.0, std=0.02)
+        # Keep padding as zero
+        with torch.no_grad():
+            self.event_embedding.weight[0].zero_()
+            self.currency_embedding.weight[0].zero_()
+        
+        logger.info(f"EconEncoder: {num_event_types-1} event types, {num_currencies-1} currencies, "
+                    f"{input_dim} → {d_model}")
+    
+    def forward(
+        self,
+        event_ids: torch.Tensor,      # [B, N] int
+        currency_ids: torch.Tensor,    # [B, N] int
+        numeric_features: torch.Tensor, # [B, N, 13] float
+    ) -> torch.Tensor:
+        """Encode econ events → [B, N, d_model]."""
+        event_emb = self.event_embedding(event_ids)      # [B, N, 32]
+        currency_emb = self.currency_embedding(currency_ids)  # [B, N, 8]
+        combined = torch.cat([event_emb, currency_emb, numeric_features], dim=-1)  # [B, N, 53]
+        return self.mlp(combined)  # [B, N, d_model]
+
+
+ECON_NUM_FEATURES = 13  # Numeric features per econ token
+
+
 class ParallelMambaVIX(nn.Module):
     """
     Parallel Mamba streams with periodic fusion checkpoints.
@@ -517,7 +560,7 @@ class ParallelMambaVIX(nn.Module):
     
     def __init__(
         self,
-        num_features: int = 45,  # Stock features from Stock_Data_2min (47 - ticker - bar_timestamp)
+        num_features: int,  # Stock features - auto-detected from dataset
         d_model: int = 256,
         n_layers: int = 4,
         d_state: int = 64,
@@ -536,6 +579,16 @@ class ParallelMambaVIX(nn.Module):
         macro_dim: int = 21,  # FED/FRED macro features from datasets/macro/macro_daily.parquet
         use_gdelt: bool = False,
         gdelt_dim: int = 391,  # 384 MiniLM embedding + 7 stats
+        use_econ: bool = False,
+        econ_num_event_types: int = 413,
+        econ_num_currencies: int = 5,
+        use_fundamentals: bool = False,
+        fundamentals_dim: int = 130,
+        use_vix_features: bool = False,
+        vix_features_dim: int = 21,  # 21 VIX features (OHLC, VVIX, MAs, RV, technicals)
+        vix_n_layers: int = 2,  # Lightweight VIX Mamba
+        vix_d_model: int = 64,  # Smaller d_model for VIX (21 features vs stock's 45)
+        vix_d_state: int = 16,  # Smaller state for VIX
     ):
         super().__init__()
         self.d_model = d_model
@@ -545,7 +598,32 @@ class ParallelMambaVIX(nn.Module):
         self.use_options = use_options
         self.use_macro = use_macro
         self.use_gdelt = use_gdelt
+        self.use_econ = use_econ
+        self.use_fundamentals = use_fundamentals
+        self.use_vix_features = use_vix_features
+        self.vix_d_model = vix_d_model
         self.gdelt_dim = gdelt_dim
+        
+        # Fundamentals projection (cross-attention state)
+        if use_fundamentals:
+            self.fundamentals_proj = nn.Linear(fundamentals_dim, d_model)
+        
+        # VIX stream (optional) - extended hours, lightweight
+        # ~540 bars/day (18h) vs stock's 195 bars (6.5h market hours)
+        # Uses smaller d_model/d_state since only 21 features
+        if use_vix_features:
+            self.vix_encoder = StreamEncoder(vix_features_dim, vix_d_model, dropout)
+            self.vix_mamba = StreamMamba(
+                n_layers=vix_n_layers,
+                d_model=vix_d_model,
+                d_state=vix_d_state,
+                d_conv=d_conv,
+                expand=expand,
+                dropout=dropout,
+            )
+            # Project VIX output to main d_model for fusion
+            self.vix_proj = nn.Linear(vix_d_model, d_model)
+            logger.info(f"VIX Mamba: {vix_n_layers} layers, d={vix_d_model}, state={vix_d_state} (extended hours)")
         
         # Stock stream (always active)
         self.stock_encoder = StreamEncoder(num_features, d_model, dropout)
@@ -559,9 +637,9 @@ class ParallelMambaVIX(nn.Module):
         )
         
         # News stream (optional) - fewer layers for sparse sequences
-        if use_news or use_gdelt:
-            # Token type embedding: 0=GDELT (world state), 1=Benzinga (article event)
-            self.news_type_embedding = nn.Embedding(2, d_model)
+        if use_news or use_gdelt or use_econ:
+            # Token type embedding: 0=GDELT, 1=Benzinga, 2=Econ calendar
+            self.news_type_embedding = nn.Embedding(3, d_model)
             # Initialize small so it doesn't dominate at start
             nn.init.normal_(self.news_type_embedding.weight, mean=0.0, std=0.02)
             
@@ -594,6 +672,16 @@ class ParallelMambaVIX(nn.Module):
                 nn.LayerNorm(d_model),
             )
             logger.info(f"GDELT stream enabled: {gdelt_dim} → {d_model} (into news Mamba)")
+        
+        # Econ calendar encoder (optional) - feeds into news Mamba
+        if use_econ:
+            self.econ_encoder = EconEncoder(
+                d_model=d_model,
+                num_event_types=econ_num_event_types,
+                num_currencies=econ_num_currencies,
+                dropout=dropout,
+            )
+            logger.info(f"Econ calendar enabled: {econ_num_event_types-1} events → {d_model} (into news Mamba)")
         
         # Options stream (optional) - same architecture as stock
         if use_options:
@@ -635,9 +723,10 @@ class ParallelMambaVIX(nn.Module):
         self.pool = SequencePooling(d_model, 'attention')
         
         num_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
-        # Note: GDELT feeds into news Mamba, not a separate stream
-        streams = ['stock'] + (['news+gdelt'] if (use_news or use_gdelt) else []) + (['options'] if use_options else [])
-        conditioning = ['macro_film'] if use_macro else []
+        # Note: GDELT and Econ feed into news Mamba, not separate streams
+        news_parts = [x for x in ['news' if use_news else None, 'gdelt' if use_gdelt else None, 'econ' if use_econ else None] if x]
+        streams = ['stock'] + (['+'.join(news_parts)] if news_parts else []) + (['options'] if use_options else []) + (['vix_ext'] if use_vix_features else [])
+        conditioning = (['macro_film'] if use_macro else []) + (['fundamentals'] if use_fundamentals else [])
         logger.info(f"ParallelMambaVIX: {num_params:,} parameters "
                     f"(d_model={d_model}, n_layers={n_layers}, checkpoint={checkpoint_interval}, "
                     f"streams={streams}, conditioning={conditioning})")
@@ -725,6 +814,15 @@ class ParallelMambaVIX(nn.Module):
         gdelt_timestamps: Optional[torch.Tensor] = None,
         macro_context: Optional[torch.Tensor] = None,
         bar_timestamps: Optional[torch.Tensor] = None,
+        econ_event_ids: Optional[torch.Tensor] = None,
+        econ_currency_ids: Optional[torch.Tensor] = None,
+        econ_numeric: Optional[torch.Tensor] = None,
+        econ_mask: Optional[torch.Tensor] = None,
+        econ_timestamps: Optional[torch.Tensor] = None,
+        fundamentals_context: Optional[torch.Tensor] = None,
+        vix_features: Optional[torch.Tensor] = None,
+        vix_mask: Optional[torch.Tensor] = None,
+        vix_timestamps: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Dict[str, torch.Tensor]:
         """
@@ -738,12 +836,21 @@ class ParallelMambaVIX(nn.Module):
             news_embs: [B, N1, news_dim] - Benzinga news embeddings
             news_mask: [B, N1] - Benzinga news validity mask
             news_indices: [B, N1] - bar index for each news article
-            news_timestamps: [B, N1] - Unix timestamps for news articles
+            news_timestamps: [B, N1] - Unix timestamps for news articles (ns)
             gdelt_embs: [B, N2, gdelt_dim] - GDELT world state embeddings (391-dim)
             gdelt_mask: [B, N2] - GDELT validity mask
-            gdelt_timestamps: [B, N2] - Unix timestamps for GDELT buckets
+            gdelt_timestamps: [B, N2] - Unix timestamps for GDELT buckets (ns)
             macro_context: [B, macro_dim] - macro conditioning features (T-1)
-            bar_timestamps: [B, T] - Unix second timestamps for FiLM time encoding
+            bar_timestamps: [B, T] - Unix timestamps for bars (ns for alignment)
+            econ_event_ids: [B, N3] - econ calendar event type IDs
+            econ_currency_ids: [B, N3] - econ calendar currency IDs
+            econ_numeric: [B, N3, 13] - econ calendar numeric features
+            econ_mask: [B, N3] - econ calendar validity mask
+            econ_timestamps: [B, N3] - Unix timestamps for econ events (ns)
+            fundamentals_context: [B, fundamentals_dim] - sector fundamentals state
+            vix_features: [B, V, vix_dim] - VIX features (extended hours, ~540 bars/day)
+            vix_mask: [B, V] - VIX validity mask
+            vix_timestamps: [B, V] - Unix timestamps for VIX bars (ns)
         
         Returns:
             dict with:
@@ -787,20 +894,48 @@ class ParallelMambaVIX(nn.Module):
             gdelt_encoded = gdelt_encoded + type_emb
             gdelt_ts = gdelt_timestamps  # [B, N2]
         
-        # Merge Benzinga and GDELT into combined news sequence, sorted by timestamp
+        # Encode econ calendar if present
+        econ_encoded = None
+        econ_ts = None
+        if self.use_econ and econ_event_ids is not None and econ_event_ids.shape[1] > 0:
+            econ_encoded = self.econ_encoder(econ_event_ids, econ_currency_ids, econ_numeric)  # [B, N3, d_model]
+            # Add econ type embedding (type=2)
+            type_emb = self.news_type_embedding(torch.full(econ_encoded.shape[:2], 2, dtype=torch.long, device=device))
+            econ_encoded = econ_encoded + type_emb
+            econ_ts = econ_timestamps  # [B, N3]
+        
+        # Merge Benzinga, GDELT, and Econ into combined news sequence, sorted by timestamp
         news_encoded = None
         combined_news_ts = None
         combined_news_mask = None
+        
+        # First merge Benzinga + GDELT
+        merged_encoded = None
+        merged_ts = None
+        merged_mask = None
         if benzinga_encoded is not None or gdelt_encoded is not None:
-            news_encoded, combined_news_ts, combined_news_mask = self._merge_news_sources(
+            merged_encoded, merged_ts, merged_mask = self._merge_news_sources(
                 benzinga_encoded, benzinga_ts, news_mask if self.use_news else None,
                 gdelt_encoded, gdelt_ts, gdelt_mask if self.use_gdelt else None,
+                device,
+            )
+        
+        # Then merge (Benzinga+GDELT) + Econ
+        if merged_encoded is not None or econ_encoded is not None:
+            news_encoded, combined_news_ts, combined_news_mask = self._merge_news_sources(
+                merged_encoded, merged_ts, merged_mask,
+                econ_encoded, econ_ts, econ_mask if self.use_econ else None,
                 device,
             )
         
         options_encoded = None
         if self.use_options and options is not None:
             options_encoded = self.options_encoder(options)  # [B, T, d_model]
+        
+        # Encode VIX features if present (extended hours sequence)
+        vix_encoded = None
+        if self.use_vix_features and vix_features is not None and vix_features.shape[1] > 0:
+            vix_encoded = self.vix_encoder(vix_features)  # [B, V, d_model]
         
         # Process in checkpoint segments
         num_checkpoints = (T + self.checkpoint_interval - 1) // self.checkpoint_interval
@@ -809,6 +944,7 @@ class ParallelMambaVIX(nn.Module):
         stock_outputs = []
         news_outputs = []
         options_outputs = []
+        vix_outputs = []
         
         # Running state for stock (carries fused context forward)
         stock_running_state = None
@@ -886,11 +1022,53 @@ class ParallelMambaVIX(nn.Module):
                 options_outputs.append(options_out)
                 options_state = self.options_mamba.get_final_state(options_out)
             
+            # --- VIX segment (extended hours, timestamp-filtered) ---
+            vix_state = None
+            if vix_encoded is not None and vix_timestamps is not None and bar_timestamps is not None:
+                # Find VIX bars in this checkpoint window by timestamp
+                segment_bar_ts = bar_timestamps[:, start_idx:end_idx]  # [B, segment_len]
+                segment_start_ts = segment_bar_ts[:, 0:1]  # [B, 1]
+                segment_end_ts = segment_bar_ts[:, -1:]    # [B, 1]
+                
+                # For first checkpoint: include ALL pre-market VIX (overnight accumulation)
+                if cp == 0:
+                    # Use earliest bar timestamp as end bound, include everything before
+                    vix_in_window = vix_timestamps <= segment_end_ts
+                else:
+                    # VIX is in window if timestamp falls within segment bar timestamps
+                    vix_in_window = (vix_timestamps >= segment_start_ts) & (vix_timestamps <= segment_end_ts)
+                
+                if vix_mask is not None:
+                    vix_in_window = vix_in_window & (vix_mask > 0)
+                
+                # Process VIX for each batch item
+                vix_states_batch = []
+                for b in range(B):
+                    valid_vix = vix_in_window[b]
+                    if valid_vix.sum() > 0:
+                        vix_segment = vix_encoded[b, valid_vix, :].unsqueeze(0)  # [1, n, vix_d_model]
+                        vix_out = self.vix_mamba(vix_segment)
+                        vix_final = self.vix_mamba.get_final_state(vix_out).squeeze(0)  # [vix_d_model]
+                        vix_states_batch.append(self.vix_proj(vix_final))  # Project to d_model
+                    else:
+                        # No VIX in this window - use zero state
+                        vix_states_batch.append(torch.zeros(self.d_model, device=device))
+                
+                vix_state = torch.stack(vix_states_batch, dim=0)  # [B, d_model]
+                vix_outputs.append(vix_state)
+            
             # --- Fusion at checkpoint ---
+            # Project fundamentals if enabled (same for all checkpoints)
+            fund_state = None
+            if self.use_fundamentals and fundamentals_context is not None:
+                fund_state = self.fundamentals_proj(fundamentals_context)  # [B, d_model]
+            
             stock_running_state = self.fusion_gate(
                 stock_state,
                 news_state=news_state,
                 options_state=options_state,
+                fundamentals_state=fund_state,
+                vix_state=vix_state,
             )
         
         # --- Final predictions ---
@@ -912,17 +1090,34 @@ class ParallelMambaVIX(nn.Module):
                 results['news_pred'] = self.news_aux_head(news_pooled)
         
         # Options auxiliary prediction (if enabled)
+        options_pooled = None
         if self.use_options and options_outputs:
             options_all = torch.cat(options_outputs, dim=1)  # [B, T, d_model]
             options_pooled = self.pool(options_all)
             results['options_pred'] = self.options_aux_head(options_pooled)
         
+        # VIX pooled state (if enabled)
+        vix_pooled = None
+        if self.use_vix_features and vix_outputs:
+            vix_all = torch.stack(vix_outputs, dim=1)  # [B, num_checkpoints, d_model]
+            vix_pooled = vix_all.mean(dim=1)  # Mean over checkpoints
+        
         # Final fused prediction
         # Fuse final states from all streams
         final_news_state = news_pooled if ((self.use_news or self.use_gdelt) and news_outputs) else None
         final_options_state = options_pooled if (self.use_options and options_outputs) else None
+        final_fund_state = None
+        if self.use_fundamentals and fundamentals_context is not None:
+            final_fund_state = self.fundamentals_proj(fundamentals_context)
+        final_vix_state = vix_pooled if (self.use_vix_features and vix_outputs) else None
         
-        final_fused = self.fusion_gate(stock_pooled, final_news_state, final_options_state)
+        final_fused = self.fusion_gate(
+            stock_pooled, 
+            final_news_state, 
+            final_options_state, 
+            final_fund_state,
+            final_vix_state,
+        )
         results['vix_pred'] = self.final_head(final_fused)
         
         return results

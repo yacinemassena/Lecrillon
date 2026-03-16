@@ -343,7 +343,7 @@ def check_data_overlap(paths: Dict[str, Path]) -> bool:
 class SyntheticBarDataset(Dataset):
     """Generate synthetic bar data for smoke testing when real data unavailable."""
 
-    def __init__(self, num_samples: int = 50, seq_len: int = 2000, num_features: int = 29):
+    def __init__(self, num_samples: int = 50, seq_len: int = 2000, num_features: int = None):
         self.num_samples = num_samples
         self.seq_len = seq_len
         self.num_features = num_features
@@ -496,6 +496,29 @@ def train_steps(model, loader, optimizer, criterion, scaler, device, num_steps,
         if news_timestamps is not None:
             news_timestamps = news_timestamps.to(device, non_blocking=True)
         
+        # Optional econ calendar data
+        econ_event_ids = batch.get('econ_event_ids')
+        econ_currency_ids = batch.get('econ_currency_ids')
+        econ_numeric = batch.get('econ_numeric')
+        econ_mask = batch.get('econ_mask')
+        econ_timestamps = batch.get('econ_timestamps')
+        
+        if econ_event_ids is not None:
+            econ_event_ids = econ_event_ids.to(device, non_blocking=True)
+        if econ_currency_ids is not None:
+            econ_currency_ids = econ_currency_ids.to(device, non_blocking=True)
+        if econ_numeric is not None:
+            econ_numeric = econ_numeric.to(device, non_blocking=True)
+        if econ_mask is not None:
+            econ_mask = econ_mask.to(device, non_blocking=True)
+        if econ_timestamps is not None:
+            econ_timestamps = econ_timestamps.to(device, non_blocking=True)
+        
+        # Optional fundamentals context
+        fundamentals_context = batch.get('fundamentals_context')
+        if fundamentals_context is not None:
+            fundamentals_context = fundamentals_context.to(device, non_blocking=True)
+        
         torch.cuda.synchronize()
         t_gpu = time.time() - t_gpu_start
         
@@ -517,6 +540,12 @@ def train_steps(model, loader, optimizer, criterion, scaler, device, num_steps,
                 gdelt_timestamps=gdelt_timestamps,
                 macro_context=macro_context,
                 bar_timestamps=bar_timestamps,
+                econ_event_ids=econ_event_ids,
+                econ_currency_ids=econ_currency_ids,
+                econ_numeric=econ_numeric,
+                econ_mask=econ_mask,
+                econ_timestamps=econ_timestamps,
+                fundamentals_context=fundamentals_context,
             )
             pred = outputs['vix_pred']  # [B, 4] multi-horizon
             
@@ -687,6 +716,29 @@ def val_steps(model, loader, criterion, device, num_steps, amp_dtype=torch.bfloa
             gdelt_timestamps = gdelt_timestamps.to(device, non_blocking=True)
         if news_timestamps is not None:
             news_timestamps = news_timestamps.to(device, non_blocking=True)
+        
+        # Optional econ calendar data
+        econ_event_ids = batch.get('econ_event_ids')
+        econ_currency_ids = batch.get('econ_currency_ids')
+        econ_numeric = batch.get('econ_numeric')
+        econ_mask = batch.get('econ_mask')
+        econ_timestamps = batch.get('econ_timestamps')
+        
+        if econ_event_ids is not None:
+            econ_event_ids = econ_event_ids.to(device, non_blocking=True)
+        if econ_currency_ids is not None:
+            econ_currency_ids = econ_currency_ids.to(device, non_blocking=True)
+        if econ_numeric is not None:
+            econ_numeric = econ_numeric.to(device, non_blocking=True)
+        if econ_mask is not None:
+            econ_mask = econ_mask.to(device, non_blocking=True)
+        if econ_timestamps is not None:
+            econ_timestamps = econ_timestamps.to(device, non_blocking=True)
+        
+        # Optional fundamentals context
+        fundamentals_context = batch.get('fundamentals_context')
+        if fundamentals_context is not None:
+            fundamentals_context = fundamentals_context.to(device, non_blocking=True)
 
         with torch.autocast(device_type='cuda', dtype=amp_dtype, enabled=True):
             outputs = model(
@@ -702,6 +754,12 @@ def val_steps(model, loader, criterion, device, num_steps, amp_dtype=torch.bfloa
                 gdelt_timestamps=gdelt_timestamps,
                 macro_context=macro_context,
                 bar_timestamps=bar_timestamps,
+                econ_event_ids=econ_event_ids,
+                econ_currency_ids=econ_currency_ids,
+                econ_numeric=econ_numeric,
+                econ_mask=econ_mask,
+                econ_timestamps=econ_timestamps,
+                fundamentals_context=fundamentals_context,
             )
             pred = outputs['vix_pred']  # [B, 4] multi-horizon
             loss = criterion(pred, target, horizon_mask)
@@ -777,6 +835,237 @@ def val_steps(model, loader, criterion, device, num_steps, amp_dtype=torch.bfloa
 
 
 # ---------------------------------------------------------------------------
+# Validation Checks
+# ---------------------------------------------------------------------------
+def run_validation_checks(
+    model: nn.Module,
+    args,
+    device: torch.device,
+    num_features: int,
+    macro_dim: int = 15,
+    gdelt_dim: int = 391,
+    fundamentals_dim: int = 130,
+    phase: str = "pre",
+    train_loss: float = None,
+    is_distributed: bool = False,
+) -> int:
+    """
+    Run validation checks to verify model architecture and feed contributions.
+    
+    Args:
+        model: The model to validate
+        args: Training arguments
+        device: Device to run on
+        num_features: Number of stock features
+        macro_dim: Macro feature dimension
+        gdelt_dim: GDELT feature dimension
+        fundamentals_dim: Fundamentals feature dimension
+        phase: "pre" (before training) or "post" (after training)
+        train_loss: Final training loss (only for post-training)
+        is_distributed: Whether using DDP
+    
+    Returns:
+        Number of checks passed
+    """
+    from mamba_only_model import NUM_OPTION_FEATURES
+    
+    eval_model = model.module if is_distributed else model
+    checks_passed = 0
+    total_checks = 0
+    
+    dashboard.log("\n" + "═" * 50)
+    dashboard.log(f"[bold]{phase.upper()}-TRAINING VALIDATION[/]")
+    dashboard.log("═" * 50)
+    
+    # --- Basic Architecture Checks ---
+    
+    # Check 1: Model has parameters
+    total_checks += 1
+    n_params = sum(p.numel() for p in eval_model.parameters() if p.requires_grad)
+    ok = n_params > 0
+    dashboard.log(f"  [{'[green]✓' if ok else '[red]✗'}] Model has {n_params:,} parameters[/]")
+    checks_passed += ok
+    
+    # Build dummy inputs for all streams
+    eval_model.eval()
+    with torch.no_grad():
+        dummy_bars = torch.randn(1, 100, num_features).to(device)
+        dummy_mask = torch.ones(1, 100, dtype=torch.bool, device=device)
+        dummy_opts = torch.randn(1, 100, NUM_OPTION_FEATURES).to(device) if args.use_options else None
+        dummy_opts_mask = torch.ones(1, 100, dtype=torch.bool, device=device) if args.use_options else None
+        dummy_news = torch.randn(1, 10, 3072).to(device) if args.use_news else None
+        dummy_news_mask = torch.ones(1, 10, dtype=torch.bool, device=device) if args.use_news else None
+        dummy_news_idx = torch.zeros(1, 10, dtype=torch.long, device=device) if args.use_news else None
+        dummy_news_ts = torch.arange(10, device=device).unsqueeze(0) * 1000 if args.use_news else None
+        dummy_gdelt = torch.randn(1, 5, gdelt_dim).to(device) if args.use_gdelt else None
+        dummy_gdelt_mask = torch.ones(1, 5, dtype=torch.bool, device=device) if args.use_gdelt else None
+        dummy_gdelt_ts = torch.arange(5, device=device).unsqueeze(0) * 1000 if args.use_gdelt else None
+        dummy_macro = torch.randn(1, macro_dim).to(device) if args.use_macro else None
+        dummy_bar_ts = torch.arange(100, device=device).unsqueeze(0)
+        dummy_econ_ids = torch.randint(1, 10, (1, 8), device=device) if args.use_econ else None
+        dummy_econ_cur = torch.randint(1, 4, (1, 8), device=device) if args.use_econ else None
+        dummy_econ_num = torch.randn(1, 8, 13, device=device) if args.use_econ else None
+        dummy_econ_mask = torch.ones(1, 8, device=device) if args.use_econ else None
+        dummy_econ_ts = torch.arange(8, device=device).unsqueeze(0) * 1000 if args.use_econ else None
+        dummy_fund = torch.randn(1, fundamentals_dim).to(device) if args.use_fundamentals else None
+        
+        # Check 2: Forward pass produces output
+        total_checks += 1
+        try:
+            out = eval_model(
+                dummy_bars, dummy_mask, dummy_opts, dummy_opts_mask,
+                dummy_news, dummy_news_mask, dummy_news_idx, dummy_news_ts,
+                dummy_gdelt, dummy_gdelt_mask, dummy_gdelt_ts,
+                dummy_macro, dummy_bar_ts,
+                econ_event_ids=dummy_econ_ids,
+                econ_currency_ids=dummy_econ_cur,
+                econ_numeric=dummy_econ_num,
+                econ_mask=dummy_econ_mask,
+                econ_timestamps=dummy_econ_ts,
+                fundamentals_context=dummy_fund,
+            )
+            ok = 'vix_pred' in out and out['vix_pred'].shape == (1, 4)
+            dashboard.log(f"  [{'[green]✓' if ok else '[red]✗'}] Forward pass correct[/]")
+            checks_passed += ok
+        except Exception as e:
+            dashboard.log(f"  [[red]✗[/]] Forward pass failed: {e}")
+    
+    # Check 3: Backward pass works
+    total_checks += 1
+    eval_model.train()
+    try:
+        out = eval_model(
+            dummy_bars, dummy_mask, dummy_opts, dummy_opts_mask,
+            dummy_news, dummy_news_mask, dummy_news_idx, dummy_news_ts,
+            dummy_gdelt, dummy_gdelt_mask, dummy_gdelt_ts,
+            dummy_macro, dummy_bar_ts,
+            econ_event_ids=dummy_econ_ids,
+            econ_currency_ids=dummy_econ_cur,
+            econ_numeric=dummy_econ_num,
+            econ_mask=dummy_econ_mask,
+            econ_timestamps=dummy_econ_ts,
+            fundamentals_context=dummy_fund,
+        )
+        loss = out['vix_pred'].sum()
+        loss.backward()
+        has_grads = any(p.grad is not None and p.grad.abs().sum() > 0
+                        for p in eval_model.parameters())
+        dashboard.log(f"  [{'[green]✓' if has_grads else '[red]✗'}] Gradients flow[/]")
+        checks_passed += has_grads
+        # Clear grads
+        eval_model.zero_grad()
+    except Exception as e:
+        dashboard.log(f"  [[red]✗[/]] Backward pass failed: {e}")
+    
+    # Check 4: No NaN in parameters
+    total_checks += 1
+    has_nan = any(torch.isnan(p).any() for p in eval_model.parameters())
+    ok = not has_nan
+    dashboard.log(f"  [{'[green]✓' if ok else '[red]✗'}] No NaN in params[/]")
+    checks_passed += ok
+    
+    # Post-training only: Check loss is finite
+    if phase == "post" and train_loss is not None:
+        total_checks += 1
+        ok = np.isfinite(train_loss) and train_loss > 0
+        dashboard.log(f"  [{'[green]✓' if ok else '[red]✗'}] Loss finite ({train_loss:.4f})[/]")
+        checks_passed += ok
+    
+    # --- Feed Contribution Checks ---
+    # Note: VIXHead and MultiHorizonVIXHead have final-layer weights init to zero,
+    # so vix_pred = bias only (input-independent) at init. We use a forward hook on
+    # the fusion_gate to compare representations BEFORE the zero-weight head.
+    eval_model.eval()
+    with torch.no_grad():
+        # Hook to capture fusion gate output
+        base_model = eval_model.module if hasattr(eval_model, 'module') else eval_model
+        captured = {}
+        def _capture_hook(name):
+            def hook(module, inp, out):
+                captured[name] = out.detach().clone()
+            return hook
+        
+        handle = base_model.fusion_gate.register_forward_hook(_capture_hook('fused'))
+        
+        def _run_forward(**override_kwargs):
+            """Run forward with baseline args, overriding specific kwargs."""
+            fwd_kwargs = dict(
+                options=dummy_opts, options_mask=dummy_opts_mask,
+                news_embs=dummy_news, news_mask=dummy_news_mask,
+                news_indices=dummy_news_idx, news_timestamps=dummy_news_ts,
+                gdelt_embs=dummy_gdelt, gdelt_mask=dummy_gdelt_mask,
+                gdelt_timestamps=dummy_gdelt_ts,
+                macro_context=dummy_macro, bar_timestamps=dummy_bar_ts,
+                econ_event_ids=dummy_econ_ids, econ_currency_ids=dummy_econ_cur,
+                econ_numeric=dummy_econ_num, econ_mask=dummy_econ_mask,
+                econ_timestamps=dummy_econ_ts,
+                fundamentals_context=dummy_fund,
+            )
+            fwd_kwargs.update(override_kwargs)
+            return eval_model(dummy_bars, dummy_mask, **fwd_kwargs)
+        
+        # Baseline
+        _run_forward()
+        baseline_fused = captured['fused'].clone()
+        
+        def _check_feed(name, **override_kwargs):
+            """Check if removing a feed changes the fusion gate output."""
+            nonlocal checks_passed, total_checks
+            total_checks += 1
+            _run_forward(**override_kwargs)
+            ablated_fused = captured['fused']
+            diff = (baseline_fused - ablated_fused).abs().sum().item()
+            ok = diff > 1e-6
+            dashboard.log(f"  [{'[green]✓' if ok else '[red]✗'}] {name} contributes (Δ={diff:.6f})[/]")
+            checks_passed += ok
+        
+        if args.use_news:
+            _check_feed("News", news_embs=None, news_mask=None,
+                         news_indices=None, news_timestamps=None)
+        
+        if args.use_gdelt:
+            _check_feed("GDELT", gdelt_embs=None, gdelt_mask=None,
+                         gdelt_timestamps=None)
+        
+        if args.use_options:
+            _check_feed("Options", options=None, options_mask=None)
+        
+        if args.use_macro:
+            # FiLM heads use identity init (weight=0, gamma_bias=1, beta_bias=0),
+            # so FiLM is a no-op at init regardless of macro input → fusion Δ=0.
+            # Instead, verify macro_proj produces non-zero output (wiring correct).
+            total_checks += 1
+            macro_hook_out = {}
+            def _macro_hook(module, inp, out):
+                macro_hook_out['proj'] = out.detach()
+            mh = base_model.film_generator.macro_proj.register_forward_hook(_macro_hook)
+            _run_forward()  # baseline with macro
+            mh.remove()
+            proj_norm = macro_hook_out.get('proj')
+            if proj_norm is not None:
+                norm_val = proj_norm.abs().sum().item()
+                ok = norm_val > 1e-6
+                dashboard.log(f"  [{'[green]✓' if ok else '[red]✗'}] Macro/FiLM wired (proj‖={norm_val:.4f}, identity-init → Δ=0 expected pre-train)[/]")
+            else:
+                ok = False
+                dashboard.log(f"  [[red]✗] Macro/FiLM: macro_proj hook not triggered[/]")
+            checks_passed += ok
+        
+        if args.use_econ:
+            _check_feed("Econ", econ_event_ids=None, econ_currency_ids=None,
+                         econ_numeric=None, econ_mask=None, econ_timestamps=None)
+        
+        if args.use_fundamentals:
+            _check_feed("Fundamentals", fundamentals_context=None)
+        
+        handle.remove()  # Clean up hook
+    
+    dashboard.log(f"\n[bold]Result: {checks_passed}/{total_checks} checks passed[/]")
+    
+    return checks_passed, total_checks
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def main():
@@ -845,6 +1134,30 @@ def main():
                         help='Disable GDELT integration for A/B comparison.')
     parser.add_argument('--gdelt-path', type=str, default=None,
                         help='Path to GDELT embeddings directory (default: datasets/GDELT)')
+    parser.add_argument('--use-econ', action='store_true', default=cfg.use_econ,
+                        help='Enable economic calendar integration. Enabled by default.')
+    parser.add_argument('--no-econ', action='store_false', dest='use_econ',
+                        help='Disable economic calendar for A/B comparison.')
+    parser.add_argument('--econ-path', type=str, default=None,
+                        help='Path to econ_calendar directory (default: datasets/econ_calendar)')
+    parser.add_argument('--use-fundamentals', action='store_true', default=cfg.use_fundamentals,
+                        help='Enable fundamentals cross-attention (sector state). Enabled by default.')
+    parser.add_argument('--no-fundamentals', action='store_false', dest='use_fundamentals',
+                        help='Disable fundamentals for A/B comparison.')
+    parser.add_argument('--fundamentals-path', type=str, default=None,
+                        help='Path to fundamentals_state.parquet (default: datasets/fundamentals/fundamentals_state.parquet)')
+    parser.add_argument('--use-vix-features', action='store_true', default=cfg.use_vix_features,
+                        help='Enable VIX Mamba stream (extended hours). Enabled by default.')
+    parser.add_argument('--no-vix-features', action='store_false', dest='use_vix_features',
+                        help='Disable VIX features for A/B comparison.')
+    parser.add_argument('--vix-features-path', type=str, default=None,
+                        help='Path to VIX features directory (default: datasets/VIX/Vix_features)')
+    parser.add_argument('--vix-n-layers', type=int, default=cfg.vix_n_layers,
+                        help='Number of VIX Mamba layers (default: 2)')
+    parser.add_argument('--vix-d-model', type=int, default=cfg.vix_d_model,
+                        help='VIX Mamba hidden dimension (default: 64)')
+    parser.add_argument('--vix-d-state', type=int, default=cfg.vix_d_state,
+                        help='VIX Mamba state dimension (default: 16)')
     parser.add_argument('--checkpoint-interval', type=int, default=cfg.checkpoint_interval,
                         help='Fusion checkpoint interval in bars (default: 300 = 5 min)')
     # Spike-weighted loss parameters
@@ -930,7 +1243,7 @@ def main():
         sys.exit(1)
 
     # Build datasets
-    num_features = 45  # Stock features from Stock_Data_2min (47 cols - ticker - bar_timestamp)
+    from loader.bar_mamba_dataset import NUM_STOCK_FEATURES
     train_sampler = None
     val_sampler = None
     
@@ -938,11 +1251,12 @@ def main():
         if is_main:
             dashboard.log(f"[yellow]Using SYNTHETIC data[/] (seq_len={args.seq_len})")
         train_dataset = SyntheticBarDataset(
-            num_samples=50 * world_size, seq_len=args.seq_len, num_features=num_features
+            num_samples=50 * world_size, seq_len=args.seq_len, num_features=NUM_STOCK_FEATURES
         )
         val_dataset = SyntheticBarDataset(
-            num_samples=20 * world_size, seq_len=args.seq_len, num_features=num_features
+            num_samples=20 * world_size, seq_len=args.seq_len, num_features=NUM_STOCK_FEATURES
         )
+        num_features = NUM_STOCK_FEATURES
         collate_fn = SyntheticBarDataset.collate_fn
     else:
         if is_main:
@@ -1005,9 +1319,17 @@ def main():
                 logger.info("Options integration DISABLED (baseline A/B mode)")
         
         # Macro path: use provided path or default
+        # Priority: enhanced macro (with FED/cross-asset) > standard macro
         macro_path = args.macro_path
         if args.use_macro and macro_path is None:
             for candidate in [
+                # Enhanced macro with FED yields, rates, credit spreads
+                data_paths.get('stock', Path('.')).parent / 'MACRO' / 'macro_daily_enhanced.parquet',
+                Path('datasets/MACRO/macro_daily_enhanced.parquet'),
+                # Standard macro (sector fundamentals only)
+                data_paths.get('stock', Path('.')).parent / 'MACRO' / 'macro_daily.parquet',
+                Path('datasets/MACRO/macro_daily.parquet'),
+                # Legacy paths
                 data_paths.get('stock', Path('.')).parent / 'macro' / 'macro_daily.parquet',
                 Path('datasets/macro/macro_daily.parquet'),
             ]:
@@ -1047,6 +1369,71 @@ def main():
                     logger.warning("GDELT enabled but no path found")
             else:
                 dashboard.log("[dim]🌍 GDELT: disabled (baseline mode)[/]")
+        
+        # Econ calendar path: use provided path or default
+        econ_path = args.econ_path
+        if args.use_econ and econ_path is None:
+            for candidate in [
+                data_paths.get('stock', Path('.')).parent / 'econ_calendar',
+                Path('datasets/econ_calendar'),
+            ]:
+                if candidate.exists():
+                    econ_path = str(candidate)
+                    break
+        
+        if is_main:
+            if args.use_econ:
+                if econ_path:
+                    dashboard.log(f"[bold cyan]📅 Econ Calendar:[/] {econ_path}")
+                    logger.info(f"Econ calendar ENABLED: {econ_path}")
+                else:
+                    dashboard.log("[yellow]⚠️ Econ enabled but no econ_calendar path found[/]")
+                    logger.warning("Econ enabled but no path found")
+            else:
+                dashboard.log("[dim]📅 Econ: disabled (baseline mode)[/]")
+        
+        # Fundamentals path: use provided path or default
+        fundamentals_path = args.fundamentals_path
+        if args.use_fundamentals and fundamentals_path is None:
+            for candidate in [
+                data_paths.get('stock', Path('.')).parent / 'fundamentals' / 'fundamentals_state.parquet',
+                Path('datasets/fundamentals/fundamentals_state.parquet'),
+            ]:
+                if candidate.exists():
+                    fundamentals_path = str(candidate)
+                    break
+        
+        # VIX features path: use provided path or default
+        vix_features_path = args.vix_features_path
+        if args.use_vix_features and vix_features_path is None:
+            for candidate in [
+                data_paths.get('stock', Path('.')).parent / 'VIX' / 'Vix_features',
+                Path('datasets/VIX/Vix_features'),
+            ]:
+                if candidate.exists():
+                    vix_features_path = str(candidate)
+                    break
+        
+        if is_main:
+            if args.use_fundamentals:
+                if fundamentals_path:
+                    dashboard.log(f"[bold cyan]📊 Fundamentals:[/] {fundamentals_path}")
+                    logger.info(f"Fundamentals cross-attention ENABLED: {fundamentals_path}")
+                else:
+                    dashboard.log("[yellow]⚠️ Fundamentals enabled but no fundamentals_state.parquet found[/]")
+                    logger.warning("Fundamentals enabled but no path found")
+            else:
+                dashboard.log("[dim]📊 Fundamentals: disabled (baseline mode)[/]")
+            
+            if args.use_vix_features:
+                if vix_features_path:
+                    dashboard.log(f"[bold cyan]📈 VIX Mamba:[/] {vix_features_path} (d={args.vix_d_model}, {args.vix_n_layers}L)")
+                    logger.info(f"VIX Mamba ENABLED: {vix_features_path}, d_model={args.vix_d_model}, d_state={args.vix_d_state}, {args.vix_n_layers} layers")
+                else:
+                    dashboard.log("[yellow]⚠️ VIX features enabled but no Vix_features dir found[/]")
+                    logger.warning("VIX features enabled but no path found")
+            else:
+                dashboard.log("[dim]📈 VIX Mamba: disabled (baseline mode)[/]")
 
         train_dataset = BarMambaDataset(
             stock_data_path=stock_path,
@@ -1064,6 +1451,12 @@ def main():
             use_macro=args.use_macro,
             gdelt_data_path=gdelt_path,
             use_gdelt=args.use_gdelt,
+            econ_calendar_path=econ_path,
+            use_econ=args.use_econ,
+            fundamentals_data_path=fundamentals_path,
+            use_fundamentals=args.use_fundamentals,
+            vix_features_path=vix_features_path,
+            use_vix_features=args.use_vix_features,
         )
         val_dataset = BarMambaDataset(
             stock_data_path=stock_path,
@@ -1081,6 +1474,12 @@ def main():
             use_macro=args.use_macro,
             gdelt_data_path=gdelt_path,
             use_gdelt=args.use_gdelt,
+            econ_calendar_path=econ_path,
+            use_econ=args.use_econ,
+            fundamentals_data_path=fundamentals_path,
+            use_fundamentals=args.use_fundamentals,
+            vix_features_path=vix_features_path,
+            use_vix_features=args.use_vix_features,
         )
         num_features = train_dataset.num_features
         collate_fn = BarMambaDataset.collate_fn
@@ -1126,6 +1525,16 @@ def main():
     # Determine gdelt_dim from dataset if gdelt is enabled
     gdelt_dim = getattr(train_dataset, 'gdelt_dim', 391) if args.use_gdelt else 391
     
+    # Determine econ vocab sizes from dataset if econ is enabled
+    econ_num_event_types = getattr(train_dataset, 'econ_num_event_types', 412) + 1 if args.use_econ else 413  # +1 for padding idx 0
+    econ_num_currencies = getattr(train_dataset, 'econ_num_currencies', 4) + 1 if args.use_econ else 5  # +1 for padding idx 0
+    
+    # Determine fundamentals_dim from dataset if fundamentals is enabled
+    fundamentals_dim = getattr(train_dataset, 'fundamentals_dim', 130) if args.use_fundamentals else 130
+    
+    # Determine vix_features_dim from dataset if vix features is enabled
+    vix_features_dim = getattr(train_dataset, 'num_vix_features', 21) if args.use_vix_features else 21
+    
     model = ParallelMambaVIX(
         num_features=num_features,
         d_model=args.d_model,
@@ -1145,6 +1554,16 @@ def main():
         macro_dim=macro_dim,
         use_gdelt=args.use_gdelt,
         gdelt_dim=gdelt_dim,
+        use_econ=args.use_econ,
+        econ_num_event_types=econ_num_event_types,
+        econ_num_currencies=econ_num_currencies,
+        use_fundamentals=args.use_fundamentals,
+        fundamentals_dim=fundamentals_dim,
+        use_vix_features=args.use_vix_features,
+        vix_features_dim=vix_features_dim,
+        vix_n_layers=args.vix_n_layers,
+        vix_d_model=args.vix_d_model,
+        vix_d_state=args.vix_d_state,
     ).to(device)
     if is_main:
         dashboard.log(f"[bold magenta]🔀 Parallel streams:[/] checkpoint every {args.checkpoint_interval} bars")
@@ -1154,6 +1573,17 @@ def main():
         model = DDP(model, device_ids=[local_rank], output_device=local_rank)
         if is_main:
             dashboard.log(f"[dim]Model wrapped in DistributedDataParallel[/]")
+
+    # --- PRE-TRAINING VALIDATION ---
+    if is_main:
+        pre_checks_passed, pre_total = run_validation_checks(
+            model, args, device, num_features,
+            macro_dim=macro_dim, gdelt_dim=gdelt_dim, fundamentals_dim=fundamentals_dim,
+            phase="pre", is_distributed=is_distributed
+        )
+        if pre_checks_passed < pre_total:
+            dashboard.log(f"[bold yellow]⚠ Pre-training validation: {pre_checks_passed}/{pre_total} checks passed[/]")
+        dashboard.log("")  # Spacer
 
     # Optimizer & loss — separate param group with 10x LR for FiLM generator
     if args.use_macro and hasattr(model, 'module'):
@@ -1351,78 +1781,16 @@ def main():
         )
         dashboard.log(f"[bold blue]💾 Final checkpoint saved:[/] {ckpt_file}")
 
-    # Final checks (only on main process)
+    # --- POST-TRAINING VALIDATION ---
     checks_passed = 0
-    total_checks = 5
+    total_checks = 0
     
     if is_main:
-        dashboard.log("\n" + "═" * 50)
-        dashboard.log("[bold]VALIDATION CHECKS[/]")
-        dashboard.log("═" * 50)
-
-        # Get underlying model for DDP
-        eval_model = model.module if is_distributed else model
-
-        # Check 1: Model has parameters
-        n_params = sum(p.numel() for p in eval_model.parameters() if p.requires_grad)
-        ok = n_params > 0
-        dashboard.log(f"  [{'[green]✓' if ok else '[red]✗'}] Model has {n_params:,} parameters[/]")
-        checks_passed += ok
-
-        # Check 2: Forward pass produces output (both heads)
-        eval_model.eval()
-        with torch.no_grad():
-            # Build proper dummy inputs for all streams
-            dummy_bars = torch.randn(1, 100, num_features).to(device)
-            dummy_mask = torch.ones(1, 100, dtype=torch.bool, device=device)
-            dummy_opts = torch.randn(1, 100, NUM_OPTION_FEATURES).to(device) if args.use_options else None
-            dummy_opts_mask = torch.ones(1, 100, dtype=torch.bool, device=device) if args.use_options else None
-            dummy_news = torch.randn(1, 10, 3072).to(device) if args.use_news else None
-            dummy_news_mask = torch.ones(1, 10, dtype=torch.bool, device=device) if args.use_news else None
-            dummy_news_idx = torch.zeros(1, 10, dtype=torch.long, device=device) if args.use_news else None
-            dummy_news_ts = torch.arange(10, device=device).unsqueeze(0) * 1000 if args.use_news else None
-            dummy_gdelt = torch.randn(1, 5, gdelt_dim).to(device) if args.use_gdelt else None
-            dummy_gdelt_mask = torch.ones(1, 5, dtype=torch.bool, device=device) if args.use_gdelt else None
-            dummy_gdelt_ts = torch.arange(5, device=device).unsqueeze(0) * 1000 if args.use_gdelt else None
-            dummy_macro = torch.randn(1, macro_dim).to(device) if args.use_macro else None
-            dummy_bar_ts = torch.arange(100, device=device).unsqueeze(0)
-            out = eval_model(
-                dummy_bars, dummy_mask, dummy_opts, dummy_opts_mask,
-                dummy_news, dummy_news_mask, dummy_news_idx, dummy_news_ts,
-                dummy_gdelt, dummy_gdelt_mask, dummy_gdelt_ts,
-                dummy_macro, dummy_bar_ts
-            )
-            ok = 'vix_pred' in out and out['vix_pred'].shape == (1, 4)
-            dashboard.log(f"  [{'[green]✓' if ok else '[red]✗'}] Forward pass correct[/]")
-            checks_passed += ok
-
-        # Check 3: Backward pass works
-        eval_model.train()
-        out = eval_model(
-            dummy_bars, dummy_mask, dummy_opts, dummy_opts_mask,
-            dummy_news, dummy_news_mask, dummy_news_idx, dummy_news_ts,
-            dummy_gdelt, dummy_gdelt_mask, dummy_gdelt_ts,
-            dummy_macro, dummy_bar_ts
+        checks_passed, total_checks = run_validation_checks(
+            model, args, device, num_features,
+            macro_dim=macro_dim, gdelt_dim=gdelt_dim, fundamentals_dim=fundamentals_dim,
+            phase="post", train_loss=train_loss, is_distributed=is_distributed
         )
-        loss = out['vix_pred'].sum()
-        loss.backward()
-        has_grads = any(p.grad is not None and p.grad.abs().sum() > 0
-                        for p in eval_model.parameters())
-        dashboard.log(f"  [{'[green]✓' if has_grads else '[red]✗'}] Gradients flow[/]")
-        checks_passed += has_grads
-
-        # Check 4: Loss is finite
-        ok = np.isfinite(train_loss) and train_loss > 0
-        dashboard.log(f"  [{'[green]✓' if ok else '[red]✗'}] Loss finite ({train_loss:.4f})[/]")
-        checks_passed += ok
-
-        # Check 5: No NaN in parameters
-        has_nan = any(torch.isnan(p).any() for p in eval_model.parameters())
-        ok = not has_nan
-        dashboard.log(f"  [{'[green]✓' if ok else '[red]✗'}] No NaN in params[/]")
-        checks_passed += ok
-
-        dashboard.log(f"\n[bold]Result: {checks_passed}/{total_checks} checks passed[/]")
         
         # Log results to CSV for HP sweep
         if args.results_csv:

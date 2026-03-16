@@ -37,7 +37,197 @@ DEFAULT_FEATURES = [
     'close_return', 'volume_per_trade', 'buy_sell_ratio', 'high_low_ratio',
     'close_position', 'day_of_week', 'days_to_friday', 'minute_of_day',
     'is_friday', 'days_to_monthly_expiry', 'days_to_weekly_expiry', 'is_expiration_day',
+    # Derived features (computed on-the-fly)
+    'liquidity_stress',
+    'ofi_acceleration',  # OFI(t) - OFI(t-10)
+    'abs_ofi',           # |OFI|
+    'intraday_vol_skew', # rv_last_hour / rv_first_hour
+    'ticker_dispersion', # std(close_return) across tickers
 ]
+
+# Features required for liquidity_stress computation
+LIQUIDITY_STRESS_INPUTS = ['amihud', 'inter_trade_std', 'tick_arrival_rate']
+
+NUM_STOCK_FEATURES = len(DEFAULT_FEATURES)
+
+
+def compute_cumulative_zscore(arr: np.ndarray, min_samples: int = 2) -> np.ndarray:
+    """Compute cumulative z-score using only past values (no lookahead).
+    
+    For each position i, z-score is computed using mean/std of arr[0:i+1].
+    First min_samples-1 values are set to 0 (not enough history).
+    
+    Args:
+        arr: 1D array of values
+        min_samples: Minimum samples needed before computing z-score
+    
+    Returns:
+        1D array of cumulative z-scores
+    """
+    n = len(arr)
+    result = np.zeros(n, dtype=np.float32)
+    
+    if n < min_samples:
+        return result
+    
+    # Cumulative sum and sum of squares for online computation
+    cumsum = np.cumsum(arr)
+    cumsum_sq = np.cumsum(arr ** 2)
+    
+    for i in range(min_samples - 1, n):
+        count = i + 1
+        mean = cumsum[i] / count
+        var = (cumsum_sq[i] / count) - (mean ** 2)
+        std = np.sqrt(max(var, 1e-8))  # Avoid division by zero
+        result[i] = (arr[i] - mean) / std
+    
+    return result
+
+
+def compute_intraday_vol_skew(features: np.ndarray, feature_names: list, 
+                               bars_per_hour: int = 30) -> np.ndarray:
+    """Compute intraday_vol_skew = rv_last_hour / rv_first_hour.
+    
+    Computes ratio of realized volatility in last hour vs first hour of the day.
+    Uses rv_intrabar summed over first/last hour windows.
+    
+    Args:
+        features: [T, num_features] array (single day)
+        feature_names: List of feature names
+        bars_per_hour: Number of 2-min bars per hour (default 30)
+    
+    Returns:
+        [T] array with same skew value broadcast to all bars
+    """
+    n = len(features)
+    result = np.ones(n, dtype=np.float32)  # Default to 1.0 (neutral)
+    
+    try:
+        rv_idx = feature_names.index('rv_intrabar')
+    except ValueError:
+        return result
+    
+    rv = features[:, rv_idx]
+    
+    # Need at least 2 hours of data (first + last hour)
+    if n < bars_per_hour * 2:
+        return result
+    
+    # Sum RV for first hour and last hour
+    rv_first_hour = np.sum(rv[:bars_per_hour])
+    rv_last_hour = np.sum(rv[-bars_per_hour:])
+    
+    # Compute ratio (avoid division by zero)
+    if rv_first_hour > 1e-10:
+        skew = rv_last_hour / rv_first_hour
+    else:
+        skew = 1.0
+    
+    # Broadcast to all bars in the day
+    result[:] = skew
+    return result
+
+
+def compute_ofi_derived(features: np.ndarray, feature_names: list, lag: int = 10) -> Tuple[np.ndarray, np.ndarray]:
+    """Compute OFI-derived features: ofi_acceleration and abs_ofi.
+    
+    Args:
+        features: [T, num_features] array
+        feature_names: List of feature names corresponding to columns
+        lag: Lookback for acceleration (default 10 bars = 20 min)
+    
+    Returns:
+        (ofi_acceleration, abs_ofi) - each [T] array
+    """
+    try:
+        ofi_idx = feature_names.index('ofi')
+    except ValueError:
+        n = len(features)
+        return np.zeros(n, dtype=np.float32), np.zeros(n, dtype=np.float32)
+    
+    ofi = features[:, ofi_idx]
+    n = len(ofi)
+    
+    # abs_ofi = |OFI|
+    abs_ofi = np.abs(ofi).astype(np.float32)
+    
+    # ofi_acceleration = OFI(t) - OFI(t-lag)
+    # First `lag` values are 0 (no history)
+    ofi_acceleration = np.zeros(n, dtype=np.float32)
+    if n > lag:
+        ofi_acceleration[lag:] = ofi[lag:] - ofi[:-lag]
+    
+    return ofi_acceleration, abs_ofi
+
+
+def compute_ticker_dispersion(df, feature_names: list, ts_col: str = 'bar_timestamp') -> np.ndarray:
+    """Compute ticker_dispersion = std(close_return) across tickers per timestamp.
+    
+    Args:
+        df: Polars DataFrame with ticker and timestamp columns
+        feature_names: List of feature names (to check if close_return exists)
+        ts_col: Timestamp column name
+    
+    Returns:
+        [T] array of dispersion values (one per unique timestamp, sorted)
+    """
+    import polars as pl
+    
+    if 'close_return' not in df.columns or 'ticker' not in df.columns:
+        # No ticker info or close_return - return zeros
+        return np.zeros(len(df), dtype=np.float32)
+    
+    # Group by timestamp and compute std of close_return across tickers
+    dispersion = (
+        df.group_by(ts_col)
+        .agg(pl.col('close_return').std().alias('dispersion'))
+        .sort(ts_col)
+    )
+    
+    # Map back to original row order
+    result = df.sort(ts_col).join(
+        dispersion, on=ts_col, how='left'
+    )['dispersion'].fill_null(0.0).to_numpy().astype(np.float32)
+    
+    return result
+
+
+def compute_liquidity_stress(features: np.ndarray, feature_names: list) -> np.ndarray:
+    """Compute liquidity_stress = zscore(amihud) + zscore(inter_trade_std) - zscore(tick_arrival_rate).
+    
+    Uses cumulative z-score (past bars only, no lookahead).
+    
+    Args:
+        features: [T, num_features] array
+        feature_names: List of feature names corresponding to columns
+    
+    Returns:
+        [T] array of liquidity_stress values
+    """
+    # Find column indices for input features
+    try:
+        amihud_idx = feature_names.index('amihud')
+        inter_trade_std_idx = feature_names.index('inter_trade_std')
+        tick_arrival_rate_idx = feature_names.index('tick_arrival_rate')
+    except ValueError:
+        # Missing required features, return zeros
+        return np.zeros(len(features), dtype=np.float32)
+    
+    # Extract columns
+    amihud = features[:, amihud_idx]
+    inter_trade_std = features[:, inter_trade_std_idx]
+    tick_arrival_rate = features[:, tick_arrival_rate_idx]
+    
+    # Compute cumulative z-scores (no lookahead)
+    z_amihud = compute_cumulative_zscore(amihud)
+    z_inter_trade_std = compute_cumulative_zscore(inter_trade_std)
+    z_tick_arrival_rate = compute_cumulative_zscore(tick_arrival_rate)
+    
+    # liquidity_stress = zscore(amihud) + zscore(inter_trade_std) - zscore(tick_arrival_rate)
+    liquidity_stress = z_amihud + z_inter_trade_std - z_tick_arrival_rate
+    
+    return liquidity_stress
+
 
 # Option features (all 49 features from opt_trade_2min)
 OPTION_FEATURES = [
@@ -59,8 +249,54 @@ OPTION_FEATURES = [
     'net_premium_flow', 'premium_imbalance', 'large_trade_pct', 'put_large_pct',
     'uoa_total', 'uoa_put_bias', 'deep_otm_put_pct',
     'near_far_ratio', 'sweep_to_trade_ratio',
+    # Derived features (computed on-the-fly)
+    'skew_change',  # skew_proxy(t) - skew_proxy(t-30)
 ]
 NUM_OPTION_FEATURES = len(OPTION_FEATURES)
+
+# Option derived features
+OPTION_DERIVED_FEATURES = {'skew_change'}
+
+
+def compute_option_derived(features: np.ndarray, feature_names: list, lag: int = 30) -> dict:
+    """Compute derived option features.
+    
+    Args:
+        features: [T, num_features] array
+        feature_names: List of feature names
+        lag: Lookback for skew_change (default 30 bars = 1 hour)
+    
+    Returns:
+        Dict of feature_name -> [T] array
+    """
+    n = len(features)
+    result = {}
+    
+    # skew_change = skew_proxy(t) - skew_proxy(t-30)
+    try:
+        skew_idx = feature_names.index('skew_proxy')
+        skew = features[:, skew_idx]
+        skew_change = np.zeros(n, dtype=np.float32)
+        if n > lag:
+            skew_change[lag:] = skew[lag:] - skew[:-lag]
+        result['skew_change'] = skew_change
+    except ValueError:
+        result['skew_change'] = np.zeros(n, dtype=np.float32)
+    
+    return result
+
+# VIX features (from Vix_features parquet files) - 21 features
+# Extended hours: ~540 bars/day (04:00-22:00 ET) vs stock's 195 bars
+VIX_FEATURES = [
+    'open', 'high', 'low', 'close',  # OHLC (volume dropped - unreliable overnight)
+    'vvix', 'previousclose',
+    '5dMA', '10dMA', '20dMA',
+    'rv_5m', 'rv_30m', 'rv_2h', 'rv_acceleration', 'rv_change_5', 'rv_change_30', 'rv_ratio',
+    'vix_vvix_ratio', 'vix_zscore_20d', 'vix_percentile_252d', 'distance_from_20dMA',
+    'vix_velocity_15', 'vix_velocity_75', 'vix_acceleration_15', 'vix_acceleration_75',
+    'rv_ratio_to_vix',
+]
+NUM_VIX_FEATURES = len(VIX_FEATURES)  # 21
 
 # Multi-horizon prediction targets (days ahead)
 HORIZONS = [1, 7, 15, 30]  # +1d, +7d, +15d, +30d
@@ -172,6 +408,12 @@ class BarMambaDataset(Dataset):
         use_macro: bool = False,
         gdelt_data_path: Optional[str] = None,
         use_gdelt: bool = False,
+        econ_calendar_path: Optional[str] = None,
+        use_econ: bool = False,
+        fundamentals_data_path: Optional[str] = None,
+        use_fundamentals: bool = False,
+        vix_features_path: Optional[str] = None,
+        use_vix_features: bool = False,
     ):
         self.split = split
         self.features = features or DEFAULT_FEATURES
@@ -182,6 +424,19 @@ class BarMambaDataset(Dataset):
         self.use_options = use_options
         self.use_macro = use_macro
         self.use_gdelt = use_gdelt
+        self.use_econ = use_econ
+        self.use_fundamentals = use_fundamentals
+        self.use_vix_features = use_vix_features
+        
+        # Store date boundaries early (needed for z-score computation)
+        self.train_end = pd.to_datetime(train_end).date()
+        self.val_end = pd.to_datetime(val_end).date()
+        
+        # VIX features data
+        self.vix_features_path = Path(vix_features_path) if vix_features_path else None
+        self.vix_features = VIX_FEATURES
+        self.num_vix_features = NUM_VIX_FEATURES
+        self.vix_feature_files: Dict = {}  # date -> file path
         
         # News data (Benzinga embeddings)
         self.news_path = Path(news_data_path) if news_data_path else None
@@ -198,6 +453,8 @@ class BarMambaDataset(Dataset):
         self.macro_data: Optional[pd.DataFrame] = None
         self.macro_dim = 0
         self.macro_features: List[str] = []
+        self.macro_mean: Optional[np.ndarray] = None  # Global z-score stats
+        self.macro_std: Optional[np.ndarray] = None
         if use_macro and macro_data_path:
             macro_path = Path(macro_data_path)
             if macro_path.exists():
@@ -209,11 +466,54 @@ class BarMambaDataset(Dataset):
                 elif self.macro_data.index.name == 'date' or self.macro_data.index.dtype == 'datetime64[ns]':
                     self.macro_data.index = pd.to_datetime(self.macro_data.index).date
                     self.macro_data.index.name = 'date'
+                
+                # Compute derived macro features
+                self._compute_macro_derived_features()
+                
                 self.macro_features = [c for c in self.macro_data.columns]
                 self.macro_dim = len(self.macro_features)
-                logger.info(f"Loaded macro data: {len(self.macro_data)} days, {self.macro_dim} features")
+                
+                # Compute global z-score stats from TRAINING period only
+                train_mask = self.macro_data.index <= self.train_end
+                train_data = self.macro_data.loc[train_mask].values.astype(np.float32)
+                train_data = np.nan_to_num(train_data, nan=0.0, posinf=0.0, neginf=0.0)
+                self.macro_mean = train_data.mean(axis=0)
+                self.macro_std = train_data.std(axis=0) + 1e-8
+                
+                logger.info(f"Loaded macro data: {len(self.macro_data)} days, {self.macro_dim} features (global z-score from {train_mask.sum()} train days)")
             else:
                 logger.warning(f"Macro data not found: {macro_path}")
+        
+        # Fundamentals data (cross-attention state)
+        self.fundamentals_data: Optional[pd.DataFrame] = None
+        self.fundamentals_dim = 0
+        self.fundamentals_features: List[str] = []
+        self.fundamentals_mean: Optional[np.ndarray] = None  # Global z-score stats
+        self.fundamentals_std: Optional[np.ndarray] = None
+        if use_fundamentals and fundamentals_data_path:
+            fund_path = Path(fundamentals_data_path)
+            if fund_path.exists():
+                self.fundamentals_data = pd.read_parquet(fund_path)
+                # Handle both index-based and column-based date
+                if 'date' in self.fundamentals_data.columns:
+                    self.fundamentals_data['date'] = pd.to_datetime(self.fundamentals_data['date']).dt.date
+                    self.fundamentals_data = self.fundamentals_data.set_index('date').sort_index()
+                elif self.fundamentals_data.index.name == 'date' or self.fundamentals_data.index.dtype == 'datetime64[ns]':
+                    self.fundamentals_data.index = pd.to_datetime(self.fundamentals_data.index).date
+                    self.fundamentals_data.index.name = 'date'
+                self.fundamentals_features = [c for c in self.fundamentals_data.columns]
+                self.fundamentals_dim = len(self.fundamentals_features)
+                
+                # Compute global z-score stats from TRAINING period only
+                train_mask = self.fundamentals_data.index <= self.train_end
+                train_data = self.fundamentals_data.loc[train_mask].values.astype(np.float32)
+                train_data = np.nan_to_num(train_data, nan=0.0, posinf=0.0, neginf=0.0)
+                self.fundamentals_mean = train_data.mean(axis=0)
+                self.fundamentals_std = train_data.std(axis=0) + 1e-8
+                
+                logger.info(f"Loaded fundamentals data: {len(self.fundamentals_data)} days, {self.fundamentals_dim} features (global z-score from {train_mask.sum()} train days)")
+            else:
+                logger.warning(f"Fundamentals data not found: {fund_path}")
         
         # Options data
         self.options_path = Path(options_data_path) if options_data_path else None
@@ -221,13 +521,40 @@ class BarMambaDataset(Dataset):
         self.num_option_features = NUM_OPTION_FEATURES
         self.option_files: Dict = {}  # date -> file path
         
+        # Economic calendar data (preprocessed parquet + vocab)
+        self.econ_data: Optional[pd.DataFrame] = None
+        self.econ_by_date: Dict = {}  # date_str -> DataFrame slice
+        self.econ_num_features = 13  # numeric features per econ token
+        self.econ_num_event_types = 0
+        self.econ_num_currencies = 0
+        if use_econ and econ_calendar_path:
+            econ_path = Path(econ_calendar_path)
+            parquet_file = econ_path / 'econ_events.parquet'
+            if parquet_file.exists():
+                self.econ_data = pd.read_parquet(parquet_file)
+                # Index by date for fast lookup
+                for date_str, group in self.econ_data.groupby('date'):
+                    self.econ_by_date[date_str] = group
+                # Load vocab for metadata
+                vocab_file = econ_path / 'vocab.json'
+                if vocab_file.exists():
+                    import json
+                    with open(vocab_file) as f:
+                        econ_vocab = json.load(f)
+                    self.econ_num_event_types = econ_vocab['num_event_types']
+                    self.econ_num_currencies = econ_vocab['num_currencies']
+                logger.info(f"Loaded econ calendar: {len(self.econ_data)} events, "
+                           f"{len(self.econ_by_date)} days, "
+                           f"{self.econ_num_event_types} event types")
+            else:
+                logger.warning(f"Econ calendar not found: {parquet_file}")
+        
         # Calculate days needed based on seq_len (~195 bars per trading day at 2-min)
         bars_per_day = 195
         self.lookback_days = max(1, (max_total_bars // bars_per_day) + 1)
         # Anchor dates
         self.anchor_start = pd.to_datetime(train_start).date()
-        self.train_end = pd.to_datetime(train_end).date()
-        self.val_end = pd.to_datetime(val_end).date()
+        # train_end and val_end already set earlier for z-score computation
 
         # Load ticker filter
         self.allowed_tickers: Set[str] = set()
@@ -244,6 +571,10 @@ class BarMambaDataset(Dataset):
         # Index option files by date (if enabled)
         if self.use_options and self.options_path:
             self._index_option_files()
+        
+        # Index VIX feature files by date (if enabled)
+        if self.use_vix_features and self.vix_features_path:
+            self._index_vix_feature_files()
 
         # Load VIX daily close
         self.vix_daily = load_vix_daily_close(vix_data_path)
@@ -256,10 +587,46 @@ class BarMambaDataset(Dataset):
             sources.append(f'options({len(self.option_files)} days)')
         if self.use_news:
             sources.append('news')
+        if self.use_vix_features:
+            sources.append(f'vix_features({len(self.vix_feature_files)} days)')
         logger.info(
             f"BarMambaDataset [{split}]: {len(self.anchor_dates)} samples, "
             f"seq={max_total_bars} (~{self.lookback_days}d), sources={sources}"
         )
+
+    def _compute_macro_derived_features(self):
+        """Compute derived macro features from raw FED/FRED data.
+        
+        Adds:
+            - credit_spread: BAMLH0A0HYM2 - BAMLC0A0CM (high yield - investment grade)
+            - yield_curve_velocity: T10Y2Y(t) - T10Y2Y(t-5) (5-day change)
+            - stlfsi4_change: STLFSI4(t) - STLFSI4(t-1) (daily change in stress index)
+            - fomc_proximity: exp(-days_until_fomc / 5) (exponential decay)
+        """
+        if self.macro_data is None:
+            return
+        
+        df = self.macro_data
+        
+        # credit_spread = BAMLH0A0HYM2 - BAMLC0A0CM
+        if 'BAMLH0A0HYM2' in df.columns and 'BAMLC0A0CM' in df.columns:
+            df['credit_spread'] = df['BAMLH0A0HYM2'] - df['BAMLC0A0CM']
+        
+        # yield_curve_velocity = T10Y2Y(t) - T10Y2Y(t-5)
+        if 'T10Y2Y' in df.columns:
+            df['yield_curve_velocity'] = df['T10Y2Y'] - df['T10Y2Y'].shift(5)
+            df['yield_curve_velocity'] = df['yield_curve_velocity'].fillna(0.0)
+        
+        # stlfsi4_change = STLFSI4(t) - STLFSI4(t-1)
+        if 'STLFSI4' in df.columns:
+            df['stlfsi4_change'] = df['STLFSI4'] - df['STLFSI4'].shift(1)
+            df['stlfsi4_change'] = df['stlfsi4_change'].fillna(0.0)
+        
+        # fomc_proximity = exp(-days_until_fomc / 5)
+        if 'days_until_fomc' in df.columns:
+            df['fomc_proximity'] = np.exp(-df['days_until_fomc'] / 5.0)
+        
+        self.macro_data = df
 
     def _index_stock_files(self):
         """Build date → file path mapping from all available stock files."""
@@ -292,6 +659,24 @@ class BarMambaDataset(Dataset):
             except Exception:
                 continue
         logger.info(f"Indexed {len(self.option_files)} option data files")
+
+    def _index_vix_feature_files(self):
+        """Build date → file path mapping for VIX feature 2-min bars."""
+        vix_dir = self.vix_features_path
+        if not vix_dir.exists():
+            logger.warning(f"VIX features directory not found: {vix_dir}")
+            return
+        
+        for f in vix_dir.glob('*.parquet'):
+            if f.name.startswith('._'):
+                continue
+            date_str = f.stem.split('.')[0]
+            try:
+                dt = pd.to_datetime(date_str).date()
+                self.vix_feature_files[dt] = f.resolve()
+            except Exception:
+                continue
+        logger.info(f"Indexed {len(self.vix_feature_files)} VIX feature files")
 
     def _find_vix_at_horizon(self, anchor_date: date, horizon_days: int, 
                                vix_dates: set, all_dates: List[date], date_to_idx: Dict[date, int]) -> Optional[float]:
@@ -411,13 +796,46 @@ class BarMambaDataset(Dataset):
         # Sort by timestamp
         df = df.sort(ts_col)
 
-        # Extract features
-        avail = [f for f in self.features if f in df.columns]
+        # Derived features computed on-the-fly (not in parquet)
+        derived_features = {'liquidity_stress', 'ofi_acceleration', 'abs_ofi', 
+                           'intraday_vol_skew', 'ticker_dispersion'}
+        
+        # Compute ticker_dispersion before aggregation (needs raw df with ticker column)
+        ticker_disp = None
+        if 'ticker_dispersion' in self.features:
+            ticker_disp = compute_ticker_dispersion(df, list(df.columns), ts_col)
+        
+        # Extract features (excluding derived features)
+        avail = [f for f in self.features if f in df.columns and f not in derived_features]
         if not avail:
             return None
 
         features = df.select(avail).to_numpy().astype(np.float32)
         features = np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
+
+        # Compute derived features
+        if 'liquidity_stress' in self.features:
+            liquidity_stress = compute_liquidity_stress(features, avail)
+            features = np.column_stack([features, liquidity_stress])
+            avail = avail + ['liquidity_stress']
+        
+        if 'ofi_acceleration' in self.features or 'abs_ofi' in self.features:
+            ofi_accel, abs_ofi = compute_ofi_derived(features, avail)
+            if 'ofi_acceleration' in self.features:
+                features = np.column_stack([features, ofi_accel])
+                avail = avail + ['ofi_acceleration']
+            if 'abs_ofi' in self.features:
+                features = np.column_stack([features, abs_ofi])
+                avail = avail + ['abs_ofi']
+        
+        if 'intraday_vol_skew' in self.features:
+            vol_skew = compute_intraday_vol_skew(features, avail)
+            features = np.column_stack([features, vol_skew])
+            avail = avail + ['intraday_vol_skew']
+        
+        if 'ticker_dispersion' in self.features and ticker_disp is not None:
+            features = np.column_stack([features, ticker_disp])
+            avail = avail + ['ticker_dispersion']
 
         # Extract timestamps as Unix nanoseconds, convert to seconds
         timestamps = df[ts_col].to_numpy()
@@ -642,9 +1060,11 @@ class BarMambaDataset(Dataset):
         df = df.sort(ts_col)
         
         # Aggregate across all underlyings per second (sum volumes, mean ratios)
-        # Group by timestamp and aggregate
+        # Group by timestamp and aggregate (excluding derived features)
         agg_exprs = []
         for feat in self.option_features:
+            if feat in OPTION_DERIVED_FEATURES:
+                continue  # Skip derived features
             if feat not in df.columns:
                 continue
             if 'ratio' in feat or 'skew' in feat or 'vs_20d' in feat:
@@ -659,13 +1079,20 @@ class BarMambaDataset(Dataset):
         
         df_agg = df.group_by(ts_col).agg(agg_exprs).sort(ts_col)
         
-        # Extract features
-        avail = [f for f in self.option_features if f in df_agg.columns]
+        # Extract features (excluding derived)
+        avail = [f for f in self.option_features if f in df_agg.columns and f not in OPTION_DERIVED_FEATURES]
         if not avail:
             return None
         
         features = df_agg.select(avail).to_numpy().astype(np.float32)
         features = np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
+        
+        # Compute derived option features
+        derived = compute_option_derived(features, avail)
+        for feat_name in ['skew_change']:
+            if feat_name in self.option_features:
+                features = np.column_stack([features, derived[feat_name]])
+                avail = avail + [feat_name]
         
         # Pad missing features
         if len(avail) < self.num_option_features:
@@ -682,6 +1109,153 @@ class BarMambaDataset(Dataset):
             features = padded
         
         return features
+
+    def _load_vix_features_with_timestamps(self, d: date) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+        """Load VIX features for a day with timestamps for checkpoint alignment.
+        
+        VIX runs extended hours (~540 bars/day vs stock's 195). Returns full
+        sequence with timestamps so model can align at checkpoints.
+        
+        Args:
+            d: Date to load
+        
+        Returns:
+            (features [N, num_vix_features], timestamps [N]) or None if unavailable
+            Timestamps are nanoseconds since epoch (int64).
+        """
+        if not self.use_vix_features or d not in self.vix_feature_files:
+            return None
+        
+        try:
+            df = pd.read_parquet(self.vix_feature_files[d])
+        except Exception as e:
+            logger.warning(f"Failed to load VIX features for {d}: {e}")
+            return None
+        
+        if len(df) == 0:
+            return None
+        
+        # Sort by timestamp
+        df = df.sort_values('bar_timestamp')
+        
+        # Extract timestamps (already int64 nanoseconds)
+        timestamps = df['bar_timestamp'].values.astype(np.int64)
+        
+        # Extract features
+        avail = [f for f in self.vix_features if f in df.columns]
+        if not avail:
+            return None
+        
+        features = df[avail].values.astype(np.float32)
+        features = np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
+        
+        # Pad missing features
+        if len(avail) < self.num_vix_features:
+            padded = np.zeros((len(features), self.num_vix_features), dtype=np.float32)
+            padded[:, :len(avail)] = features
+            features = padded
+        
+        return features, timestamps
+
+    def _load_econ_events(self, window_dates: List[date], anchor_date) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Load economic calendar events for lookback + D+15 forward window.
+        
+        Lookback events (in window_dates): full features including actual_z.
+        Forward events (anchor+1 to anchor+15): actual_z masked to 0, is_future=1.
+        
+        Returns:
+            event_ids: [N] int array of event type IDs
+            currency_ids: [N] int array of currency IDs  
+            numeric_features: [N, 13] float array of numeric features
+            timestamps: [N] int64 array of Unix timestamps
+        """
+        if not self.use_econ or self.econ_data is None:
+            return (np.zeros(0, dtype=np.int16),
+                    np.zeros(0, dtype=np.int8),
+                    np.zeros((0, self.econ_num_features), dtype=np.float32),
+                    np.zeros(0, dtype=np.int64))
+        
+        from datetime import timedelta
+        
+        all_events = []
+        
+        # Lookback events — full features
+        for d in window_dates:
+            date_str = str(d)
+            if date_str in self.econ_by_date:
+                all_events.append((self.econ_by_date[date_str], False))
+        
+        # Forward events — D+1 to D+15 (actual masked)
+        for offset in range(1, 16):
+            fwd_date = anchor_date + timedelta(days=offset)
+            date_str = str(fwd_date)
+            if date_str in self.econ_by_date:
+                all_events.append((self.econ_by_date[date_str], True))
+        
+        if not all_events:
+            return (np.zeros(0, dtype=np.int16),
+                    np.zeros(0, dtype=np.int8),
+                    np.zeros((0, self.econ_num_features), dtype=np.float32),
+                    np.zeros(0, dtype=np.int64))
+        
+        event_ids_list = []
+        currency_ids_list = []
+        numeric_list = []
+        timestamps_list = []
+        
+        for df_slice, is_future in all_events:
+            for _, row in df_slice.iterrows():
+                event_ids_list.append(row['event_id'])
+                currency_ids_list.append(row['currency_id'])
+                timestamps_list.append(row['timestamp'])
+                
+                # Compute days_until relative to anchor date
+                event_date = pd.to_datetime(row['date']).date() if isinstance(row['date'], str) else row['date']
+                days_until = (event_date - anchor_date).days
+                
+                # Build numeric feature vector [13 features]
+                # All fields scaled to roughly [-2, 2] range
+                actual_z = 0.0 if is_future else float(row['actual_z'])
+                has_actual = 0 if is_future else int(row['has_actual'])
+                
+                # Normalize days_until: divide by 15 to get ~[-3, 1] range
+                days_until_norm = float(days_until) / 15.0
+                # Normalize time_of_day: assume 0-24 hours, scale to [0, 1]
+                time_of_day = float(row['time_of_day'])
+                time_of_day_norm = time_of_day / 24.0 if time_of_day > 1.0 else time_of_day
+                # Normalize impact: 0-3 -> 0-1
+                impact_norm = float(row['impact_ord']) / 3.0
+                
+                numeric = np.array([
+                    impact_norm,                         # 0: impact [0, 1]
+                    float(row['is_usd']),               # 1: is_usd [0, 1]
+                    days_until_norm,                     # 2: days_until normalized [~-3, 1]
+                    time_of_day_norm,                    # 3: time_of_day [0, 1]
+                    float(is_future),                    # 4: is_future [0, 1]
+                    actual_z,                            # 5: actual_z (z-scored, masked if future)
+                    float(row['forecast_z']),            # 6: forecast_z (z-scored)
+                    float(row['previous_z']),            # 7: previous_z (z-scored)
+                    float(has_actual),                   # 8: has_actual [0, 1]
+                    float(row['has_forecast']),          # 9: has_forecast [0, 1]
+                    float(row['event_rank_today_norm']), # 10: event_rank_today [0, 1]
+                    float(row['days_since_last_same_norm']),  # 11: days_since_last_same [0, 1]
+                    days_until_norm,                     # 12: days_until normalized (duplicate for backwards compat)
+                ], dtype=np.float32)
+                numeric_list.append(numeric)
+        
+        event_ids = np.array(event_ids_list, dtype=np.int16)
+        currency_ids = np.array(currency_ids_list, dtype=np.int8)
+        numeric_features = np.stack(numeric_list, axis=0)
+        timestamps = np.array(timestamps_list, dtype=np.int64)
+        
+        # Sort by timestamp
+        sort_idx = np.argsort(timestamps)
+        event_ids = event_ids[sort_idx]
+        currency_ids = currency_ids[sort_idx]
+        numeric_features = numeric_features[sort_idx]
+        timestamps = timestamps[sort_idx]
+        
+        return event_ids, currency_ids, numeric_features, timestamps
 
     def _normalize_bars(self, bars: np.ndarray, mask: np.ndarray = None) -> np.ndarray:
         """Z-score normalize bars across the sequence.
@@ -717,8 +1291,8 @@ class BarMambaDataset(Dataset):
         vix_targets = sample['vix_targets']      # [4] multi-horizon targets
         horizon_mask = sample['horizon_mask']    # [4] validity mask
 
-        # Load bars for all lookback days (with timestamps if using news, macro, or gdelt)
-        need_timestamps = self.use_news or self.use_macro or self.use_gdelt
+        # Load bars for all lookback days (with timestamps if using news, macro, gdelt, or econ)
+        need_timestamps = self.use_news or self.use_macro or self.use_gdelt or self.use_econ
         all_bars = []
         all_bar_ts = []
         for d in window_dates:
@@ -759,6 +1333,14 @@ class BarMambaDataset(Dataset):
                 if 'bar_timestamps' not in result:
                     result['bar_timestamps'] = torch.zeros(1, dtype=torch.long)
                 result['macro_context'] = torch.zeros(max(self.macro_dim, 1), dtype=torch.float32)
+            if self.use_econ:
+                if 'bar_timestamps' not in result:
+                    result['bar_timestamps'] = torch.zeros(1, dtype=torch.long)
+                result['econ_event_ids'] = torch.zeros(0, dtype=torch.long)
+                result['econ_currency_ids'] = torch.zeros(0, dtype=torch.long)
+                result['econ_numeric'] = torch.zeros(0, self.econ_num_features)
+                result['econ_timestamps'] = torch.zeros(0, dtype=torch.long)
+                result['num_econ'] = 0
             return result
 
         # Concatenate all days into one sequence
@@ -825,7 +1407,39 @@ class BarMambaDataset(Dataset):
                     macro_vec = self.macro_data.loc[earlier[-1]].values.astype(np.float32)
                 else:
                     macro_vec = np.zeros(self.macro_dim, dtype=np.float32)
+            # Apply global z-score normalization (using training period stats)
+            macro_vec = np.nan_to_num(macro_vec, nan=0.0, posinf=0.0, neginf=0.0)
+            if self.macro_mean is not None and self.macro_std is not None:
+                macro_vec = (macro_vec - self.macro_mean) / self.macro_std
             result['macro_context'] = torch.from_numpy(macro_vec)
+        
+        # Add fundamentals context if enabled (cross-attention state)
+        if self.use_fundamentals and self.fundamentals_data is not None:
+            anchor = sample['anchor_date']
+            if anchor in self.fundamentals_data.index:
+                fund_vec = self.fundamentals_data.loc[anchor].values.astype(np.float32)
+            else:
+                # Find nearest earlier date
+                earlier = self.fundamentals_data.index[self.fundamentals_data.index <= anchor]
+                if len(earlier) > 0:
+                    fund_vec = self.fundamentals_data.loc[earlier[-1]].values.astype(np.float32)
+                else:
+                    fund_vec = np.zeros(self.fundamentals_dim, dtype=np.float32)
+            # Apply global z-score normalization (using training period stats)
+            fund_vec = np.nan_to_num(fund_vec, nan=0.0, posinf=0.0, neginf=0.0)
+            if self.fundamentals_mean is not None and self.fundamentals_std is not None:
+                fund_vec = (fund_vec - self.fundamentals_mean) / self.fundamentals_std
+            result['fundamentals_context'] = torch.from_numpy(fund_vec)
+        
+        # Add econ calendar data if enabled
+        if self.use_econ:
+            anchor = sample['anchor_date']
+            econ_ids, econ_cur, econ_num, econ_ts = self._load_econ_events(window_dates, anchor)
+            result['econ_event_ids'] = torch.from_numpy(econ_ids.astype(np.int64))
+            result['econ_currency_ids'] = torch.from_numpy(econ_cur.astype(np.int64))
+            result['econ_numeric'] = torch.from_numpy(econ_num)
+            result['econ_timestamps'] = torch.from_numpy(econ_ts)
+            result['num_econ'] = len(econ_ids)
         
         # Add option data if enabled
         if self.use_options:
@@ -860,6 +1474,38 @@ class BarMambaDataset(Dataset):
             else:
                 result['options'] = torch.zeros(len(bars), self.num_option_features)
                 result['options_mask'] = torch.zeros(len(bars))
+        
+        # Add VIX features if enabled (with timestamps for checkpoint alignment)
+        # VIX runs extended hours (~540 bars/day) - kept as separate sequence
+        if self.use_vix_features:
+            all_vix_feats = []
+            all_vix_ts = []
+            for d in window_dates:
+                result_vix = self._load_vix_features_with_timestamps(d)
+                if result_vix is not None:
+                    all_vix_feats.append(result_vix[0])
+                    all_vix_ts.append(result_vix[1])
+            
+            if all_vix_feats:
+                vix_feats = np.concatenate(all_vix_feats, axis=0)
+                vix_ts = np.concatenate(all_vix_ts, axis=0)
+                
+                # Create mask: 1 where we have actual VIX data
+                vix_mask = (np.abs(vix_feats).sum(axis=1) > 1e-8).astype(np.float32)
+                
+                # Normalize VIX features
+                if vix_mask.sum() > 0:
+                    vix_feats = self._normalize_bars(vix_feats, mask=vix_mask)
+                
+                result['vix_features'] = torch.from_numpy(vix_feats)
+                result['vix_timestamps'] = torch.from_numpy(vix_ts)
+                result['vix_mask'] = torch.from_numpy(vix_mask)
+                result['num_vix'] = len(vix_feats)
+            else:
+                result['vix_features'] = torch.zeros(0, self.num_vix_features)
+                result['vix_timestamps'] = torch.zeros(0, dtype=torch.long)
+                result['vix_mask'] = torch.zeros(0)
+                result['num_vix'] = 0
 
         return result
 
@@ -970,6 +1616,42 @@ class BarMambaDataset(Dataset):
         if 'macro_context' in batch[0]:
             result['macro_context'] = torch.stack([b['macro_context'] for b in batch])
         
+        # Handle econ calendar data if present
+        if 'econ_event_ids' in batch[0]:
+            max_econ = max(b.get('num_econ', 0) for b in batch) if any(b.get('num_econ', 0) > 0 for b in batch) else 1
+            econ_num_features = batch[0]['econ_numeric'].shape[-1] if batch[0]['econ_numeric'].numel() > 0 else 13
+            
+            econ_event_ids_padded = torch.zeros(B, max_econ, dtype=torch.long)
+            econ_currency_ids_padded = torch.zeros(B, max_econ, dtype=torch.long)
+            econ_numeric_padded = torch.zeros(B, max_econ, econ_num_features)
+            econ_mask = torch.zeros(B, max_econ)
+            econ_ts_padded = torch.zeros(B, max_econ, dtype=torch.long)
+            
+            # Ensure bar_timestamps exists
+            if 'bar_timestamps' not in result:
+                bar_ts_padded = torch.zeros(B, max_len, dtype=torch.long)
+                for i, b in enumerate(batch):
+                    T = b['num_bars']
+                    if 'bar_timestamps' in b and b['bar_timestamps'].numel() > 0:
+                        bar_ts_padded[i, :T] = b['bar_timestamps'][:T]
+                result['bar_timestamps'] = bar_ts_padded
+            
+            for i, b in enumerate(batch):
+                E = b.get('num_econ', 0)
+                if E > 0:
+                    econ_event_ids_padded[i, :E] = b['econ_event_ids']
+                    econ_currency_ids_padded[i, :E] = b['econ_currency_ids']
+                    econ_numeric_padded[i, :E] = b['econ_numeric']
+                    econ_mask[i, :E] = 1.0
+                    econ_ts_padded[i, :E] = b['econ_timestamps']
+            
+            result['econ_event_ids'] = econ_event_ids_padded
+            result['econ_currency_ids'] = econ_currency_ids_padded
+            result['econ_numeric'] = econ_numeric_padded
+            result['econ_mask'] = econ_mask
+            result['econ_timestamps'] = econ_ts_padded
+            result['num_econ'] = [b.get('num_econ', 0) for b in batch]
+        
         # Handle options data if present
         if 'options' in batch[0]:
             num_option_features = batch[0]['options'].shape[-1]
@@ -985,5 +1667,27 @@ class BarMambaDataset(Dataset):
             
             result['options'] = options_padded
             result['options_mask'] = options_mask
+        
+        # Handle VIX features if present (separate sequence with own length)
+        if 'vix_features' in batch[0]:
+            num_vix_features = batch[0]['vix_features'].shape[-1] if batch[0]['vix_features'].numel() > 0 else 21
+            max_vix = max(b.get('num_vix', 0) for b in batch) if any(b.get('num_vix', 0) > 0 for b in batch) else 1
+            
+            vix_padded = torch.zeros(B, max_vix, num_vix_features)
+            vix_mask = torch.zeros(B, max_vix)
+            vix_ts_padded = torch.zeros(B, max_vix, dtype=torch.long)
+            
+            for i, b in enumerate(batch):
+                V = b.get('num_vix', 0)
+                if V > 0 and b['vix_features'].numel() > 0:
+                    vix_padded[i, :V, :] = b['vix_features'][:V]
+                    vix_mask[i, :V] = b['vix_mask'][:V] if 'vix_mask' in b else 1.0
+                    if 'vix_timestamps' in b and b['vix_timestamps'].numel() > 0:
+                        vix_ts_padded[i, :V] = b['vix_timestamps'][:V]
+            
+            result['vix_features'] = vix_padded
+            result['vix_mask'] = vix_mask
+            result['vix_timestamps'] = vix_ts_padded
+            result['num_vix'] = [b.get('num_vix', 0) for b in batch]
 
         return result
