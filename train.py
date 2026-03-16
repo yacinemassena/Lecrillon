@@ -257,8 +257,12 @@ def load_checkpoint(checkpoint_dir, model, optimizer, scaler, device, is_distrib
 # ---------------------------------------------------------------------------
 def get_data_paths() -> Dict[str, Path]:
     """Detect data paths for WSL, Windows, or Linux VPS."""
-    if os.path.exists('/workspace/datasets'):
-        # Linux VPS (Docker)
+    # Check relative path first (inside repo)
+    script_dir = Path(__file__).parent
+    if (script_dir / 'datasets').exists():
+        base = script_dir / 'datasets'
+    elif os.path.exists('/workspace/datasets'):
+        # Linux VPS (Docker) - standalone datasets folder
         base = Path('/workspace/datasets')
     elif os.path.exists('/mnt/d/Mamba v2/datasets'):
         # WSL
