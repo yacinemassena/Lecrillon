@@ -13,7 +13,7 @@ class TrainConfig:
     
     # Training settings
     epochs: int = 50                # Number of training epochs
-    train_steps: int = 0            # Steps per epoch (0 = full epoch)
+    train_steps: int = 15000        # Steps per epoch
     val_steps: int = 0              # Validation steps (0 = full validation)
     batch_size: int = 16            # Batch size (16 good for RTX 5080)
     num_workers: int = 4            # DataLoader workers (4 for VPS with 117GB RAM)
