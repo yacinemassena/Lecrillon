@@ -338,63 +338,6 @@ def check_data_overlap(paths: Dict[str, Path]) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Synthetic Dataset (fallback)
-# ---------------------------------------------------------------------------
-class SyntheticBarDataset(Dataset):
-    """Generate synthetic bar data for smoke testing when real data unavailable."""
-
-    def __init__(self, num_samples: int = 50, seq_len: int = 2000, num_features: int = None):
-        self.num_samples = num_samples
-        self.seq_len = seq_len
-        self.num_features = num_features
-
-    def __len__(self):
-        return self.num_samples
-
-    def __getitem__(self, idx):
-        bars = np.random.randn(self.seq_len, self.num_features).astype(np.float32)
-        # Synthetic VIX change target: loosely correlated with bar volatility
-        vol = np.std(bars[:, 0])  # std of "close" feature
-        vix_change = (vol - 1.0) * 2.0 + np.random.randn() * 0.5  # centered near 0
-        # Multi-horizon targets: [+1d, +7d, +15d, +30d]
-        vix_targets = [vix_change, vix_change * 1.5, vix_change * 2.0, vix_change * 2.5]
-        return {
-            'bars': torch.from_numpy(bars),
-            'vix_targets': torch.tensor(vix_targets, dtype=torch.float32),
-            'horizon_mask': torch.ones(4, dtype=torch.float32),
-            'num_bars': self.seq_len,
-            'anchor_date': '2005-01-01',
-        }
-
-    @staticmethod
-    def collate_fn(batch):
-        """Same collate as BarMambaDataset."""
-        if not batch:
-            return {}
-        max_len = max(b['num_bars'] for b in batch)
-        num_features = batch[0]['bars'].shape[1]
-        B = len(batch)
-
-        bars_padded = torch.zeros(B, max_len, num_features)
-        bar_mask = torch.zeros(B, max_len)
-        vix_targets = torch.stack([b['vix_targets'] for b in batch])  # [B, 4]
-        horizon_mask = torch.stack([b['horizon_mask'] for b in batch])  # [B, 4]
-
-        for i, b in enumerate(batch):
-            T = b['num_bars']
-            bars_padded[i, :T, :] = b['bars']
-            bar_mask[i, :T] = 1.0
-
-        return {
-            'bars': bars_padded,
-            'bar_mask': bar_mask,
-            'vix_targets': vix_targets,
-            'horizon_mask': horizon_mask,
-            'num_bars': [b['num_bars'] for b in batch],
-        }
-
-
-# ---------------------------------------------------------------------------
 # Reproducibility
 # ---------------------------------------------------------------------------
 def seed_everything(seed: int = 42):
@@ -1075,10 +1018,6 @@ def run_validation_checks(
 def main():
     parser = argparse.ArgumentParser(description='Mamba-Only VIX Prediction Training')
     # All defaults come from trainconfig.py - edit that file to change defaults
-    parser.add_argument('--synthetic', action='store_true', default=cfg.force_synthetic,
-                        help='Force synthetic data')
-    parser.add_argument('--real', action='store_true', default=cfg.force_real,
-                        help='Force real data (fail if unavailable)')
     parser.add_argument('--train-steps', type=int, default=cfg.train_steps,
                         help='Training steps per epoch (0 = full epoch)')
     parser.add_argument('--val-steps', type=int, default=cfg.val_steps,
@@ -1215,278 +1154,252 @@ def main():
     elif is_main:
         dashboard.log(f"[yellow]🖥️ Device:[/] CPU")
 
-    # Data source selection
-    use_synthetic = args.synthetic
+    # Data paths - fail fast if not available
     data_paths = get_data_paths()
-
-    if not use_synthetic and not args.real:
-        # Auto-detect
-        if data_paths:
-            if is_main:
-                dashboard.log("[dim]Checking data availability...[/]")
-            try:
-                has_overlap = check_data_overlap(data_paths)
-                if not has_overlap:
-                    if is_main:
-                        dashboard.log("[yellow]No stock-VIX overlap → synthetic data[/]")
-                    use_synthetic = True
-                else:
-                    if is_main:
-                        dashboard.log("[green]✓ Real data available[/]")
-            except Exception as e:
-                if is_main:
-                    dashboard.log(f"[yellow]Data check failed: {e} → synthetic[/]")
-                use_synthetic = True
-        else:
-            if is_main:
-                dashboard.log("[yellow]No data directory → synthetic data[/]")
-            use_synthetic = True
-
-    if args.real and use_synthetic:
-        logger.error("--real requested but no usable data found")
+    
+    if not data_paths:
+        logger.error("No data directory found. Set up datasets/ or specify paths.")
+        sys.exit(1)
+    
+    if is_main:
+        dashboard.log("[dim]Checking data availability...[/]")
+    
+    try:
+        has_overlap = check_data_overlap(data_paths)
+        if not has_overlap:
+            logger.error("No stock-VIX overlap found. Check your data paths.")
+            sys.exit(1)
+        if is_main:
+            dashboard.log("[green]✓ Real data available[/]")
+    except Exception as e:
+        logger.error(f"Data check failed: {e}")
         sys.exit(1)
 
     # Build datasets
-    from loader.bar_mamba_dataset import NUM_STOCK_FEATURES
+    from loader.bar_mamba_dataset import NUM_STOCK_FEATURES, BarMambaDataset
     train_sampler = None
     val_sampler = None
+
+    stock_path = str(data_paths['stock'])
+    vix_path = str(data_paths['vix'])
     
-    if use_synthetic:
-        if is_main:
-            dashboard.log(f"[yellow]Using SYNTHETIC data[/] (seq_len={args.seq_len})")
-        train_dataset = SyntheticBarDataset(
-            num_samples=50 * world_size, seq_len=args.seq_len, num_features=NUM_STOCK_FEATURES
-        )
-        val_dataset = SyntheticBarDataset(
-            num_samples=20 * world_size, seq_len=args.seq_len, num_features=NUM_STOCK_FEATURES
-        )
-        num_features = NUM_STOCK_FEATURES
-        collate_fn = SyntheticBarDataset.collate_fn
+    # News path: use provided path or default
+    # Note: data loader looks for news_daily/ subdirectory internally
+    news_path = args.news_path
+    if args.use_news and news_path is None:
+        # Try default paths (point to benzinga_embeddings parent dir)
+        for candidate in [
+            data_paths.get('stock', Path('.')).parent / 'benzinga_embeddings',
+            Path('datasets/benzinga_embeddings'),
+        ]:
+            if candidate.exists():
+                news_path = str(candidate)
+                break
+    
+    # Options path: use provided path or default (2-min data)
+    options_path = args.options_path
+    if args.use_options and options_path is None:
+        # Try auto-detected path first, then fallback candidates
+        auto_path = data_paths.get('options')
+        if auto_path and auto_path.exists():
+            options_path = str(auto_path)
     else:
-        if is_main:
-            dashboard.log("[green]Using REAL data[/]")
-        from loader.bar_mamba_dataset import BarMambaDataset
+        for candidate in [
+            data_paths.get('stock', Path('.')).parent / 'opt_trade_2min',
+            Path('datasets/opt_trade_2min'),
+        ]:
+            if candidate.exists():
+                options_path = str(candidate)
+                break
+    
+    if is_main:
+        if args.use_news:
+            if news_path:
+                dashboard.log(f"[bold cyan]📰 News:[/] {news_path}")
+                logger.info(f"News integration ENABLED: {news_path}")
+            else:
+                dashboard.log("[yellow]⚠️ News enabled but no news path found[/]")
+                logger.warning("News enabled but no path found")
+        else:
+            dashboard.log("[dim]📰 News: disabled (baseline mode)[/]")
+            logger.info("News integration DISABLED (baseline A/B mode)")
+        
+        if args.use_options:
+            if options_path:
+                dashboard.log(f"[bold cyan]📊 Options:[/] {options_path}")
+                logger.info(f"Options integration ENABLED: {options_path}")
+            else:
+                dashboard.log("[yellow]⚠️ Options enabled but no path found[/]")
+                logger.warning("Options enabled but no path found")
+        else:
+            dashboard.log("[dim]📊 Options: disabled (baseline mode)[/]")
+            logger.info("Options integration DISABLED (baseline A/B mode)")
+    
+    # Macro path: use provided path or default
+    # Priority: enhanced macro (with FED/cross-asset) > standard macro
+    macro_path = args.macro_path
+    if args.use_macro and macro_path is None:
+        for candidate in [
+            # Enhanced macro with FED yields, rates, credit spreads
+            data_paths.get('stock', Path('.')).parent / 'MACRO' / 'macro_daily_enhanced.parquet',
+            Path('datasets/MACRO/macro_daily_enhanced.parquet'),
+            # Standard macro (sector fundamentals only)
+            data_paths.get('stock', Path('.')).parent / 'MACRO' / 'macro_daily.parquet',
+            Path('datasets/MACRO/macro_daily.parquet'),
+            # Legacy paths
+            data_paths.get('stock', Path('.')).parent / 'macro' / 'macro_daily.parquet',
+            Path('datasets/macro/macro_daily.parquet'),
+        ]:
+            if candidate.exists():
+                macro_path = str(candidate)
+                break
+    
+    if is_main:
+        if args.use_macro:
+            if macro_path:
+                dashboard.log(f"[bold cyan]🏦 Macro FiLM:[/] {macro_path}")
+                logger.info(f"Macro FiLM ENABLED: {macro_path}")
+            else:
+                dashboard.log("[yellow]⚠️ Macro enabled but no macro_daily.parquet found[/]")
+                logger.warning("Macro enabled but no path found")
+        else:
+            dashboard.log("[dim]🏦 Macro: disabled (baseline mode)[/]")
+    
+    # GDELT path: use provided path or default
+    gdelt_path = args.gdelt_path
+    if args.use_gdelt and gdelt_path is None:
+        for candidate in [
+            data_paths.get('stock', Path('.')).parent / 'GDELT',
+            Path('datasets/GDELT'),
+        ]:
+            if candidate.exists():
+                gdelt_path = str(candidate)
+                break
+    
+    if is_main:
+        if args.use_gdelt:
+            if gdelt_path:
+                dashboard.log(f"[bold cyan]🌍 GDELT:[/] {gdelt_path}")
+                logger.info(f"GDELT world state ENABLED: {gdelt_path}")
+            else:
+                dashboard.log("[yellow]⚠️ GDELT enabled but no GDELT path found[/]")
+                logger.warning("GDELT enabled but no path found")
+        else:
+            dashboard.log("[dim]🌍 GDELT: disabled (baseline mode)[/]")
+    
+    # Econ calendar path: use provided path or default
+    econ_path = args.econ_path
+    if args.use_econ and econ_path is None:
+        for candidate in [
+            data_paths.get('stock', Path('.')).parent / 'econ_calendar',
+            Path('datasets/econ_calendar'),
+        ]:
+            if candidate.exists():
+                econ_path = str(candidate)
+                break
+    
+    if is_main:
+        if args.use_econ:
+            if econ_path:
+                dashboard.log(f"[bold cyan]📅 Econ Calendar:[/] {econ_path}")
+                logger.info(f"Econ calendar ENABLED: {econ_path}")
+            else:
+                dashboard.log("[yellow]⚠️ Econ enabled but no econ_calendar path found[/]")
+                logger.warning("Econ enabled but no path found")
+        else:
+            dashboard.log("[dim]📅 Econ: disabled (baseline mode)[/]")
+    
+    # Fundamentals path: use provided path or default
+    fundamentals_path = args.fundamentals_path
+    if args.use_fundamentals and fundamentals_path is None:
+        for candidate in [
+            data_paths.get('stock', Path('.')).parent / 'fundamentals' / 'fundamentals_state.parquet',
+            Path('datasets/fundamentals/fundamentals_state.parquet'),
+        ]:
+            if candidate.exists():
+                fundamentals_path = str(candidate)
+                break
+    
+    # VIX features path: use provided path or default
+    vix_features_path = args.vix_features_path
+    if args.use_vix_features and vix_features_path is None:
+        for candidate in [
+            data_paths.get('stock', Path('.')).parent / 'VIX' / 'Vix_features',
+            Path('datasets/VIX/Vix_features'),
+        ]:
+            if candidate.exists():
+                vix_features_path = str(candidate)
+                break
+    
+    if is_main:
+        if args.use_fundamentals:
+            if fundamentals_path:
+                dashboard.log(f"[bold cyan]📊 Fundamentals:[/] {fundamentals_path}")
+                logger.info(f"Fundamentals cross-attention ENABLED: {fundamentals_path}")
+            else:
+                dashboard.log("[yellow]⚠️ Fundamentals enabled but no fundamentals_state.parquet found[/]")
+                logger.warning("Fundamentals enabled but no path found")
+        else:
+            dashboard.log("[dim]📊 Fundamentals: disabled (baseline mode)[/]")
+        
+        if args.use_vix_features:
+            if vix_features_path:
+                dashboard.log(f"[bold cyan]📈 VIX Mamba:[/] {vix_features_path} (d={args.vix_d_model}, {args.vix_n_layers}L)")
+                logger.info(f"VIX Mamba ENABLED: {vix_features_path}, d_model={args.vix_d_model}, d_state={args.vix_d_state}, {args.vix_n_layers} layers")
+            else:
+                dashboard.log("[yellow]⚠️ VIX features enabled but no Vix_features dir found[/]")
+                logger.warning("VIX features enabled but no path found")
+        else:
+            dashboard.log("[dim]📈 VIX Mamba: disabled (baseline mode)[/]")
 
-        stock_path = str(data_paths['stock'])
-        vix_path = str(data_paths['vix'])
-        
-        # News path: use provided path or default
-        # Note: data loader looks for news_daily/ subdirectory internally
-        news_path = args.news_path
-        if args.use_news and news_path is None:
-            # Try default paths (point to benzinga_embeddings parent dir)
-            for candidate in [
-                data_paths.get('stock', Path('.')).parent / 'benzinga_embeddings',
-                Path('datasets/benzinga_embeddings'),
-            ]:
-                if candidate.exists():
-                    news_path = str(candidate)
-                    break
-        
-        # Options path: use provided path or default (2-min data)
-        options_path = args.options_path
-        if args.use_options and options_path is None:
-            # Try auto-detected path first, then fallback candidates
-            auto_path = data_paths.get('options')
-            if auto_path and auto_path.exists():
-                options_path = str(auto_path)
-            else:
-                for candidate in [
-                    data_paths.get('stock', Path('.')).parent / 'opt_trade_2min',
-                    Path('datasets/opt_trade_2min'),
-                ]:
-                    if candidate.exists():
-                        options_path = str(candidate)
-                        break
-        
-        if is_main:
-            if args.use_news:
-                if news_path:
-                    dashboard.log(f"[bold cyan]📰 News:[/] {news_path}")
-                    logger.info(f"News integration ENABLED: {news_path}")
-                else:
-                    dashboard.log("[yellow]⚠️ News enabled but no news path found[/]")
-                    logger.warning("News enabled but no path found")
-            else:
-                dashboard.log("[dim]📰 News: disabled (baseline mode)[/]")
-                logger.info("News integration DISABLED (baseline A/B mode)")
-            
-            if args.use_options:
-                if options_path:
-                    dashboard.log(f"[bold cyan]📊 Options:[/] {options_path}")
-                    logger.info(f"Options integration ENABLED: {options_path}")
-                else:
-                    dashboard.log("[yellow]⚠️ Options enabled but no path found[/]")
-                    logger.warning("Options enabled but no path found")
-            else:
-                dashboard.log("[dim]📊 Options: disabled (baseline mode)[/]")
-                logger.info("Options integration DISABLED (baseline A/B mode)")
-        
-        # Macro path: use provided path or default
-        # Priority: enhanced macro (with FED/cross-asset) > standard macro
-        macro_path = args.macro_path
-        if args.use_macro and macro_path is None:
-            for candidate in [
-                # Enhanced macro with FED yields, rates, credit spreads
-                data_paths.get('stock', Path('.')).parent / 'MACRO' / 'macro_daily_enhanced.parquet',
-                Path('datasets/MACRO/macro_daily_enhanced.parquet'),
-                # Standard macro (sector fundamentals only)
-                data_paths.get('stock', Path('.')).parent / 'MACRO' / 'macro_daily.parquet',
-                Path('datasets/MACRO/macro_daily.parquet'),
-                # Legacy paths
-                data_paths.get('stock', Path('.')).parent / 'macro' / 'macro_daily.parquet',
-                Path('datasets/macro/macro_daily.parquet'),
-            ]:
-                if candidate.exists():
-                    macro_path = str(candidate)
-                    break
-        
-        if is_main:
-            if args.use_macro:
-                if macro_path:
-                    dashboard.log(f"[bold cyan]🏦 Macro FiLM:[/] {macro_path}")
-                    logger.info(f"Macro FiLM ENABLED: {macro_path}")
-                else:
-                    dashboard.log("[yellow]⚠️ Macro enabled but no macro_daily.parquet found[/]")
-                    logger.warning("Macro enabled but no path found")
-            else:
-                dashboard.log("[dim]🏦 Macro: disabled (baseline mode)[/]")
-        
-        # GDELT path: use provided path or default
-        gdelt_path = args.gdelt_path
-        if args.use_gdelt and gdelt_path is None:
-            for candidate in [
-                data_paths.get('stock', Path('.')).parent / 'GDELT',
-                Path('datasets/GDELT'),
-            ]:
-                if candidate.exists():
-                    gdelt_path = str(candidate)
-                    break
-        
-        if is_main:
-            if args.use_gdelt:
-                if gdelt_path:
-                    dashboard.log(f"[bold cyan]🌍 GDELT:[/] {gdelt_path}")
-                    logger.info(f"GDELT world state ENABLED: {gdelt_path}")
-                else:
-                    dashboard.log("[yellow]⚠️ GDELT enabled but no GDELT path found[/]")
-                    logger.warning("GDELT enabled but no path found")
-            else:
-                dashboard.log("[dim]🌍 GDELT: disabled (baseline mode)[/]")
-        
-        # Econ calendar path: use provided path or default
-        econ_path = args.econ_path
-        if args.use_econ and econ_path is None:
-            for candidate in [
-                data_paths.get('stock', Path('.')).parent / 'econ_calendar',
-                Path('datasets/econ_calendar'),
-            ]:
-                if candidate.exists():
-                    econ_path = str(candidate)
-                    break
-        
-        if is_main:
-            if args.use_econ:
-                if econ_path:
-                    dashboard.log(f"[bold cyan]📅 Econ Calendar:[/] {econ_path}")
-                    logger.info(f"Econ calendar ENABLED: {econ_path}")
-                else:
-                    dashboard.log("[yellow]⚠️ Econ enabled but no econ_calendar path found[/]")
-                    logger.warning("Econ enabled but no path found")
-            else:
-                dashboard.log("[dim]📅 Econ: disabled (baseline mode)[/]")
-        
-        # Fundamentals path: use provided path or default
-        fundamentals_path = args.fundamentals_path
-        if args.use_fundamentals and fundamentals_path is None:
-            for candidate in [
-                data_paths.get('stock', Path('.')).parent / 'fundamentals' / 'fundamentals_state.parquet',
-                Path('datasets/fundamentals/fundamentals_state.parquet'),
-            ]:
-                if candidate.exists():
-                    fundamentals_path = str(candidate)
-                    break
-        
-        # VIX features path: use provided path or default
-        vix_features_path = args.vix_features_path
-        if args.use_vix_features and vix_features_path is None:
-            for candidate in [
-                data_paths.get('stock', Path('.')).parent / 'VIX' / 'Vix_features',
-                Path('datasets/VIX/Vix_features'),
-            ]:
-                if candidate.exists():
-                    vix_features_path = str(candidate)
-                    break
-        
-        if is_main:
-            if args.use_fundamentals:
-                if fundamentals_path:
-                    dashboard.log(f"[bold cyan]📊 Fundamentals:[/] {fundamentals_path}")
-                    logger.info(f"Fundamentals cross-attention ENABLED: {fundamentals_path}")
-                else:
-                    dashboard.log("[yellow]⚠️ Fundamentals enabled but no fundamentals_state.parquet found[/]")
-                    logger.warning("Fundamentals enabled but no path found")
-            else:
-                dashboard.log("[dim]📊 Fundamentals: disabled (baseline mode)[/]")
-            
-            if args.use_vix_features:
-                if vix_features_path:
-                    dashboard.log(f"[bold cyan]📈 VIX Mamba:[/] {vix_features_path} (d={args.vix_d_model}, {args.vix_n_layers}L)")
-                    logger.info(f"VIX Mamba ENABLED: {vix_features_path}, d_model={args.vix_d_model}, d_state={args.vix_d_state}, {args.vix_n_layers} layers")
-                else:
-                    dashboard.log("[yellow]⚠️ VIX features enabled but no Vix_features dir found[/]")
-                    logger.warning("VIX features enabled but no path found")
-            else:
-                dashboard.log("[dim]📈 VIX Mamba: disabled (baseline mode)[/]")
-
-        train_dataset = BarMambaDataset(
-            stock_data_path=stock_path,
-            vix_data_path=vix_path,
-            split='train',
-            max_total_bars=args.seq_len,
-            train_start=args.train_start,
-            train_end=args.train_end,
-            val_end=args.val_end,
-            news_data_path=news_path,
-            use_news=args.use_news,
-            options_data_path=options_path,
-            use_options=args.use_options,
-            macro_data_path=macro_path,
-            use_macro=args.use_macro,
-            gdelt_data_path=gdelt_path,
-            use_gdelt=args.use_gdelt,
-            econ_calendar_path=econ_path,
-            use_econ=args.use_econ,
-            fundamentals_data_path=fundamentals_path,
-            use_fundamentals=args.use_fundamentals,
-            vix_features_path=vix_features_path,
-            use_vix_features=args.use_vix_features,
-        )
-        val_dataset = BarMambaDataset(
-            stock_data_path=stock_path,
-            vix_data_path=vix_path,
-            split='val',
-            max_total_bars=args.seq_len,
-            train_start=args.train_start,
-            train_end=args.train_end,
-            val_end=args.val_end,
-            news_data_path=news_path,
-            use_news=args.use_news,
-            options_data_path=options_path,
-            use_options=args.use_options,
-            macro_data_path=macro_path,
-            use_macro=args.use_macro,
-            gdelt_data_path=gdelt_path,
-            use_gdelt=args.use_gdelt,
-            econ_calendar_path=econ_path,
-            use_econ=args.use_econ,
-            fundamentals_data_path=fundamentals_path,
-            use_fundamentals=args.use_fundamentals,
-            vix_features_path=vix_features_path,
-            use_vix_features=args.use_vix_features,
-        )
-        num_features = train_dataset.num_features
-        collate_fn = BarMambaDataset.collate_fn
+    train_dataset = BarMambaDataset(
+        stock_data_path=stock_path,
+        vix_data_path=vix_path,
+        split='train',
+        max_total_bars=args.seq_len,
+        train_start=args.train_start,
+        train_end=args.train_end,
+        val_end=args.val_end,
+        news_data_path=news_path,
+        use_news=args.use_news,
+        options_data_path=options_path,
+        use_options=args.use_options,
+        macro_data_path=macro_path,
+        use_macro=args.use_macro,
+        gdelt_data_path=gdelt_path,
+        use_gdelt=args.use_gdelt,
+        econ_calendar_path=econ_path,
+        use_econ=args.use_econ,
+        fundamentals_data_path=fundamentals_path,
+        use_fundamentals=args.use_fundamentals,
+        vix_features_path=vix_features_path,
+        use_vix_features=args.use_vix_features,
+    )
+    val_dataset = BarMambaDataset(
+        stock_data_path=stock_path,
+        vix_data_path=vix_path,
+        split='val',
+        max_total_bars=args.seq_len,
+        train_start=args.train_start,
+        train_end=args.train_end,
+        val_end=args.val_end,
+        news_data_path=news_path,
+        use_news=args.use_news,
+        options_data_path=options_path,
+        use_options=args.use_options,
+        macro_data_path=macro_path,
+        use_macro=args.use_macro,
+        gdelt_data_path=gdelt_path,
+        use_gdelt=args.use_gdelt,
+        econ_calendar_path=econ_path,
+        use_econ=args.use_econ,
+        fundamentals_data_path=fundamentals_path,
+        use_fundamentals=args.use_fundamentals,
+        vix_features_path=vix_features_path,
+        use_vix_features=args.use_vix_features,
+    )
+    num_features = train_dataset.num_features
+    collate_fn = BarMambaDataset.collate_fn
 
     # Map-style dataset now supports native shuffling
     # For distributed training, could add DistributedSampler here

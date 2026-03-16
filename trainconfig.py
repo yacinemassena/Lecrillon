@@ -35,10 +35,6 @@ class TrainConfig:
     vix_d_model: int = 64           # Smaller d_model for VIX (21 features vs stock's 45)
     vix_d_state: int = 16           # Smaller state for VIX
     
-    # Data source
-    force_synthetic: bool = False   # Force synthetic data
-    force_real: bool = False        # Force real data (fail if unavailable)
-    
     # Learning rate (1e-4 for multimodal training with news/options injection)
     lr: float = 1e-4
     
