@@ -356,9 +356,12 @@ class SyntheticBarDataset(Dataset):
         # Synthetic VIX change target: loosely correlated with bar volatility
         vol = np.std(bars[:, 0])  # std of "close" feature
         vix_change = (vol - 1.0) * 2.0 + np.random.randn() * 0.5  # centered near 0
+        # Multi-horizon targets: [+1d, +7d, +15d, +30d]
+        vix_targets = [vix_change, vix_change * 1.5, vix_change * 2.0, vix_change * 2.5]
         return {
             'bars': torch.from_numpy(bars),
-            'vix_target': torch.tensor(vix_change, dtype=torch.float32),
+            'vix_targets': torch.tensor(vix_targets, dtype=torch.float32),
+            'horizon_mask': torch.ones(4, dtype=torch.float32),
             'num_bars': self.seq_len,
             'anchor_date': '2005-01-01',
         }
@@ -374,18 +377,19 @@ class SyntheticBarDataset(Dataset):
 
         bars_padded = torch.zeros(B, max_len, num_features)
         bar_mask = torch.zeros(B, max_len)
-        targets = torch.zeros(B)
+        vix_targets = torch.stack([b['vix_targets'] for b in batch])  # [B, 4]
+        horizon_mask = torch.stack([b['horizon_mask'] for b in batch])  # [B, 4]
 
         for i, b in enumerate(batch):
             T = b['num_bars']
             bars_padded[i, :T, :] = b['bars']
             bar_mask[i, :T] = 1.0
-            targets[i] = b['vix_target']
 
         return {
             'bars': bars_padded,
             'bar_mask': bar_mask,
-            'vix_target': targets,
+            'vix_targets': vix_targets,
+            'horizon_mask': horizon_mask,
             'num_bars': [b['num_bars'] for b in batch],
         }
 
