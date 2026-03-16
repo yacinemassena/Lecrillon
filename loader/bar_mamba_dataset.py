@@ -1344,6 +1344,16 @@ class BarMambaDataset(Dataset):
                 result['econ_numeric'] = torch.zeros(0, self.econ_num_features)
                 result['econ_timestamps'] = torch.zeros(0, dtype=torch.long)
                 result['num_econ'] = 0
+            if self.use_options:
+                result['options'] = torch.zeros(1, self.num_option_features)
+                result['options_mask'] = torch.zeros(1)
+            if self.use_vix_features:
+                result['vix_features'] = torch.zeros(0, self.num_vix_features)
+                result['vix_timestamps'] = torch.zeros(0, dtype=torch.long)
+                result['vix_mask'] = torch.zeros(0)
+                result['num_vix'] = 0
+            if self.use_fundamentals:
+                result['fundamentals_context'] = torch.zeros(max(self.fundamentals_dim, 1), dtype=torch.float32)
             return result
 
         # Concatenate all days into one sequence
