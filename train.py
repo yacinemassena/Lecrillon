@@ -482,6 +482,11 @@ def train_steps(model, loader, optimizer, criterion, scaler, device, num_steps,
                 loss = loss + 0.3 * options_loss
                 stream_losses['options'] = options_loss.item()
             
+            if 'vix_aux_pred' in outputs:
+                vix_aux_loss = F.huber_loss(outputs['vix_aux_pred'], target_1d, delta=0.25)
+                loss = loss + 0.3 * vix_aux_loss
+                stream_losses['vix'] = vix_aux_loss.item()
+            
             loss = loss / grad_accum
         torch.cuda.synchronize()
         t_fwd = time.time() - t_fwd_start
@@ -524,6 +529,8 @@ def train_steps(model, loader, optimizer, criterion, scaler, device, num_steps,
             loss_parts.append(f"[yellow]N:{stream_losses['news']:.3f}[/]")
         if 'options' in stream_losses:
             loss_parts.append(f"[magenta]O:{stream_losses['options']:.3f}[/]")
+        if 'vix' in stream_losses:
+            loss_parts.append(f"[blue]V:{stream_losses['vix']:.3f}[/]")
         loss_parts.append(f"[green]C:{stream_losses['combined']:.3f}[/]")
         
         stream_display = " ".join(loss_parts) if loss_parts else f"loss={step_loss:.4f}"
@@ -534,6 +541,18 @@ def train_steps(model, loader, optimizer, criterion, scaler, device, num_steps,
             f"fwd={t_fwd:.2f}s bwd={t_bwd:.2f}s | "
             f"[dim]{t_total:.2f}s/it[/] | VRAM={mem_reserved:.1f}GB | {timestamp}"
         )
+
+        # Log to file every 15 steps + last step
+        is_last = (num_steps > 0 and step + 1 == num_steps)
+        if (step + 1) % 15 == 0 or is_last:
+            avg_loss = total_loss / num_batches
+            sl = " ".join(f"{k}={v:.3f}" for k, v in stream_losses.items())
+            logger.info(
+                f"Epoch {epoch} step {step + 1}{f'/{num_steps}' if num_steps > 0 else ''}: "
+                f"{sl} avg={avg_loss:.4f} | "
+                f"fwd={t_fwd:.2f}s bwd={t_bwd:.2f}s total={t_total:.2f}s/it | "
+                f"VRAM={mem_reserved:.1f}GB"
+            )
 
     epoch_time = time.time() - epoch_start_time
     avg_iter_time = epoch_time / max(num_batches, 1)
@@ -729,12 +748,16 @@ def run_real_data_preflight(
     t0 = time.time()
     try:
         s0 = train_dataset[0]
+        t_s0 = time.time() - t0
         s1 = train_dataset[len(train_dataset) // 2]
+        t_load = time.time() - t0
         batch = collate_fn([s0, s1])
-        dashboard.log(f"  [[green]✓[/]] Loaded 2 samples in {time.time()-t0:.1f}s "
+        per_sample = t_load / 2
+        dashboard.log(f"  [[green]✓[/]] Loaded 2 samples in {t_load:.1f}s "
                       f"(bars={batch['bars'].shape}, targets={batch['vix_targets'].shape})")
         ok += 1
     except Exception as e:
+        per_sample = 0
         dashboard.log(f"  [[red]✗[/]] Dataset load failed: {e}")
         dashboard.log(f"\n[bold]Real-data preflight: {ok}/{total} passed[/]")
         return False
@@ -812,7 +835,7 @@ def run_real_data_preflight(
     
     dashboard.log(f"\n[bold]Real-data preflight: {ok}/{total} passed[/]")
     logger.info(f"Real-data preflight: {ok}/{total} passed")
-    return ok == total
+    return ok == total, per_sample
 
 
 # ---------------------------------------------------------------------------
@@ -833,11 +856,12 @@ def main():
     parser.add_argument('--news-n-layers', type=int, default=cfg.news_n_layers,
                         help='Number of Mamba layers for news stream (default: 2)')
     parser.add_argument('--d-state', type=int, default=cfg.d_state)
-    # No caching - direct file loading
+    parser.add_argument('--io-threads', type=int, default=0,
+                        help='I/O threads for parallel file loading (0 = auto: cpu_count-1)')
+    parser.add_argument('--preprocessed-path', type=str, default=None,
+                        help='Path to preprocessed memmaps (auto-detected from datasets/preprocessed)')
     parser.add_argument('--batch-size', type=int, default=cfg.batch_size,
                         help='Batch size for training')
-    parser.add_argument('--num-workers', type=int, default=cfg.num_workers,
-                        help='DataLoader workers for parallel data loading')
     parser.add_argument('--train-start', type=str, default='2005-01-01',
                         help='Start date for training data (YYYY-MM-DD, default: 2005-01-01)')
     parser.add_argument('--train-end', type=str, default=cfg.train_end,
@@ -935,13 +959,21 @@ def main():
         LOG_FILE = setup_logging()
         logger.info(f"Training started - logs saved to {LOG_FILE}")
 
+    # Configure I/O thread pool for parallel file loading
+    from loader.bar_mamba_dataset import set_io_threads, _IO_THREADS
+    if args.io_threads > 0:
+        set_io_threads(args.io_threads)
+        io_label = f"{args.io_threads} (manual)"
+    else:
+        io_label = f"{_IO_THREADS} (auto)"
+
     # Start dashboard (only on main process)
     if is_main:
         dashboard.start()
         dashboard.log(f"[dim]📝 Logs: {LOG_FILE}[/]")
-        dashboard.log(f"[bold cyan]📦 Config:[/] Batch: {args.batch_size} | Workers: {args.num_workers}")
+        dashboard.log(f"[bold cyan]📦 Config:[/] Batch: {args.batch_size} | IO threads: {io_label}")
         dashboard.log(f"[bold cyan]📊 Config:[/] Seq={args.seq_len:,} | Epochs={args.epochs}")
-        logger.info(f"Config: batch={args.batch_size}, workers={args.num_workers}, seq_len={args.seq_len}, epochs={args.epochs}, lr={args.lr}, use_news={args.use_news}, use_options={args.use_options}")
+        logger.info(f"Config: batch={args.batch_size}, seq_len={args.seq_len}, epochs={args.epochs}, lr={args.lr}, use_news={args.use_news}, use_options={args.use_options}")
         if is_distributed:
             dashboard.log(f"[bold magenta]🚀 Distributed:[/] {world_size} GPUs")
         dashboard.state.total_epochs = args.epochs
@@ -1162,6 +1194,24 @@ def main():
         else:
             dashboard.log("[dim]📈 VIX Mamba: disabled (baseline mode)[/]")
 
+    # Auto-detect preprocessed memmaps
+    pp_path = args.preprocessed_path
+    if pp_path is None:
+        # Auto-detect from datasets/preprocessed
+        for candidate in [
+            data_paths.get('stock', Path('.')).parent / 'preprocessed',
+            Path('datasets/preprocessed'),
+        ]:
+            if (candidate / 'stock_index.json').exists():
+                pp_path = str(candidate)
+                break
+    if is_main:
+        if pp_path:
+            dashboard.log(f"[bold green]⚡ Memmap mode:[/] {pp_path}")
+            logger.info(f"Preprocessed memmaps: {pp_path}")
+        else:
+            dashboard.log("[dim]⚡ Memmap: not found (using parquet loading)[/]")
+
     train_dataset = BarMambaDataset(
         stock_data_path=stock_path,
         vix_data_path=vix_path,
@@ -1184,6 +1234,7 @@ def main():
         use_fundamentals=args.use_fundamentals,
         vix_features_path=vix_features_path,
         use_vix_features=args.use_vix_features,
+        preprocessed_path=pp_path,
     )
     val_dataset = BarMambaDataset(
         stock_data_path=stock_path,
@@ -1208,6 +1259,7 @@ def main():
         vix_features_path=vix_features_path,
         use_vix_features=args.use_vix_features,
         shared_state=train_dataset.get_shared_state(),
+        preprocessed_path=pp_path,
     )
     num_features = train_dataset.num_features
     collate_fn = BarMambaDataset.collate_fn
@@ -1352,12 +1404,15 @@ def main():
 
     # --- REAL-DATA PREFLIGHT ---
     if is_main:
-        preflight_ok = run_real_data_preflight(
+        preflight_ok, per_sample_secs = run_real_data_preflight(
             model, train_dataset, collate_fn, criterion, optimizer, scaler,
             device, amp_dtype=amp_dtype, is_distributed=is_distributed,
         )
         if not preflight_ok:
             dashboard.log("[bold yellow]⚠ Real-data preflight had failures — check above[/]")
+        if per_sample_secs > 0:
+            est_batch = per_sample_secs * args.batch_size
+            dashboard.log(f"[dim]⏱ First batch estimate: {per_sample_secs:.0f}s/sample × {args.batch_size} = ~{est_batch/60:.1f} min (cold cache, faster after)[/]")
         dashboard.log("")  # Spacer
 
     # Best model tracking

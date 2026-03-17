@@ -713,6 +713,8 @@ class ParallelMambaVIX(nn.Module):
             self.news_aux_head = VIXHead(d_model, head_hidden, dropout)
         if use_options:
             self.options_aux_head = VIXHead(d_model, head_hidden, dropout)
+        if use_vix_features:
+            self.vix_aux_head = VIXHead(d_model, head_hidden, dropout)
         
         # Final prediction head (from fused representation) - multi-horizon
         self.final_head = MultiHorizonVIXHead(d_model, head_hidden, dropout)
@@ -1097,6 +1099,7 @@ class ParallelMambaVIX(nn.Module):
         if self.use_vix_features and vix_outputs:
             vix_all = torch.stack(vix_outputs, dim=1)  # [B, num_checkpoints, d_model]
             vix_pooled = vix_all.mean(dim=1)  # Mean over checkpoints
+            results['vix_aux_pred'] = self.vix_aux_head(vix_pooled)
         
         # Final fused prediction
         # Fuse final states from all streams
