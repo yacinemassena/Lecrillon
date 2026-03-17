@@ -29,6 +29,11 @@ STOCK_PREFIX = f'{DATASETS_ROOT_PREFIX}Stock_Data_2min/'
 VIX_PREFIX = f'{DATASETS_ROOT_PREFIX}VIX/'
 OPTIONS_PREFIX = f'{DATASETS_ROOT_PREFIX}opt_trade_2min/'
 NEWS_PREFIX = f'{DATASETS_ROOT_PREFIX}benzinga_embeddings/news_daily/'
+MACRO_PREFIX = f'{DATASETS_ROOT_PREFIX}MACRO/'
+GDELT_PREFIX = f'{DATASETS_ROOT_PREFIX}GDELT/'
+ECON_PREFIX = f'{DATASETS_ROOT_PREFIX}econ_calendar/'
+FUNDAMENTALS_PREFIX = f'{DATASETS_ROOT_PREFIX}fundamentals/'
+PREPROCESSED_PREFIX = f'{DATASETS_ROOT_PREFIX}preprocessed/'
 
 
 def _matches_year_filter(relative_path: str,
@@ -377,9 +382,50 @@ def download_news_data(s3_client, year: Optional[int] = None,
     return downloaded_count
 
 
+def _download_prefix(s3_client, prefix: str, local_dir: Path, label: str,
+                     year: Optional[int] = None, start_year: Optional[int] = None,
+                     end_year: Optional[int] = None, force: bool = False):
+    """Generic download for a single R2 prefix."""
+    local_dir.mkdir(parents=True, exist_ok=True)
+    print(f'📦 Downloading {label} from R2...')
+    paginator = s3_client.get_paginator('list_objects_v2')
+    downloaded_count = 0
+    skipped_count = 0
+    total_size = 0
+    for page in paginator.paginate(Bucket=R2_BUCKET, Prefix=prefix):
+        if 'Contents' not in page:
+            continue
+        for obj in page['Contents']:
+            key = obj['Key']
+            if key.endswith('/'):
+                continue
+            relative_path = key.replace(prefix, '', 1)
+            if not relative_path:
+                continue
+            if not _matches_year_filter(relative_path, year, start_year, end_year):
+                continue
+            local_file = local_dir / relative_path
+            local_file.parent.mkdir(parents=True, exist_ok=True)
+            remote_size = obj['Size']
+            size_mb = remote_size / 1e6
+            if not force and local_file.exists():
+                if local_file.stat().st_size == remote_size:
+                    skipped_count += 1
+                    continue
+                else:
+                    print(f'  [{downloaded_count+1}] {relative_path} ({size_mb:.1f} MB) [re-downloading]')
+            else:
+                print(f'  [{downloaded_count+1}] {relative_path} ({size_mb:.1f} MB)')
+            s3_client.download_file(R2_BUCKET, key, str(local_file))
+            downloaded_count += 1
+            total_size += remote_size
+    print(f'✅ {label}: {downloaded_count} downloaded, {skipped_count} skipped, {total_size/1e9:.2f} GB transferred')
+    return downloaded_count
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description='Download stock, VIX, options, news, or the full datasets tree from Cloudflare R2',
+        description='Download stock, VIX, options, news, macro, gdelt, econ, fundamentals, preprocessed, or the full datasets tree from Cloudflare R2',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -398,6 +444,9 @@ Examples:
   # Download daily news embeddings for 2024
   python download_data.py --year 2024 --data-type news
   
+  # Download preprocessed memmaps (fast loading, ~25 GB)
+  python download_data.py --data-type preprocessed
+  
   # Download all data types for 2024 (year filter applies to ALL types)
   python download_data.py --year 2024 --data-type all
   
@@ -415,7 +464,7 @@ Examples:
     parser.add_argument('--year', type=int, help='Specific year to download (e.g., 2024) - applies to ALL data types')
     parser.add_argument('--start-year', type=int, help='Start year for range download - applies to ALL data types')
     parser.add_argument('--end-year', type=int, help='End year for range download - applies to ALL data types')
-    parser.add_argument('--data-type', choices=['stock', 'vix', 'options', 'news', 'all', 'full'], default='all',
+    parser.add_argument('--data-type', choices=['stock', 'vix', 'options', 'news', 'macro', 'gdelt', 'econ', 'fundamentals', 'preprocessed', 'all', 'full'], default='all',
                        help='Type of data to download (default: all)')
     parser.add_argument('--stock-dir', type=Path, default=Path('datasets/Stock_Data_2min'),
                        help='Local directory for stock data (default: datasets/Stock_Data_2min)')
@@ -504,6 +553,31 @@ Examples:
             local_dir=args.news_dir,
             force=args.force
         )
+        print()
+
+    if args.data_type in ['macro', 'all']:
+        _download_prefix(s3, MACRO_PREFIX, Path('datasets/MACRO'), 'Macro',
+                         year=args.year, start_year=args.start_year, end_year=args.end_year, force=args.force)
+        print()
+
+    if args.data_type in ['gdelt', 'all']:
+        _download_prefix(s3, GDELT_PREFIX, Path('datasets/GDELT'), 'GDELT',
+                         year=args.year, start_year=args.start_year, end_year=args.end_year, force=args.force)
+        print()
+
+    if args.data_type in ['econ', 'all']:
+        _download_prefix(s3, ECON_PREFIX, Path('datasets/econ_calendar'), 'Econ calendar',
+                         year=args.year, start_year=args.start_year, end_year=args.end_year, force=args.force)
+        print()
+
+    if args.data_type in ['fundamentals', 'all']:
+        _download_prefix(s3, FUNDAMENTALS_PREFIX, Path('datasets/fundamentals'), 'Fundamentals',
+                         year=args.year, start_year=args.start_year, end_year=args.end_year, force=args.force)
+        print()
+
+    if args.data_type in ['preprocessed', 'all']:
+        _download_prefix(s3, PREPROCESSED_PREFIX, Path('datasets/preprocessed'), 'Preprocessed memmaps',
+                         force=args.force)
         print()
     
     print('🎉 All downloads complete!')

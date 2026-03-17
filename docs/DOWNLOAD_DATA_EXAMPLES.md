@@ -14,6 +14,9 @@ python download_data.py --year 2024 --data-type vix
 python download_data.py --year 2024 --data-type options
 python download_data.py --year 2024 --data-type news
 
+# Download preprocessed memmaps for fast loading (~25 GB)
+python download_data.py --data-type preprocessed
+
 # Download year range (2023-2024)
 python download_data.py --start-year 2023 --end-year 2024 --data-type all
 
@@ -23,13 +26,19 @@ python download_data.py --data-type all
 
 ## Data Types
 
-The script supports 5 data type options:
+The script supports these data type options:
 
-- **`stock`** - 1-second stock bar data (Stock_Data_1s)
-- **`vix`** - VIX daily close data
-- **`options`** - Options trade data (contract and underlying bars)
-- **`news`** - Benzinga news embeddings
+- **`stock`** - 2-minute stock bar data (Stock_Data_2min)
+- **`vix`** - VIX data including extended-hours features
+- **`options`** - 2-minute options trade data (opt_trade_2min)
+- **`news`** - Benzinga daily news embeddings (3072-dim)
+- **`macro`** - Enhanced macro data (FED/FRED, 55 features)
+- **`gdelt`** - GDELT world event embeddings (391-dim)
+- **`econ`** - Economic calendar events
+- **`fundamentals`** - Fundamentals cross-attention state (130-dim)
+- **`preprocessed`** - Pre-built numpy memmaps for fast loading (~25 GB)
 - **`all`** - All of the above
+- **`full`** - Mirror entire datasets/ tree
 
 ## Year Filtering
 
@@ -99,7 +108,7 @@ python download_data.py --data-type stock --stock-dir /custom/path/stock
 python download_data.py --year 2024 --data-type stock --force
 ```
 
-**Output**: Files saved to `datasets/Stock_Data_1s/YYYY-MM-DD.parquet`
+**Output**: Files saved to `datasets/Stock_Data_2min/YYYY-MM-DD.parquet`
 
 ## VIX Data Examples
 
@@ -165,6 +174,39 @@ python download_data.py --year 2024 --data-type news --force
 ```
 
 **Output**: Files saved to `datasets/benzinga_embeddings/YYYY_embedded.parquet`
+
+## Preprocessed Memmaps (Recommended)
+
+Pre-built numpy memmap files enable **~10,000x faster** data loading (20s/sample → 1.7ms/sample).
+The training script auto-detects `datasets/preprocessed/` and uses memmap loading automatically.
+
+```bash
+# Download preprocessed memmaps (~25 GB, dominated by news embeddings)
+python download_data.py --data-type preprocessed
+
+# Or with rclone (faster for large files)
+python download_data_fast.py --data-type preprocessed --transfers 32
+
+# Train — auto-detects preprocessed dir, no extra flags needed
+python train.py --seq-len 15000
+```
+
+**Contents** (8 feeds, all pre-computed):
+| Feed | Shape | Size |
+|------|-------|------|
+| Stock | [1.1M, 50] | 219 MB |
+| Options | [541K, 48] | 104 MB |
+| VIX | [1.5M, 25] | 148 MB |
+| GDELT | [579K, 391] | 906 MB |
+| News | [1.9M, 3072] | 23.7 GB |
+| Econ | [57K, 10] | 2.3 MB |
+| Macro | [9.3K, 55] | 2.0 MB |
+| Fundamentals | [3.8K, 130] | 2.0 MB |
+
+To rebuild memmaps from raw parquets:
+```bash
+python tools/preprocess_dataset.py --data-root datasets
+```
 
 ## Combined Examples
 
@@ -238,12 +280,19 @@ python download_data.py --start-year 2014 --end-year 2024 --data-type all
 
 ## Data Availability
 
-- **Stock Data**: 2005-present
-- **VIX Data**: Historical (all years)
-- **Options Data**: 2014-present (June 2014 onwards)
-- **News Data**: 2009-present
+| Source | Date Range | Path |
+|--------|------------|------|
+| Stock bars | 2003-present | `datasets/Stock_Data_2min/` |
+| VIX | 2005-present | `datasets/VIX/` |
+| Options | 2014-06+ | `datasets/opt_trade_2min/` |
+| News | 2009-present | `datasets/benzinga_embeddings/` |
+| GDELT | 2004-present | `datasets/GDELT/` |
+| Macro | 2000-present | `datasets/MACRO/` |
+| Econ calendar | 2007-present | `datasets/econ_calendar/` |
+| Fundamentals | 2010-present | `datasets/fundamentals/` |
+| Preprocessed | All feeds | `datasets/preprocessed/` |
 
-**Recommendation**: For multi-source experiments, use `--start-year 2014` to ensure all data types are available.
+**Recommendation**: For fastest training, download `preprocessed` instead of raw parquets.
 
 ## Common Workflows
 
@@ -308,12 +357,17 @@ python download_data.py --year 2024 --data-type all --force
 ### Disk Space
 
 Approximate sizes:
-- Stock data (1 year): ~50-100 GB
-- Options data (1 year): ~30-50 GB
-- News data (1 year): ~1-5 GB
-- VIX data (all years): ~1 MB
+- Stock data (all years): ~767 GB
+- Options data (all years): ~150 GB
+- News data (all years): ~80 GB
+- VIX data (all years): ~5 GB
+- GDELT (all years): ~30 GB
+- Macro: ~10 MB
+- Econ calendar: ~5 MB
+- Fundamentals: ~10 MB
+- **Preprocessed memmaps: ~25 GB** (recommended)
 
-**Example**: Full 2014-2024 download requires ~1-1.5 TB of disk space.
+**Tip**: If you only need fast training, download just `preprocessed` (~25 GB) instead of all raw data (~1 TB+).
 
 ## Help
 

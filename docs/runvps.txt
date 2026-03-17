@@ -1,41 +1,50 @@
-(without Docker):
+====== FAST SETUP (Preprocessed Memmaps) ======
 
-bash
 cd /workspace
 git clone https://github.com/yacinemassena/Lecrillon.git
 cd Lecrillon
-bash setupvps.sh  # Downloads pre-packaged venv from R2 or builds from source
-source /workspace/venv/bin/activate
-python download_vix.py --vix-dir /workspace/datasets/VIX
-python download_data.py --year 2024 --data-type both --stock-dir /workspace/datasets/Stock_Data_1s --vix-dir /workspace/datasets/VIX
-python train.py --seq-len 15000
+bash setupvps.sh
 
-
-    WITH DOCKER 
----
-cd /workspace
-git clone https://github.com/yacinemassena/Lecrillon.git
-cd Lecrillon
-python download_vix.py --vix-dir /workspace/datasets/VIX
-python download_data.py --year 2024 --data-type all \
-  --stock-dir /workspace/datasets/Stock_Data_1s \
-  --vix-dir /workspace/datasets/VIX \
-  --options-dir /workspace/datasets/opt_trade_1sec \
-  --news-dir /workspace/datasets/benzinga_embeddings
-
-    # Install rclone on VPS (one-time)
+# Install rclone (one-time)
 curl https://rclone.org/install.sh | sudo bash
 
-    # Download 2024 data with 32 parallel transfers
-python download_data_fast.py --year 2024 --data-type all
+# Download preprocessed memmaps (~25 GB) — all you need for training
+python download_data_fast.py --data-type preprocessed --transfers 32
 
----
+# Also need raw VIX for target computation + stock for anchor dates
+python download_data_fast.py --data-type vix --transfers 32
+python download_data_fast.py --data-type stock --transfers 32
+
+# Train — auto-detects preprocessed dir, ~10,000x faster loading
+python train.py --seq-len 15000
+
+====== FULL SETUP (All Raw Data) ======
+
+cd /workspace
+git clone https://github.com/yacinemassena/Lecrillon.git
+cd Lecrillon
+bash setupvps.sh
+
+# Install rclone (one-time)
+curl https://rclone.org/install.sh | sudo bash
+
+# Download all data with parallel transfers
+python download_data_fast.py --data-type all --transfers 32
+
+# Train
+python train.py --seq-len 15000 --batch-size 8 --n-layers 6 --d-model 256
+
+====== EXAMPLE TRAINING COMMANDS ======
+
 python train.py --seq-len 15000 --train-end 2024-03-30 --val-end 2024-11-30
 
 python train.py --seq-len 15000 --batch-size 8 --n-layers 6 --d-model 256 --train-start 2024-01-01 --train-end 2024-03-30 --val-end 2024-11-30
 
+# Explicit preprocessed path (if not auto-detected)
+python train.py --seq-len 15000 --preprocessed-path datasets/preprocessed
 
-LOCAL 
+====== LOCAL (WSL) ======
+
 wsl
 cd /mnt/d/Mamba\ v2
 source venv/bin/activate

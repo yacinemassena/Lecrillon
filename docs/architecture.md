@@ -1,6 +1,6 @@
 # VIX Prediction Architecture
 
-> **Last Updated:** March 16, 2026
+> **Last Updated:** March 17, 2026
 
 ## Overview
 
@@ -17,9 +17,9 @@ Option Flow [B, T, 48] ─→ OptionEncoder ─→ Option Mamba (d=256) ──�
                                                                                    │
 News [B, N, 3072] + GDELT [B, M, 391] ─→ Merge + Type Embed ─→ News Mamba (d=256) ─┤
                                                                                    │
-VIX Features [B, V, 21] ─→ VixEncoder ─→ VIX Mamba (d=64) ─→ proj ─────────────────┤
+VIX Features [B, V, 25] ─→ VixEncoder ─→ VIX Mamba (d=64) ─→ proj ─────────────────┤
                                                                                    │
-Macro Context [B, 25] ─→ FiLM conditioning on stock stream ────────────────────────┤
+Macro Context [B, 55] ─→ FiLM conditioning on stock stream ────────────────────────┤
                                                                                    │
 Fundamentals [B, 130] ─→ Linear projection ─→ cross-attention state ───────────────┤
                                                                                    │
@@ -33,8 +33,8 @@ Checkpoint fusion every N bars ─→ gated cross-stream fusion ─→ pooled he
 | **Stock stream** | Main Mamba stream over 2-minute stock bars (d=256, 4 layers) |
 | **Option stream** | Encodes 48 option-flow features, fuses with stock (d=256, 4 layers) |
 | **News stream** | Benzinga + GDELT + Econ tokens merged by timestamp (d=256, 2 layers) |
-| **VIX stream** | Extended hours VIX/VVIX features, ~540 bars/day (d=64, 2 layers) |
-| **Macro FiLM** | Time-aware conditioning on stock representations |
+| **VIX stream** | Extended hours VIX/VVIX features (25 dims), ~540 bars/day (d=64, 2 layers) |
+| **Macro FiLM** | 55-feature time-aware conditioning on stock representations |
 | **Fundamentals** | 130-dim sector state via cross-attention |
 | **Multi-horizon head** | Predicts VIX change for `+1d`, `+7d`, `+15d`, `+30d` |
 
@@ -46,8 +46,8 @@ Checkpoint fusion every N bars ─→ gated cross-stream fusion ─→ pooled he
 | **Options flow** | 48 | 2014-06+ | `datasets/opt_trade_2min/` |
 | **News embeddings** | 3072 | 2009+ | `datasets/benzinga_embeddings/` |
 | **GDELT world state** | 391 | configurable | `datasets/GDELT/` |
-| **VIX features** | 21 | 2005+ | `datasets/VIX/Vix_features/` |
-| **Macro conditioning** | 25 | 2000+ | `datasets/MACRO/macro_daily.parquet` |
+| **VIX features** | 25 | 2005+ | `datasets/VIX/Vix_features/` |
+| **Macro conditioning** | 55 | 2000+ | `datasets/MACRO/macro_daily_enhanced.parquet` |
 | **Econ calendar** | 13 | 2007+ | `datasets/econ_calendar/` |
 | **Fundamentals state** | 130 | 2010+ | `datasets/fundamentals/fundamentals_state.parquet` |
 | **Cross-asset** | ~30 | 2000+ | `datasets/cross_asset/` (optional, via FRED API) |
@@ -537,3 +537,4 @@ These results were produced on an earlier configuration and should be treated as
 | `tools/build_vix_features.py` | Build VIX feature parquets from raw CSVs |
 | `tools/aggregate_2min.py` | Aggregate 1-second bars to 2-minute bars |
 | `tools/build_fundamentals_state.py` | Build fundamentals cross-attention state |
+| `tools/preprocess_dataset.py` | Build preprocessed numpy memmaps for fast loading |
