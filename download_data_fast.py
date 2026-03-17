@@ -100,24 +100,24 @@ def build_include_filters(year: Optional[int] = None,
     if data_type == 'news':
         # Daily news files: YYYY-MM-DD.parquet
         if year:
-            filters.extend(['--include', f'{year}-*.parquet'])
+            filters.extend(['--include', f'**/{year}-*.parquet'])
         elif start_year and end_year:
             for y in range(start_year, end_year + 1):
-                filters.extend(['--include', f'{y}-*.parquet'])
+                filters.extend(['--include', f'**/{y}-*.parquet'])
         else:
-            filters.extend(['--include', '*.parquet'])
+            filters.extend(['--include', '**/*.parquet'])
     elif data_type in ['stock', 'options']:
         # Date-based files: YYYY-MM-DD.parquet
         if year:
-            filters.extend(['--include', f'{year}-*.parquet'])
+            filters.extend(['--include', f'**/{year}-*.parquet'])
         elif start_year and end_year:
             for y in range(start_year, end_year + 1):
-                filters.extend(['--include', f'{y}-*.parquet'])
+                filters.extend(['--include', f'**/{y}-*.parquet'])
         else:
-            filters.extend(['--include', '*.parquet'])
+            filters.extend(['--include', '**/*.parquet'])
     else:
         # VIX: download all (small files)
-        filters.extend(['--include', '*'])
+        filters.extend(['--include', '**'])
     
     return filters
 
