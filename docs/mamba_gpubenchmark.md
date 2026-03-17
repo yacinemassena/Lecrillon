@@ -1,5 +1,12 @@
 # Mamba GPU Benchmarks
 
+## Full-scale model (News, Options, Macro FiLM, GDELT, Econ Calendar, Fundamentals, VIX Mamba)
+
+| GPU | Seq Length | Batch | VRAM (GB) | Speed (s/it) |
+|-----|------------|-------|-----------|--------------|
+| RTX 5080 | 8,000 | 4 | 26 (OOM) | 6.0 |
+
+
 ## Configuration: D=256, L=4, STATE=64, BATCH=16
 
 Note: the first table below is for 1 feed.
