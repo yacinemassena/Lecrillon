@@ -4,7 +4,7 @@ Parallel Mamba VIX Prediction Model.
 Architecture with parallel streams and periodic fusion:
 
     Stock Bars [B, T, F]   → StreamEncoder → StreamMamba → [B, T, d_model]  (F = num_features, auto-detected)
-    Option Bars [B, T, 47] → StreamEncoder → StreamMamba → [B, T, d_model]  (optional)
+    Option Bars [B, T, 48] → StreamEncoder → StreamMamba → [B, T, d_model]  (optional)
     News Embs [B, N, 3072] → StreamEncoder → StreamMamba → [B, N, d_model]  (optional)
                                     ↓
                            FusionGate (cross-attention + gating every checkpoint_interval)
@@ -541,8 +541,6 @@ class EconEncoder(nn.Module):
         return self.mlp(combined)  # [B, N, d_model]
 
 
-ECON_NUM_FEATURES = 13  # Numeric features per econ token
-
 
 class ParallelMambaVIX(nn.Module):
     """
@@ -585,9 +583,9 @@ class ParallelMambaVIX(nn.Module):
         use_fundamentals: bool = False,
         fundamentals_dim: int = 130,
         use_vix_features: bool = False,
-        vix_features_dim: int = 21,  # 21 VIX features (OHLC, VVIX, MAs, RV, technicals)
+        vix_features_dim: int = 25,  # 25 VIX features (OHLC, VVIX, MAs, RV, technicals)
         vix_n_layers: int = 2,  # Lightweight VIX Mamba
-        vix_d_model: int = 64,  # Smaller d_model for VIX (21 features vs stock's 45)
+        vix_d_model: int = 64,  # Smaller d_model for VIX (25 features vs stock's 50)
         vix_d_state: int = 16,  # Smaller state for VIX
     ):
         super().__init__()
@@ -807,7 +805,6 @@ class ParallelMambaVIX(nn.Module):
         options_mask: Optional[torch.Tensor] = None,
         news_embs: Optional[torch.Tensor] = None,
         news_mask: Optional[torch.Tensor] = None,
-        news_indices: Optional[torch.Tensor] = None,
         news_timestamps: Optional[torch.Tensor] = None,
         gdelt_embs: Optional[torch.Tensor] = None,
         gdelt_mask: Optional[torch.Tensor] = None,
@@ -835,22 +832,21 @@ class ParallelMambaVIX(nn.Module):
             options_mask: [B, T] - options validity mask
             news_embs: [B, N1, news_dim] - Benzinga news embeddings
             news_mask: [B, N1] - Benzinga news validity mask
-            news_indices: [B, N1] - bar index for each news article
-            news_timestamps: [B, N1] - Unix timestamps for news articles (ns)
+            news_timestamps: [B, N1] - Unix timestamps for news articles (seconds)
             gdelt_embs: [B, N2, gdelt_dim] - GDELT world state embeddings (391-dim)
             gdelt_mask: [B, N2] - GDELT validity mask
-            gdelt_timestamps: [B, N2] - Unix timestamps for GDELT buckets (ns)
+            gdelt_timestamps: [B, N2] - Unix timestamps for GDELT buckets (seconds)
             macro_context: [B, macro_dim] - macro conditioning features (T-1)
-            bar_timestamps: [B, T] - Unix timestamps for bars (ns for alignment)
+            bar_timestamps: [B, T] - Unix timestamps for bars (seconds, for alignment)
             econ_event_ids: [B, N3] - econ calendar event type IDs
             econ_currency_ids: [B, N3] - econ calendar currency IDs
             econ_numeric: [B, N3, 13] - econ calendar numeric features
             econ_mask: [B, N3] - econ calendar validity mask
-            econ_timestamps: [B, N3] - Unix timestamps for econ events (ns)
+            econ_timestamps: [B, N3] - Unix timestamps for econ events (seconds)
             fundamentals_context: [B, fundamentals_dim] - sector fundamentals state
             vix_features: [B, V, vix_dim] - VIX features (extended hours, ~540 bars/day)
             vix_mask: [B, V] - VIX validity mask
-            vix_timestamps: [B, V] - Unix timestamps for VIX bars (ns)
+            vix_timestamps: [B, V] - Unix timestamps for VIX bars (seconds)
         
         Returns:
             dict with:
@@ -948,6 +944,11 @@ class ParallelMambaVIX(nn.Module):
         
         # Running state for stock (carries fused context forward)
         stock_running_state = None
+        
+        # Pre-compute fundamentals projection once (constant across checkpoints)
+        fund_state = None
+        if self.use_fundamentals and fundamentals_context is not None:
+            fund_state = self.fundamentals_proj(fundamentals_context)  # [B, d_model]
         
         for cp in range(num_checkpoints):
             start_idx = cp * self.checkpoint_interval
@@ -1058,11 +1059,6 @@ class ParallelMambaVIX(nn.Module):
                 vix_outputs.append(vix_state)
             
             # --- Fusion at checkpoint ---
-            # Project fundamentals if enabled (same for all checkpoints)
-            fund_state = None
-            if self.use_fundamentals and fundamentals_context is not None:
-                fund_state = self.fundamentals_proj(fundamentals_context)  # [B, d_model]
-            
             stock_running_state = self.fusion_gate(
                 stock_state,
                 news_state=news_state,
@@ -1106,16 +1102,13 @@ class ParallelMambaVIX(nn.Module):
         # Fuse final states from all streams
         final_news_state = news_pooled if ((self.use_news or self.use_gdelt) and news_outputs) else None
         final_options_state = options_pooled if (self.use_options and options_outputs) else None
-        final_fund_state = None
-        if self.use_fundamentals and fundamentals_context is not None:
-            final_fund_state = self.fundamentals_proj(fundamentals_context)
         final_vix_state = vix_pooled if (self.use_vix_features and vix_outputs) else None
         
         final_fused = self.fusion_gate(
             stock_pooled, 
             final_news_state, 
             final_options_state, 
-            final_fund_state,
+            fund_state,
             final_vix_state,
         )
         results['vix_pred'] = self.final_head(final_fused)

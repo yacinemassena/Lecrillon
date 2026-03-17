@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Default bar features (all 47 features from Stock_Data_2min parquet columns)
+# Default bar features (45 parquet columns + 5 derived = 50 total)
 # ---------------------------------------------------------------------------
 DEFAULT_FEATURES = [
     'open', 'high', 'low', 'close', 'volume', 'trade_count',
@@ -44,9 +44,6 @@ DEFAULT_FEATURES = [
     'intraday_vol_skew', # rv_last_hour / rv_first_hour
     'ticker_dispersion', # std(close_return) across tickers
 ]
-
-# Features required for liquidity_stress computation
-LIQUIDITY_STRESS_INPUTS = ['amihud', 'inter_trade_std', 'tick_arrival_rate']
 
 NUM_STOCK_FEATURES = len(DEFAULT_FEATURES)
 
@@ -171,8 +168,6 @@ def compute_ticker_dispersion(df, feature_names: list, ts_col: str = 'bar_timest
     Returns:
         [T] array of dispersion values (one per unique timestamp, sorted)
     """
-    import polars as pl
-    
     if 'close_return' not in df.columns or 'ticker' not in df.columns:
         # No ticker info or close_return - return zeros
         return np.zeros(len(df), dtype=np.float32)
@@ -285,7 +280,7 @@ def compute_option_derived(features: np.ndarray, feature_names: list, lag: int =
     
     return result
 
-# VIX features (from Vix_features parquet files) - 21 features
+# VIX features (from Vix_features parquet files) - 25 features
 # Extended hours: ~540 bars/day (04:00-22:00 ET) vs stock's 195 bars
 VIX_FEATURES = [
     'open', 'high', 'low', 'close',  # OHLC (volume dropped - unreliable overnight)
@@ -296,51 +291,18 @@ VIX_FEATURES = [
     'vix_velocity_15', 'vix_velocity_75', 'vix_acceleration_15', 'vix_acceleration_75',
     'rv_ratio_to_vix',
 ]
-NUM_VIX_FEATURES = len(VIX_FEATURES)  # 21
+NUM_VIX_FEATURES = len(VIX_FEATURES)  # 25
 
 # Multi-horizon prediction targets (days ahead)
 HORIZONS = [1, 7, 15, 30]  # +1d, +7d, +15d, +30d
 NUM_HORIZONS = len(HORIZONS)
 
-# Class-level news cache (shared across all dataset instances/workers)
+# Class-level caches (shared across all dataset instances/workers)
 # Loaded once in main process, shared via copy-on-write in workers
 _NEWS_CACHE: Dict[int, pd.DataFrame] = {}
-_NEWS_CACHE_PATH: Optional[Path] = None
-
-
-def preload_news_cache(news_path: str, start_date: str = None, end_date: str = None):
-    """Preload news cache in main process before spawning workers.
-    
-    Call this before creating DataLoader to avoid redundant loading in workers.
-    Only loads years within the specified date range.
-    
-    Args:
-        news_path: Path to news embeddings directory
-        start_date: Start date string (YYYY-MM-DD) - determines first year to load
-        end_date: End date string (YYYY-MM-DD) - determines last year to load
-    """
-    global _NEWS_CACHE, _NEWS_CACHE_PATH
-    news_path = Path(news_path)
-    _NEWS_CACHE_PATH = news_path
-    
-    # Determine years to load from date range
-    if start_date and end_date:
-        start_year = int(start_date[:4])
-        end_year = int(end_date[:4])
-        years = list(range(start_year, end_year + 1))
-    else:
-        # Fallback: load nothing, let lazy loading handle it
-        return
-    
-    for year in years:
-        if year not in _NEWS_CACHE:
-            path = news_path / f"{year}_embedded.parquet"
-            if path.exists():
-                try:
-                    _NEWS_CACHE[year] = pd.read_parquet(path)
-                    logger.info(f"Preloaded news cache for {year}: {len(_NEWS_CACHE[year])} articles")
-                except Exception as e:
-                    logger.warning(f"Failed to preload news for {year}: {e}")
+_BARS_CACHE: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}   # file_path -> (features, timestamps)
+_GDELT_CACHE: Dict[str, pd.DataFrame] = {}                   # date_str -> DataFrame
+_VIX_CACHE: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}    # date_str -> (features, timestamps)
 
 
 # ---------------------------------------------------------------------------
@@ -414,6 +376,8 @@ class BarMambaDataset(Dataset):
         use_fundamentals: bool = False,
         vix_features_path: Optional[str] = None,
         use_vix_features: bool = False,
+        max_vix_bars: int = 0,  # Cap on VIX sequence length (0 = auto: 2.7× max_total_bars)
+        shared_state: Optional[Dict] = None,  # Pre-built indexes from train dataset
     ):
         self.split = split
         self.features = features or DEFAULT_FEATURES
@@ -427,6 +391,9 @@ class BarMambaDataset(Dataset):
         self.use_econ = use_econ
         self.use_fundamentals = use_fundamentals
         self.use_vix_features = use_vix_features
+        # VIX runs ~2.77× more bars than stock (540 vs 195 per day)
+        # Default cap: proportional to stock cap to keep memory bounded
+        self.max_vix_bars = max_vix_bars if max_vix_bars > 0 else int(max_total_bars * 2.77)
         
         # Store date boundaries early (needed for z-score computation)
         self.train_end = pd.to_datetime(train_end).date()
@@ -449,6 +416,62 @@ class BarMambaDataset(Dataset):
         self.gdelt_stats_dim = 7    # Summary stats (article_count, goldstein, tone, etc.)
         self.gdelt_dim = self.gdelt_embed_dim + self.gdelt_stats_dim  # 391 total
         
+        # Calculate days needed based on seq_len (~195 bars per trading day at 2-min)
+        bars_per_day = 195
+        self.lookback_days = max(1, (max_total_bars // bars_per_day) + 1)
+        # Anchor dates
+        self.anchor_start = pd.to_datetime(train_start).date()
+        # train_end and val_end already set earlier for z-score computation
+
+        # --- Fast path: reuse indexes/static data from train dataset ---
+        if shared_state is not None:
+            self.stock_path = shared_state['stock_path']
+            self.stock_files = shared_state['stock_files']
+            self.option_files = shared_state.get('option_files', {})
+            self.options_path = shared_state.get('options_path')
+            self.option_features = OPTION_FEATURES
+            self.num_option_features = NUM_OPTION_FEATURES
+            self.vix_feature_files = shared_state.get('vix_feature_files', {})
+            self.vix_daily = shared_state['vix_daily']
+            self.macro_data = shared_state.get('macro_data')
+            self.macro_dim = shared_state.get('macro_dim', 0)
+            self.macro_features = shared_state.get('macro_features', [])
+            self.macro_mean = shared_state.get('macro_mean')
+            self.macro_std = shared_state.get('macro_std')
+            self.fundamentals_data = shared_state.get('fundamentals_data')
+            self.fundamentals_dim = shared_state.get('fundamentals_dim', 0)
+            self.fundamentals_features = shared_state.get('fundamentals_features', [])
+            self.fundamentals_mean = shared_state.get('fundamentals_mean')
+            self.fundamentals_std = shared_state.get('fundamentals_std')
+            self.econ_data = shared_state.get('econ_data')
+            self.econ_by_date = shared_state.get('econ_by_date', {})
+            self.econ_num_features = 13
+            self.econ_num_event_types = shared_state.get('econ_num_event_types', 0)
+            self.econ_num_currencies = shared_state.get('econ_num_currencies', 0)
+            self.allowed_tickers = shared_state.get('allowed_tickers', set())
+            self.news_path = shared_state.get('news_path')
+            self.news_cache = shared_state.get('news_cache', {})
+            self.news_dim = 3072
+            self.gdelt_path = shared_state.get('gdelt_path')
+            self.gdelt_embed_dim = 384
+            self.gdelt_stats_dim = 7
+            self.gdelt_dim = 391
+            # Only rebuild anchor dates for this split's date range
+            self.anchor_dates = self._build_anchor_dates()
+            sources = ['stock']
+            if self.use_options:
+                sources.append(f'options({len(self.option_files)} days)')
+            if self.use_news:
+                sources.append('news')
+            if self.use_vix_features:
+                sources.append(f'vix_features({len(self.vix_feature_files)} days)')
+            logger.info(
+                f"BarMambaDataset [{split}]: {len(self.anchor_dates)} samples, "
+                f"seq={max_total_bars} (~{self.lookback_days}d), sources={sources} (shared indexes)"
+            )
+            return
+        # --- End fast path ---
+
         # Macro conditioning data (FiLM)
         self.macro_data: Optional[pd.DataFrame] = None
         self.macro_dim = 0
@@ -549,13 +572,6 @@ class BarMambaDataset(Dataset):
             else:
                 logger.warning(f"Econ calendar not found: {parquet_file}")
         
-        # Calculate days needed based on seq_len (~195 bars per trading day at 2-min)
-        bars_per_day = 195
-        self.lookback_days = max(1, (max_total_bars // bars_per_day) + 1)
-        # Anchor dates
-        self.anchor_start = pd.to_datetime(train_start).date()
-        # train_end and val_end already set earlier for z-score computation
-
         # Load ticker filter
         self.allowed_tickers: Set[str] = set()
         if allowed_tickers_file and Path(allowed_tickers_file).exists():
@@ -593,6 +609,35 @@ class BarMambaDataset(Dataset):
             f"BarMambaDataset [{split}]: {len(self.anchor_dates)} samples, "
             f"seq={max_total_bars} (~{self.lookback_days}d), sources={sources}"
         )
+
+    def get_shared_state(self) -> Dict:
+        """Return indexes and static data so a val dataset can skip re-loading."""
+        return {
+            'stock_path': self.stock_path,
+            'stock_files': self.stock_files,
+            'option_files': getattr(self, 'option_files', {}),
+            'options_path': getattr(self, 'options_path', None),
+            'vix_feature_files': getattr(self, 'vix_feature_files', {}),
+            'vix_daily': self.vix_daily,
+            'macro_data': self.macro_data,
+            'macro_dim': self.macro_dim,
+            'macro_features': self.macro_features,
+            'macro_mean': self.macro_mean,
+            'macro_std': self.macro_std,
+            'fundamentals_data': self.fundamentals_data,
+            'fundamentals_dim': self.fundamentals_dim,
+            'fundamentals_features': self.fundamentals_features,
+            'fundamentals_mean': getattr(self, 'fundamentals_mean', None),
+            'fundamentals_std': getattr(self, 'fundamentals_std', None),
+            'econ_data': self.econ_data,
+            'econ_by_date': self.econ_by_date,
+            'econ_num_event_types': self.econ_num_event_types,
+            'econ_num_currencies': self.econ_num_currencies,
+            'allowed_tickers': self.allowed_tickers,
+            'news_path': self.news_path,
+            'news_cache': self.news_cache,
+            'gdelt_path': self.gdelt_path,
+        }
 
     def _compute_macro_derived_features(self):
         """Compute derived macro features from raw FED/FRED data.
@@ -768,14 +813,20 @@ class BarMambaDataset(Dataset):
         return valid
 
     def _load_day_bars(self, file_path: Path) -> Optional[np.ndarray]:
-        """Load one day of bars as feature matrix. No caching."""
+        """Load one day of bars as feature matrix. Uses RAM cache via _load_day_bars_with_timestamps."""
         result = self._load_day_bars_with_timestamps(file_path)
         if result is None:
             return None
         return result[0]  # Return only features, not timestamps
 
     def _load_day_bars_with_timestamps(self, file_path: Path) -> Optional[Tuple[np.ndarray, np.ndarray]]:
-        """Load one day of bars with timestamps. Returns (features, timestamps)."""
+        """Load one day of bars with timestamps. Cached in RAM after first load."""
+        global _BARS_CACHE
+        cache_key = str(file_path)
+        
+        if cache_key in _BARS_CACHE:
+            return _BARS_CACHE[cache_key]
+        
         try:
             df = pl.read_parquet(file_path)
         except Exception as e:
@@ -854,6 +905,7 @@ class BarMambaDataset(Dataset):
             features = features[:self.max_bars_per_day]
             timestamps = timestamps[:self.max_bars_per_day]
 
+        _BARS_CACHE[cache_key] = (features, timestamps)
         return features, timestamps
 
     def _load_news(self, window_dates: List[date]) -> Tuple[np.ndarray, np.ndarray]:
@@ -958,26 +1010,38 @@ class BarMambaDataset(Dataset):
         if not self.use_gdelt or self.gdelt_path is None:
             return np.zeros((0, self.gdelt_dim), dtype=np.float32), np.zeros(0, dtype=np.int64)
         
+        global _GDELT_CACHE
         all_gdelt = []
         
         for d in window_dates:
+            cache_key = f"gdelt_{d}"
+            
+            if cache_key in _GDELT_CACHE:
+                if _GDELT_CACHE[cache_key] is not None:
+                    all_gdelt.append(_GDELT_CACHE[cache_key])
+                continue
+            
             year = d.year
             month = d.month
             day = d.day
             path = self.gdelt_path / str(year) / f"{month:02d}" / f"{day:02d}.parquet"
             
             if not path.exists():
+                _GDELT_CACHE[cache_key] = None
                 continue
             
             try:
                 df = pd.read_parquet(path)
             except Exception as e:
                 logger.warning(f"Failed to load GDELT for {d}: {e}")
+                _GDELT_CACHE[cache_key] = None
                 continue
             
             if len(df) == 0:
+                _GDELT_CACHE[cache_key] = None
                 continue
             
+            _GDELT_CACHE[cache_key] = df
             all_gdelt.append(df)
         
         if not all_gdelt:
@@ -1115,6 +1179,7 @@ class BarMambaDataset(Dataset):
         
         VIX runs extended hours (~540 bars/day vs stock's 195). Returns full
         sequence with timestamps so model can align at checkpoints.
+        Cached in RAM after first load.
         
         Args:
             d: Date to load
@@ -1123,23 +1188,31 @@ class BarMambaDataset(Dataset):
             (features [N, num_vix_features], timestamps [N]) or None if unavailable
             Timestamps are nanoseconds since epoch (int64).
         """
+        global _VIX_CACHE
+        
         if not self.use_vix_features or d not in self.vix_feature_files:
             return None
+        
+        cache_key = f"vix_{d}"
+        if cache_key in _VIX_CACHE:
+            return _VIX_CACHE[cache_key]
         
         try:
             df = pd.read_parquet(self.vix_feature_files[d])
         except Exception as e:
             logger.warning(f"Failed to load VIX features for {d}: {e}")
+            _VIX_CACHE[cache_key] = None
             return None
         
         if len(df) == 0:
+            _VIX_CACHE[cache_key] = None
             return None
         
         # Sort by timestamp
         df = df.sort_values('bar_timestamp')
         
-        # Extract timestamps (already int64 nanoseconds)
-        timestamps = df['bar_timestamp'].values.astype(np.int64)
+        # Convert timestamps to Unix seconds (matching stock bar_timestamps)
+        timestamps = pd.to_datetime(df['bar_timestamp']).values.astype('datetime64[s]').astype(np.int64)
         
         # Extract features
         avail = [f for f in self.vix_features if f in df.columns]
@@ -1155,6 +1228,7 @@ class BarMambaDataset(Dataset):
             padded[:, :len(avail)] = features
             features = padded
         
+        _VIX_CACHE[cache_key] = (features, timestamps)
         return features, timestamps
 
     def _load_econ_events(self, window_dates: List[date], anchor_date) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -1246,7 +1320,15 @@ class BarMambaDataset(Dataset):
         event_ids = np.array(event_ids_list, dtype=np.int16)
         currency_ids = np.array(currency_ids_list, dtype=np.int8)
         numeric_features = np.stack(numeric_list, axis=0)
-        timestamps = np.array(timestamps_list, dtype=np.int64)
+        raw_ts = np.array(timestamps_list, dtype=np.int64)
+        # Normalize to Unix seconds (matching stock bar_timestamps)
+        # Auto-detect unit: nanoseconds (>=1e18), microseconds (>=1e15), or seconds
+        if len(raw_ts) > 0 and abs(raw_ts[0]) > 1e15:
+            timestamps = (raw_ts // 1_000_000_000).astype(np.int64)
+        elif len(raw_ts) > 0 and abs(raw_ts[0]) > 1e12:
+            timestamps = (raw_ts // 1_000_000).astype(np.int64)
+        else:
+            timestamps = raw_ts
         
         # Sort by timestamp
         sort_idx = np.argsort(timestamps)
@@ -1292,7 +1374,7 @@ class BarMambaDataset(Dataset):
         horizon_mask = sample['horizon_mask']    # [4] validity mask
 
         # Load bars for all lookback days (with timestamps if using news, macro, gdelt, or econ)
-        need_timestamps = self.use_news or self.use_macro or self.use_gdelt or self.use_econ
+        need_timestamps = self.use_news or self.use_macro or self.use_gdelt or self.use_econ or self.use_vix_features
         all_bars = []
         all_bar_ts = []
         loaded_days = []  # Track which days were successfully loaded
@@ -1388,16 +1470,6 @@ class BarMambaDataset(Dataset):
             result['news_embs'] = torch.from_numpy(news_embs)
             result['news_timestamps'] = torch.from_numpy(news_ts)
             result['num_news'] = len(news_embs)
-            
-            # Compute news_indices: map each news timestamp to nearest bar index
-            if len(news_ts) > 0 and len(bar_timestamps) > 0:
-                # Use searchsorted to find insertion point for each news timestamp
-                # This gives the index of the bar that comes after (or at) the news time
-                news_indices = np.searchsorted(bar_timestamps, news_ts, side='right') - 1
-                news_indices = np.clip(news_indices, 0, len(bar_timestamps) - 1)
-                result['news_indices'] = torch.from_numpy(news_indices.astype(np.int64))
-            else:
-                result['news_indices'] = torch.zeros(len(news_embs), dtype=torch.long)
         
         # Add GDELT data if enabled
         if self.use_gdelt:
@@ -1502,6 +1574,11 @@ class BarMambaDataset(Dataset):
                 vix_feats = np.concatenate(all_vix_feats, axis=0)
                 vix_ts = np.concatenate(all_vix_ts, axis=0)
                 
+                # Cap VIX sequence length (keep most recent bars)
+                if len(vix_feats) > self.max_vix_bars:
+                    vix_feats = vix_feats[-self.max_vix_bars:]
+                    vix_ts = vix_ts[-self.max_vix_bars:]
+                
                 # Create mask: 1 where we have actual VIX data
                 vix_mask = (np.abs(vix_feats).sum(axis=1) > 1e-8).astype(np.float32)
                 
@@ -1560,8 +1637,6 @@ class BarMambaDataset(Dataset):
             news_mask = torch.zeros(B, max_news)
             news_ts_padded = torch.zeros(B, max_news, dtype=torch.long)
             bar_ts_padded = torch.zeros(B, max_len, dtype=torch.long)
-
-            news_indices_padded = torch.zeros(B, max_news, dtype=torch.long)
             
             for i, b in enumerate(batch):
                 # Bar timestamps
@@ -1575,14 +1650,11 @@ class BarMambaDataset(Dataset):
                     news_padded[i, :N] = b['news_embs']
                     news_mask[i, :N] = 1.0
                     news_ts_padded[i, :N] = b['news_timestamps']
-                    if 'news_indices' in b and b['news_indices'].numel() > 0:
-                        news_indices_padded[i, :N] = b['news_indices']
 
             result['bar_timestamps'] = bar_ts_padded
             result['news_embs'] = news_padded
             result['news_mask'] = news_mask
             result['news_timestamps'] = news_ts_padded
-            result['news_indices'] = news_indices_padded
             result['num_news'] = [b['num_news'] for b in batch]
         
         # Handle GDELT data if present
@@ -1686,7 +1758,7 @@ class BarMambaDataset(Dataset):
         
         # Handle VIX features if present (separate sequence with own length)
         if 'vix_features' in batch[0]:
-            num_vix_features = batch[0]['vix_features'].shape[-1] if batch[0]['vix_features'].numel() > 0 else 21
+            num_vix_features = batch[0]['vix_features'].shape[-1] if batch[0]['vix_features'].numel() > 0 else NUM_VIX_FEATURES
             max_vix = max(b.get('num_vix', 0) for b in batch) if any(b.get('num_vix', 0) > 0 for b in batch) else 1
             
             vix_padded = torch.zeros(B, max_vix, num_vix_features)

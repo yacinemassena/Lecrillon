@@ -30,8 +30,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset
-from torch.amp import autocast, GradScaler
+from torch.utils.data import DataLoader
+from torch.amp import GradScaler
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 
@@ -181,27 +181,6 @@ class SpikeWeightedHuberLoss(nn.Module):
         
         return weighted_loss.mean()
     
-    def get_spike_stats(self, target: torch.Tensor, horizon_mask: Optional[torch.Tensor] = None) -> Dict[str, float]:
-        """Get statistics about spike distribution in batch."""
-        abs_target = target.abs()
-        
-        if horizon_mask is not None:
-            valid = horizon_mask.bool()
-            abs_target = abs_target[valid]
-        
-        if abs_target.numel() == 0:
-            return {'normal_pct': 0, 'spike_pct': 0, 'extreme_pct': 0}
-        
-        total = abs_target.numel()
-        normal = (abs_target < self.spike_thresh).sum().item()
-        spike = ((abs_target >= self.spike_thresh) & (abs_target < self.extreme_thresh)).sum().item()
-        extreme = (abs_target >= self.extreme_thresh).sum().item()
-        
-        return {
-            'normal_pct': normal / total * 100,
-            'spike_pct': spike / total * 100,
-            'extreme_pct': extreme / total * 100,
-        }
 
 
 # ---------------------------------------------------------------------------
@@ -277,7 +256,6 @@ def get_data_paths() -> Dict[str, Path]:
         'stock': base / 'Stock_Data_2min',
         'options': base / 'opt_trade_2min',
         'vix': base / 'VIX',
-        'rv': base / 'SPY_daily_rv',
     }
 
 
@@ -354,6 +332,35 @@ def seed_everything(seed: int = 42):
 
 
 # ---------------------------------------------------------------------------
+# Batch-to-device helper (used by train_steps and val_steps)
+# ---------------------------------------------------------------------------
+def batch_to_device(batch: Dict, device: torch.device) -> Dict:
+    """Transfer all batch tensors to device. Returns dict of GPU tensors."""
+    d = {}
+    d['bars'] = batch['bars'].to(device, non_blocking=True)
+    d['bar_mask'] = batch['bar_mask'].to(device, non_blocking=True)
+    d['target'] = batch['vix_targets'].to(device, non_blocking=True)
+    d['horizon_mask'] = batch['horizon_mask'].to(device, non_blocking=True)
+
+    # Optional tensor keys: .get() + conditional .to()
+    _optional_keys = [
+        'news_embs', 'news_mask', 'news_timestamps',
+        'options', 'options_mask',
+        'macro_context', 'bar_timestamps',
+        'gdelt_embs', 'gdelt_mask', 'gdelt_timestamps',
+        'econ_event_ids', 'econ_currency_ids', 'econ_numeric',
+        'econ_mask', 'econ_timestamps',
+        'fundamentals_context',
+        'vix_features', 'vix_mask', 'vix_timestamps',
+    ]
+    for key in _optional_keys:
+        val = batch.get(key)
+        d[key] = val.to(device, non_blocking=True) if val is not None else None
+
+    return d
+
+
+# ---------------------------------------------------------------------------
 # Training step
 # ---------------------------------------------------------------------------
 def train_steps(model, loader, optimizer, criterion, scaler, device, num_steps,
@@ -373,9 +380,13 @@ def train_steps(model, loader, optimizer, criterion, scaler, device, num_steps,
     
     # If num_steps=0, iterate through full epoch
     if num_steps == 0:
+        logger.info(f"Epoch {epoch}: creating full-epoch iterator...")
         data_iter = enumerate(loader)
+        logger.info(f"Epoch {epoch}: iterator ready, starting steps")
     else:
+        logger.info(f"Epoch {epoch}: creating iterator for {num_steps} steps...")
         loader_iter = iter(loader)
+        logger.info(f"Epoch {epoch}: iterator ready, starting steps")
         data_iter = range(num_steps)
 
     for step_data in data_iter:
@@ -384,106 +395,41 @@ def train_steps(model, loader, optimizer, criterion, scaler, device, num_steps,
         else:
             step = step_data
             try:
+                if step == 0:
+                    logger.info(f"Epoch {epoch}: fetching first batch...")
                 batch = next(loader_iter)
+                if step == 0:
+                    logger.info(f"Epoch {epoch}: first batch received, training active")
             except StopIteration:
                 break
         
-        torch.cuda.synchronize()
         t_start = time.time()
         
-        # Data loading timing (already loaded if num_steps=0)
-        t_data_start = time.time()
-        t_data = time.time() - t_data_start
-
         # GPU transfer
-        t_gpu_start = time.time()
-        bars = batch['bars'].to(device, non_blocking=True)
-        bar_mask = batch['bar_mask'].to(device, non_blocking=True)
-        target = batch['vix_targets'].to(device, non_blocking=True)  # [B, 4] multi-horizon
-        horizon_mask = batch['horizon_mask'].to(device, non_blocking=True)  # [B, 4]
-        
-        # Optional news data
-        news_embs = batch.get('news_embs')
-        news_mask = batch.get('news_mask')
-        news_indices = batch.get('news_indices')
-        
-        if news_embs is not None:
-            news_embs = news_embs.to(device, non_blocking=True)
-        if news_mask is not None:
-            news_mask = news_mask.to(device, non_blocking=True)
-        if news_indices is not None:
-            news_indices = news_indices.to(device, non_blocking=True)
-        
-        # Optional options data
-        options = batch.get('options')
-        options_mask = batch.get('options_mask')
-        
-        if options is not None:
-            options = options.to(device, non_blocking=True)
-        if options_mask is not None:
-            options_mask = options_mask.to(device, non_blocking=True)
-        
-        # Optional macro context and bar timestamps (for FiLM)
-        macro_context = batch.get('macro_context')
-        bar_timestamps = batch.get('bar_timestamps')
-        
-        if macro_context is not None:
-            macro_context = macro_context.to(device, non_blocking=True)
-        if bar_timestamps is not None:
-            bar_timestamps = bar_timestamps.to(device, non_blocking=True)
-        
-        # Optional GDELT data
-        gdelt_embs = batch.get('gdelt_embs')
-        gdelt_mask = batch.get('gdelt_mask')
-        gdelt_timestamps = batch.get('gdelt_timestamps')
-        news_timestamps = batch.get('news_timestamps')
-        
-        if gdelt_embs is not None:
-            gdelt_embs = gdelt_embs.to(device, non_blocking=True)
-        if gdelt_mask is not None:
-            gdelt_mask = gdelt_mask.to(device, non_blocking=True)
-        if gdelt_timestamps is not None:
-            gdelt_timestamps = gdelt_timestamps.to(device, non_blocking=True)
-        if news_timestamps is not None:
-            news_timestamps = news_timestamps.to(device, non_blocking=True)
-        
-        # Optional econ calendar data
-        econ_event_ids = batch.get('econ_event_ids')
-        econ_currency_ids = batch.get('econ_currency_ids')
-        econ_numeric = batch.get('econ_numeric')
-        econ_mask = batch.get('econ_mask')
-        econ_timestamps = batch.get('econ_timestamps')
-        
-        if econ_event_ids is not None:
-            econ_event_ids = econ_event_ids.to(device, non_blocking=True)
-        if econ_currency_ids is not None:
-            econ_currency_ids = econ_currency_ids.to(device, non_blocking=True)
-        if econ_numeric is not None:
-            econ_numeric = econ_numeric.to(device, non_blocking=True)
-        if econ_mask is not None:
-            econ_mask = econ_mask.to(device, non_blocking=True)
-        if econ_timestamps is not None:
-            econ_timestamps = econ_timestamps.to(device, non_blocking=True)
-        
-        # Optional fundamentals context
-        fundamentals_context = batch.get('fundamentals_context')
-        if fundamentals_context is not None:
-            fundamentals_context = fundamentals_context.to(device, non_blocking=True)
-        
-        # Optional VIX features (extended hours)
-        vix_features = batch.get('vix_features')
-        vix_mask = batch.get('vix_mask')
-        vix_timestamps = batch.get('vix_timestamps')
-        
-        if vix_features is not None:
-            vix_features = vix_features.to(device, non_blocking=True)
-        if vix_mask is not None:
-            vix_mask = vix_mask.to(device, non_blocking=True)
-        if vix_timestamps is not None:
-            vix_timestamps = vix_timestamps.to(device, non_blocking=True)
-        
-        torch.cuda.synchronize()
-        t_gpu = time.time() - t_gpu_start
+        bd = batch_to_device(batch, device)
+        bars = bd['bars']
+        bar_mask = bd['bar_mask']
+        target = bd['target']
+        horizon_mask = bd['horizon_mask']
+        news_embs = bd['news_embs']
+        news_mask = bd['news_mask']
+        news_timestamps = bd['news_timestamps']
+        options = bd['options']
+        options_mask = bd['options_mask']
+        macro_context = bd['macro_context']
+        bar_timestamps = bd['bar_timestamps']
+        gdelt_embs = bd['gdelt_embs']
+        gdelt_mask = bd['gdelt_mask']
+        gdelt_timestamps = bd['gdelt_timestamps']
+        econ_event_ids = bd['econ_event_ids']
+        econ_currency_ids = bd['econ_currency_ids']
+        econ_numeric = bd['econ_numeric']
+        econ_mask = bd['econ_mask']
+        econ_timestamps = bd['econ_timestamps']
+        fundamentals_context = bd['fundamentals_context']
+        vix_features = bd['vix_features']
+        vix_mask = bd['vix_mask']
+        vix_timestamps = bd['vix_timestamps']
         
         seq_len = bars.shape[1]
 
@@ -496,7 +442,6 @@ def train_steps(model, loader, optimizer, criterion, scaler, device, num_steps,
                 options_mask=options_mask,
                 news_embs=news_embs,
                 news_mask=news_mask,
-                news_indices=news_indices,
                 news_timestamps=news_timestamps,
                 gdelt_embs=gdelt_embs,
                 gdelt_mask=gdelt_mask,
@@ -560,7 +505,6 @@ def train_steps(model, loader, optimizer, criterion, scaler, device, num_steps,
         total_loss += step_loss
         num_batches += 1
         
-        torch.cuda.synchronize()
         t_total = time.time() - t_start
 
         # VRAM stats - use reserved memory which shows actual GPU allocation
@@ -633,90 +577,30 @@ def val_steps(model, loader, criterion, device, num_steps, amp_dtype=torch.bfloa
             except StopIteration:
                 break
 
-        bars = batch['bars'].to(device, non_blocking=True)
-        bar_mask = batch['bar_mask'].to(device, non_blocking=True)
-        target = batch['vix_targets'].to(device, non_blocking=True)  # [B, 4] multi-horizon
-        horizon_mask = batch['horizon_mask'].to(device, non_blocking=True)  # [B, 4]
-        
-        # Optional news data
-        news_embs = batch.get('news_embs')
-        news_mask = batch.get('news_mask')
-        news_indices = batch.get('news_indices')
-        
-        if news_embs is not None:
-            news_embs = news_embs.to(device, non_blocking=True)
-        if news_mask is not None:
-            news_mask = news_mask.to(device, non_blocking=True)
-        if news_indices is not None:
-            news_indices = news_indices.to(device, non_blocking=True)
-        
-        # Optional options data
-        options = batch.get('options')
-        options_mask = batch.get('options_mask')
-        
-        if options is not None:
-            options = options.to(device, non_blocking=True)
-        if options_mask is not None:
-            options_mask = options_mask.to(device, non_blocking=True)
-        
-        # Optional macro context and bar timestamps (for FiLM)
-        macro_context = batch.get('macro_context')
-        bar_timestamps = batch.get('bar_timestamps')
-        
-        if macro_context is not None:
-            macro_context = macro_context.to(device, non_blocking=True)
-        if bar_timestamps is not None:
-            bar_timestamps = bar_timestamps.to(device, non_blocking=True)
-        
-        # Optional GDELT data
-        gdelt_embs = batch.get('gdelt_embs')
-        gdelt_mask = batch.get('gdelt_mask')
-        gdelt_timestamps = batch.get('gdelt_timestamps')
-        news_timestamps = batch.get('news_timestamps')
-        
-        if gdelt_embs is not None:
-            gdelt_embs = gdelt_embs.to(device, non_blocking=True)
-        if gdelt_mask is not None:
-            gdelt_mask = gdelt_mask.to(device, non_blocking=True)
-        if gdelt_timestamps is not None:
-            gdelt_timestamps = gdelt_timestamps.to(device, non_blocking=True)
-        if news_timestamps is not None:
-            news_timestamps = news_timestamps.to(device, non_blocking=True)
-        
-        # Optional econ calendar data
-        econ_event_ids = batch.get('econ_event_ids')
-        econ_currency_ids = batch.get('econ_currency_ids')
-        econ_numeric = batch.get('econ_numeric')
-        econ_mask = batch.get('econ_mask')
-        econ_timestamps = batch.get('econ_timestamps')
-        
-        if econ_event_ids is not None:
-            econ_event_ids = econ_event_ids.to(device, non_blocking=True)
-        if econ_currency_ids is not None:
-            econ_currency_ids = econ_currency_ids.to(device, non_blocking=True)
-        if econ_numeric is not None:
-            econ_numeric = econ_numeric.to(device, non_blocking=True)
-        if econ_mask is not None:
-            econ_mask = econ_mask.to(device, non_blocking=True)
-        if econ_timestamps is not None:
-            econ_timestamps = econ_timestamps.to(device, non_blocking=True)
-        
-        # Optional fundamentals context
-        fundamentals_context = batch.get('fundamentals_context')
-        if fundamentals_context is not None:
-            fundamentals_context = fundamentals_context.to(device, non_blocking=True)
-        
-        # Optional VIX features (extended hours)
-        vix_features = batch.get('vix_features')
-        vix_mask = batch.get('vix_mask')
-        vix_timestamps = batch.get('vix_timestamps')
-        
-        if vix_features is not None:
-            vix_features = vix_features.to(device, non_blocking=True)
-        if vix_mask is not None:
-            vix_mask = vix_mask.to(device, non_blocking=True)
-        if vix_timestamps is not None:
-            vix_timestamps = vix_timestamps.to(device, non_blocking=True)
+        bd = batch_to_device(batch, device)
+        bars = bd['bars']
+        bar_mask = bd['bar_mask']
+        target = bd['target']
+        horizon_mask = bd['horizon_mask']
+        news_embs = bd['news_embs']
+        news_mask = bd['news_mask']
+        news_timestamps = bd['news_timestamps']
+        options = bd['options']
+        options_mask = bd['options_mask']
+        macro_context = bd['macro_context']
+        bar_timestamps = bd['bar_timestamps']
+        gdelt_embs = bd['gdelt_embs']
+        gdelt_mask = bd['gdelt_mask']
+        gdelt_timestamps = bd['gdelt_timestamps']
+        econ_event_ids = bd['econ_event_ids']
+        econ_currency_ids = bd['econ_currency_ids']
+        econ_numeric = bd['econ_numeric']
+        econ_mask = bd['econ_mask']
+        econ_timestamps = bd['econ_timestamps']
+        fundamentals_context = bd['fundamentals_context']
+        vix_features = bd['vix_features']
+        vix_mask = bd['vix_mask']
+        vix_timestamps = bd['vix_timestamps']
 
         with torch.autocast(device_type='cuda', dtype=amp_dtype, enabled=True):
             outputs = model(
@@ -725,7 +609,6 @@ def val_steps(model, loader, criterion, device, num_steps, amp_dtype=torch.bfloa
                 options_mask=options_mask,
                 news_embs=news_embs,
                 news_mask=news_mask,
-                news_indices=news_indices,
                 news_timestamps=news_timestamps,
                 gdelt_embs=gdelt_embs,
                 gdelt_mask=gdelt_mask,
@@ -816,234 +699,120 @@ def val_steps(model, loader, criterion, device, num_steps, amp_dtype=torch.bfloa
 
 
 # ---------------------------------------------------------------------------
-# Validation Checks
+# Real-Data Preflight Checks
 # ---------------------------------------------------------------------------
-def run_validation_checks(
+def run_real_data_preflight(
     model: nn.Module,
-    args,
+    train_dataset,
+    collate_fn,
+    criterion: nn.Module,
+    optimizer,
+    scaler,
     device: torch.device,
-    num_features: int,
-    macro_dim: int = 15,
-    gdelt_dim: int = 391,
-    fundamentals_dim: int = 130,
-    phase: str = "pre",
-    train_loss: float = None,
+    batch_size: int = 4,
+    amp_dtype=torch.bfloat16,
     is_distributed: bool = False,
-) -> int:
+) -> bool:
     """
-    Run validation checks to verify model architecture and feed contributions.
-    
-    Args:
-        model: The model to validate
-        args: Training arguments
-        device: Device to run on
-        num_features: Number of stock features
-        macro_dim: Macro feature dimension
-        gdelt_dim: GDELT feature dimension
-        fundamentals_dim: Fundamentals feature dimension
-        phase: "pre" (before training) or "post" (after training)
-        train_loss: Final training loss (only for post-training)
-        is_distributed: Whether using DDP
-    
-    Returns:
-        Number of checks passed
+    Quick preflight on 2 real samples: load → forward → backward → check.
+    Returns True if all checks pass.
     """
-    from mamba_only_model import NUM_OPTION_FEATURES
-    
-    eval_model = model.module if is_distributed else model
-    checks_passed = 0
-    total_checks = 0
+    ok = 0
+    total = 0
     
     dashboard.log("\n" + "═" * 50)
-    dashboard.log(f"[bold]{phase.upper()}-TRAINING VALIDATION[/]")
+    dashboard.log("[bold]REAL-DATA PREFLIGHT[/]")
     dashboard.log("═" * 50)
     
-    # --- Basic Architecture Checks ---
-    
-    # Check 1: Model has parameters
-    total_checks += 1
-    n_params = sum(p.numel() for p in eval_model.parameters() if p.requires_grad)
-    ok = n_params > 0
-    dashboard.log(f"  [{'[green]✓' if ok else '[red]✗'}] Model has {n_params:,} parameters[/]")
-    checks_passed += ok
-    
-    # Build dummy inputs for all streams
-    eval_model.eval()
-    with torch.no_grad():
-        dummy_bars = torch.randn(1, 100, num_features).to(device)
-        dummy_mask = torch.ones(1, 100, dtype=torch.bool, device=device)
-        dummy_opts = torch.randn(1, 100, NUM_OPTION_FEATURES).to(device) if args.use_options else None
-        dummy_opts_mask = torch.ones(1, 100, dtype=torch.bool, device=device) if args.use_options else None
-        dummy_news = torch.randn(1, 10, 3072).to(device) if args.use_news else None
-        dummy_news_mask = torch.ones(1, 10, dtype=torch.bool, device=device) if args.use_news else None
-        dummy_news_idx = torch.zeros(1, 10, dtype=torch.long, device=device) if args.use_news else None
-        dummy_news_ts = torch.arange(10, device=device).unsqueeze(0) * 1000 if args.use_news else None
-        dummy_gdelt = torch.randn(1, 5, gdelt_dim).to(device) if args.use_gdelt else None
-        dummy_gdelt_mask = torch.ones(1, 5, dtype=torch.bool, device=device) if args.use_gdelt else None
-        dummy_gdelt_ts = torch.arange(5, device=device).unsqueeze(0) * 1000 if args.use_gdelt else None
-        dummy_macro = torch.randn(1, macro_dim).to(device) if args.use_macro else None
-        dummy_bar_ts = torch.arange(100, device=device).unsqueeze(0)
-        dummy_econ_ids = torch.randint(1, 10, (1, 8), device=device) if args.use_econ else None
-        dummy_econ_cur = torch.randint(1, 4, (1, 8), device=device) if args.use_econ else None
-        dummy_econ_num = torch.randn(1, 8, 13, device=device) if args.use_econ else None
-        dummy_econ_mask = torch.ones(1, 8, device=device) if args.use_econ else None
-        dummy_econ_ts = torch.arange(8, device=device).unsqueeze(0) * 1000 if args.use_econ else None
-        dummy_fund = torch.randn(1, fundamentals_dim).to(device) if args.use_fundamentals else None
-        
-        # Check 2: Forward pass produces output
-        total_checks += 1
-        try:
-            out = eval_model(
-                dummy_bars, dummy_mask, dummy_opts, dummy_opts_mask,
-                dummy_news, dummy_news_mask, dummy_news_idx, dummy_news_ts,
-                dummy_gdelt, dummy_gdelt_mask, dummy_gdelt_ts,
-                dummy_macro, dummy_bar_ts,
-                econ_event_ids=dummy_econ_ids,
-                econ_currency_ids=dummy_econ_cur,
-                econ_numeric=dummy_econ_num,
-                econ_mask=dummy_econ_mask,
-                econ_timestamps=dummy_econ_ts,
-                fundamentals_context=dummy_fund,
-            )
-            ok = 'vix_pred' in out and out['vix_pred'].shape == (1, 4)
-            dashboard.log(f"  [{'[green]✓' if ok else '[red]✗'}] Forward pass correct[/]")
-            checks_passed += ok
-        except Exception as e:
-            dashboard.log(f"  [[red]✗[/]] Forward pass failed: {e}")
-    
-    # Check 3: Backward pass works
-    total_checks += 1
-    eval_model.train()
+    # 1. Load 2 samples directly
+    total += 1
+    t0 = time.time()
     try:
-        out = eval_model(
-            dummy_bars, dummy_mask, dummy_opts, dummy_opts_mask,
-            dummy_news, dummy_news_mask, dummy_news_idx, dummy_news_ts,
-            dummy_gdelt, dummy_gdelt_mask, dummy_gdelt_ts,
-            dummy_macro, dummy_bar_ts,
-            econ_event_ids=dummy_econ_ids,
-            econ_currency_ids=dummy_econ_cur,
-            econ_numeric=dummy_econ_num,
-            econ_mask=dummy_econ_mask,
-            econ_timestamps=dummy_econ_ts,
-            fundamentals_context=dummy_fund,
-        )
-        loss = out['vix_pred'].sum()
-        loss.backward()
-        has_grads = any(p.grad is not None and p.grad.abs().sum() > 0
-                        for p in eval_model.parameters())
-        dashboard.log(f"  [{'[green]✓' if has_grads else '[red]✗'}] Gradients flow[/]")
-        checks_passed += has_grads
-        # Clear grads
-        eval_model.zero_grad()
+        s0 = train_dataset[0]
+        s1 = train_dataset[len(train_dataset) // 2]
+        batch = collate_fn([s0, s1])
+        dashboard.log(f"  [[green]✓[/]] Loaded 2 samples in {time.time()-t0:.1f}s "
+                      f"(bars={batch['bars'].shape}, targets={batch['vix_targets'].shape})")
+        ok += 1
     except Exception as e:
-        dashboard.log(f"  [[red]✗[/]] Backward pass failed: {e}")
+        dashboard.log(f"  [[red]✗[/]] Dataset load failed: {e}")
+        dashboard.log(f"\n[bold]Real-data preflight: {ok}/{total} passed[/]")
+        return False
     
-    # Check 4: No NaN in parameters
-    total_checks += 1
-    has_nan = any(torch.isnan(p).any() for p in eval_model.parameters())
-    ok = not has_nan
-    dashboard.log(f"  [{'[green]✓' if ok else '[red]✗'}] No NaN in params[/]")
-    checks_passed += ok
+    # 2. Check inputs for NaN/Inf
+    total += 1
+    bad_keys = [k for k in ['bars', 'vix_targets'] 
+                if k in batch and (torch.isnan(batch[k]).any() or torch.isinf(batch[k]).any())]
+    if bad_keys:
+        dashboard.log(f"  [[red]✗[/]] NaN/Inf in: {bad_keys}")
+    else:
+        dashboard.log(f"  [[green]✓[/]] Inputs clean")
+        ok += 1
     
-    # Post-training only: Check loss is finite
-    if phase == "post" and train_loss is not None:
-        total_checks += 1
-        ok = np.isfinite(train_loss) and train_loss > 0
-        dashboard.log(f"  [{'[green]✓' if ok else '[red]✗'}] Loss finite ({train_loss:.4f})[/]")
-        checks_passed += ok
-    
-    # --- Feed Contribution Checks ---
-    # Note: VIXHead and MultiHorizonVIXHead have final-layer weights init to zero,
-    # so vix_pred = bias only (input-independent) at init. We use a forward hook on
-    # the fusion_gate to compare representations BEFORE the zero-weight head.
-    eval_model.eval()
-    with torch.no_grad():
-        # Hook to capture fusion gate output
-        base_model = eval_model.module if hasattr(eval_model, 'module') else eval_model
-        captured = {}
-        def _capture_hook(name):
-            def hook(module, inp, out):
-                captured[name] = out.detach().clone()
-            return hook
-        
-        handle = base_model.fusion_gate.register_forward_hook(_capture_hook('fused'))
-        
-        def _run_forward(**override_kwargs):
-            """Run forward with baseline args, overriding specific kwargs."""
-            fwd_kwargs = dict(
-                options=dummy_opts, options_mask=dummy_opts_mask,
-                news_embs=dummy_news, news_mask=dummy_news_mask,
-                news_indices=dummy_news_idx, news_timestamps=dummy_news_ts,
-                gdelt_embs=dummy_gdelt, gdelt_mask=dummy_gdelt_mask,
-                gdelt_timestamps=dummy_gdelt_ts,
-                macro_context=dummy_macro, bar_timestamps=dummy_bar_ts,
-                econ_event_ids=dummy_econ_ids, econ_currency_ids=dummy_econ_cur,
-                econ_numeric=dummy_econ_num, econ_mask=dummy_econ_mask,
-                econ_timestamps=dummy_econ_ts,
-                fundamentals_context=dummy_fund,
+    # 3. Forward + loss
+    total += 1
+    bd = batch_to_device(batch, device)
+    model.train()
+    optimizer.zero_grad(set_to_none=True)
+    try:
+        with torch.autocast(device_type='cuda', dtype=amp_dtype):
+            out = model(
+                bd['bars'], bd['bar_mask'],
+                options=bd['options'], options_mask=bd['options_mask'],
+                news_embs=bd['news_embs'], news_mask=bd['news_mask'],
+                news_timestamps=bd['news_timestamps'],
+                gdelt_embs=bd['gdelt_embs'], gdelt_mask=bd['gdelt_mask'],
+                gdelt_timestamps=bd['gdelt_timestamps'],
+                macro_context=bd['macro_context'],
+                bar_timestamps=bd['bar_timestamps'],
+                econ_event_ids=bd['econ_event_ids'],
+                econ_currency_ids=bd['econ_currency_ids'],
+                econ_numeric=bd['econ_numeric'],
+                econ_mask=bd['econ_mask'],
+                econ_timestamps=bd['econ_timestamps'],
+                fundamentals_context=bd['fundamentals_context'],
+                vix_features=bd['vix_features'],
+                vix_mask=bd['vix_mask'],
+                vix_timestamps=bd['vix_timestamps'],
             )
-            fwd_kwargs.update(override_kwargs)
-            return eval_model(dummy_bars, dummy_mask, **fwd_kwargs)
+            pred = out['vix_pred']
+            loss = criterion(pred, bd['target'], bd['horizon_mask'])
         
-        # Baseline
-        _run_forward()
-        baseline_fused = captured['fused'].clone()
-        
-        def _check_feed(name, **override_kwargs):
-            """Check if removing a feed changes the fusion gate output."""
-            nonlocal checks_passed, total_checks
-            total_checks += 1
-            _run_forward(**override_kwargs)
-            ablated_fused = captured['fused']
-            diff = (baseline_fused - ablated_fused).abs().sum().item()
-            ok = diff > 1e-6
-            dashboard.log(f"  [{'[green]✓' if ok else '[red]✗'}] {name} contributes (Δ={diff:.6f})[/]")
-            checks_passed += ok
-        
-        if args.use_news:
-            _check_feed("News", news_embs=None, news_mask=None,
-                         news_indices=None, news_timestamps=None)
-        
-        if args.use_gdelt:
-            _check_feed("GDELT", gdelt_embs=None, gdelt_mask=None,
-                         gdelt_timestamps=None)
-        
-        if args.use_options:
-            _check_feed("Options", options=None, options_mask=None)
-        
-        if args.use_macro:
-            # FiLM heads use identity init (weight=0, gamma_bias=1, beta_bias=0),
-            # so FiLM is a no-op at init regardless of macro input → fusion Δ=0.
-            # Instead, verify macro_proj produces non-zero output (wiring correct).
-            total_checks += 1
-            macro_hook_out = {}
-            def _macro_hook(module, inp, out):
-                macro_hook_out['proj'] = out.detach()
-            mh = base_model.film_generator.macro_proj.register_forward_hook(_macro_hook)
-            _run_forward()  # baseline with macro
-            mh.remove()
-            proj_norm = macro_hook_out.get('proj')
-            if proj_norm is not None:
-                norm_val = proj_norm.abs().sum().item()
-                ok = norm_val > 1e-6
-                dashboard.log(f"  [{'[green]✓' if ok else '[red]✗'}] Macro/FiLM wired (proj‖={norm_val:.4f}, identity-init → Δ=0 expected pre-train)[/]")
-            else:
-                ok = False
-                dashboard.log(f"  [[red]✗] Macro/FiLM: macro_proj hook not triggered[/]")
-            checks_passed += ok
-        
-        if args.use_econ:
-            _check_feed("Econ", econ_event_ids=None, econ_currency_ids=None,
-                         econ_numeric=None, econ_mask=None, econ_timestamps=None)
-        
-        if args.use_fundamentals:
-            _check_feed("Fundamentals", fundamentals_context=None)
-        
-        handle.remove()  # Clean up hook
+        loss_ok = torch.isfinite(loss).item() and not torch.isnan(pred).any().item()
+        if loss_ok:
+            dashboard.log(f"  [[green]✓[/]] Forward OK: loss={loss.item():.4f}, "
+                          f"pred=[{pred.min():.3f}, {pred.max():.3f}]")
+            ok += 1
+        else:
+            dashboard.log(f"  [[red]✗[/]] Forward produced NaN/Inf")
+    except Exception as e:
+        dashboard.log(f"  [[red]✗[/]] Forward crashed: {e}")
+        dashboard.log(f"\n[bold]Real-data preflight: {ok}/{total} passed[/]")
+        return False
     
-    dashboard.log(f"\n[bold]Result: {checks_passed}/{total_checks} checks passed[/]")
+    # 4. Backward + grad check
+    total += 1
+    try:
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        nan_grads = any(p.grad is not None and torch.isnan(p.grad).any() for p in model.parameters())
+        
+        if nan_grads:
+            dashboard.log(f"  [[red]✗[/]] NaN in gradients")
+        else:
+            dashboard.log(f"  [[green]✓[/]] Backward OK: grad_norm={grad_norm:.4f}")
+            ok += 1
+        
+        # Don't step optimizer — just clean up
+        optimizer.zero_grad(set_to_none=True)
+        scaler.update()
+    except Exception as e:
+        dashboard.log(f"  [[red]✗[/]] Backward crashed: {e}")
     
-    return checks_passed, total_checks
+    dashboard.log(f"\n[bold]Real-data preflight: {ok}/{total} passed[/]")
+    logger.info(f"Real-data preflight: {ok}/{total} passed")
+    return ok == total
 
 
 # ---------------------------------------------------------------------------
@@ -1146,7 +915,14 @@ def main():
                         help='Loss weight multiplier for spikes (default: 3.0)')
     parser.add_argument('--extreme-weight', type=float, default=5.0,
                         help='Loss weight multiplier for extreme spikes (default: 5.0)')
+    parser.add_argument('--diagnose', action='store_true',
+                        help='Run verbose init diagnostics (train_diagnostics.py) then exit')
     args = parser.parse_args()
+
+    # Run diagnostics if requested
+    if args.diagnose:
+        from train_diagnostics import run_diagnostics
+        sys.exit(run_diagnostics(args))
 
     # Setup distributed training
     rank, world_size, local_rank = setup_distributed()
@@ -1237,14 +1013,14 @@ def main():
         auto_path = data_paths.get('options')
         if auto_path and auto_path.exists():
             options_path = str(auto_path)
-    else:
-        for candidate in [
-            data_paths.get('stock', Path('.')).parent / 'opt_trade_2min',
-            Path('datasets/opt_trade_2min'),
-        ]:
-            if candidate.exists():
-                options_path = str(candidate)
-                break
+        else:
+            for candidate in [
+                data_paths.get('stock', Path('.')).parent / 'opt_trade_2min',
+                Path('datasets/opt_trade_2min'),
+            ]:
+                if candidate.exists():
+                    options_path = str(candidate)
+                    break
     
     if is_main:
         if args.use_news:
@@ -1431,6 +1207,7 @@ def main():
         use_fundamentals=args.use_fundamentals,
         vix_features_path=vix_features_path,
         use_vix_features=args.use_vix_features,
+        shared_state=train_dataset.get_shared_state(),
     )
     num_features = train_dataset.num_features
     collate_fn = BarMambaDataset.collate_fn
@@ -1438,24 +1215,15 @@ def main():
     # Map-style dataset now supports native shuffling
     # For distributed training, could add DistributedSampler here
     
-    # Reduce workers for multi-GPU to prevent OOM (6 GPUs × 4 workers = 24 processes)
-    effective_workers = max(1, args.num_workers // world_size) if is_distributed else args.num_workers
-    if is_main and is_distributed and effective_workers != args.num_workers:
-        dashboard.log(f"[dim]Workers reduced: {args.num_workers} → {effective_workers} per GPU[/]")
-    
+    # num_workers=0: single process shares one RAM cache (from _BARS_CACHE etc.)
+    # Multi-worker fork after CUDA init deadlocks; spawn works but duplicates caches.
     train_loader = DataLoader(
         train_dataset, batch_size=args.batch_size, shuffle=True,
-        num_workers=effective_workers, collate_fn=collate_fn, pin_memory=True,
-        persistent_workers=(effective_workers > 0),
-        prefetch_factor=2 if effective_workers > 0 else None,
-        timeout=300 if effective_workers > 0 else 0,  # 5min timeout per batch
+        num_workers=0, collate_fn=collate_fn, pin_memory=True,
     )
     val_loader = DataLoader(
         val_dataset, batch_size=args.batch_size, shuffle=False,
-        num_workers=effective_workers, collate_fn=collate_fn, pin_memory=True,
-        persistent_workers=(effective_workers > 0),
-        prefetch_factor=2 if effective_workers > 0 else None,
-        timeout=300 if effective_workers > 0 else 0,
+        num_workers=0, collate_fn=collate_fn, pin_memory=True,
     )
 
     # Auto-calculate steps if not specified (0 = full epoch)
@@ -1488,7 +1256,7 @@ def main():
     fundamentals_dim = getattr(train_dataset, 'fundamentals_dim', 130) if args.use_fundamentals else 130
     
     # Determine vix_features_dim from dataset if vix features is enabled
-    vix_features_dim = getattr(train_dataset, 'num_vix_features', 21) if args.use_vix_features else 21
+    vix_features_dim = getattr(train_dataset, 'num_vix_features', 25) if args.use_vix_features else 25
     
     model = ParallelMambaVIX(
         num_features=num_features,
@@ -1528,17 +1296,6 @@ def main():
         model = DDP(model, device_ids=[local_rank], output_device=local_rank)
         if is_main:
             dashboard.log(f"[dim]Model wrapped in DistributedDataParallel[/]")
-
-    # --- PRE-TRAINING VALIDATION ---
-    if is_main:
-        pre_checks_passed, pre_total = run_validation_checks(
-            model, args, device, num_features,
-            macro_dim=macro_dim, gdelt_dim=gdelt_dim, fundamentals_dim=fundamentals_dim,
-            phase="pre", is_distributed=is_distributed
-        )
-        if pre_checks_passed < pre_total:
-            dashboard.log(f"[bold yellow]⚠ Pre-training validation: {pre_checks_passed}/{pre_total} checks passed[/]")
-        dashboard.log("")  # Spacer
 
     # Optimizer & loss — separate param group with 10x LR for FiLM generator
     if args.use_macro and hasattr(model, 'module'):
@@ -1592,6 +1349,16 @@ def main():
     if is_main:
         dashboard.log(f"[dim]AMP: {amp_dtype}[/]")
         dashboard.log("─" * 50)
+
+    # --- REAL-DATA PREFLIGHT ---
+    if is_main:
+        preflight_ok = run_real_data_preflight(
+            model, train_dataset, collate_fn, criterion, optimizer, scaler,
+            device, amp_dtype=amp_dtype, is_distributed=is_distributed,
+        )
+        if not preflight_ok:
+            dashboard.log("[bold yellow]⚠ Real-data preflight had failures — check above[/]")
+        dashboard.log("")  # Spacer
 
     # Best model tracking
     best_val_loss = float('inf')
@@ -1675,18 +1442,8 @@ def main():
                 f"iter={avg_iter_time:.2f}s/it, VRAM={mem_alloc:.1f}GB"
             )
             
-            # Log scale parameters if present (news/options injection)
-            eval_model = model.module if is_distributed else model
-            scale_info = []
-            if hasattr(eval_model, 'news_scale'):
-                scale_info.append(f"news_scale={eval_model.news_scale.item():.4f}")
-            if hasattr(eval_model, 'option_scale'):
-                scale_info.append(f"option_scale={eval_model.option_scale.item():.4f}")
-            if scale_info:
-                logger.info(f"Scale params: {', '.join(scale_info)}")
-                dashboard.log(f"[dim]📏 Scales: {', '.join(scale_info)}[/]")
-            
             # Log FiLM gamma/beta statistics if macro is enabled
+            eval_model = model.module if is_distributed else model
             if hasattr(eval_model, 'film_generator'):
                 film_stats = eval_model.film_generator.get_film_stats()
                 if film_stats:
@@ -1729,54 +1486,35 @@ def main():
                 dashboard.log(f"[bold blue]💾 Checkpoint saved:[/] {ckpt_file}")
 
     # Save final checkpoint
-    if is_main and args.epochs > 0:
+    if is_main and args.epochs > 0 and 'val_metrics' in dir():
         ckpt_file = save_checkpoint(
             model, optimizer, scaler, args.epochs, val_metrics['loss'],
             args.checkpoint_dir, is_distributed
         )
         dashboard.log(f"[bold blue]💾 Final checkpoint saved:[/] {ckpt_file}")
 
-    # --- POST-TRAINING VALIDATION ---
-    checks_passed = 0
-    total_checks = 0
-    
+    # Log results to CSV for HP sweep
+    if is_main and args.results_csv:
+        import csv
+        csv_path = Path(args.results_csv)
+        write_header = not csv_path.exists()
+        with open(csv_path, 'a', newline='') as f:
+            writer = csv.writer(f)
+            if write_header:
+                writer.writerow(['exp_name', 'lr', 'd_model', 'n_layers', 'd_state', 
+                               'seq_len', 'epochs', 'final_train_loss', 'final_val_loss', 
+                               'final_val_mae_pt'])
+            exp_name = args.exp_name or f"lr_{args.lr}"
+            writer.writerow([exp_name, args.lr, args.d_model, args.n_layers, args.d_state,
+                           args.seq_len, args.epochs, f"{train_loss:.6f}", 
+                           f"{val_metrics['loss']:.6f}", f"{val_metrics['mae']:.4f}"])
+        dashboard.log(f"[bold green]📊 Results appended to:[/] {args.results_csv}")
+
     if is_main:
-        checks_passed, total_checks = run_validation_checks(
-            model, args, device, num_features,
-            macro_dim=macro_dim, gdelt_dim=gdelt_dim, fundamentals_dim=fundamentals_dim,
-            phase="post", train_loss=train_loss, is_distributed=is_distributed
-        )
-        
-        # Log results to CSV for HP sweep
-        if args.results_csv:
-            import csv
-            csv_path = Path(args.results_csv)
-            write_header = not csv_path.exists()
-            with open(csv_path, 'a', newline='') as f:
-                writer = csv.writer(f)
-                if write_header:
-                    writer.writerow(['exp_name', 'lr', 'd_model', 'n_layers', 'd_state', 
-                                   'seq_len', 'epochs', 'final_train_loss', 'final_val_loss', 
-                                   'final_val_mae_pt', 'checks_passed'])
-                exp_name = args.exp_name or f"lr_{args.lr}"
-                writer.writerow([exp_name, args.lr, args.d_model, args.n_layers, args.d_state,
-                               args.seq_len, args.epochs, f"{train_loss:.6f}", 
-                               f"{val_metrics['loss']:.6f}", f"{val_metrics['mae']:.4f}",
-                               f"{checks_passed}/{total_checks}"])
-            dashboard.log(f"[bold green]📊 Results appended to:[/] {args.results_csv}")
-        
         dashboard.stop()
+        print("\n✅ TRAINING COMPLETE")
 
-    # Cleanup distributed
     cleanup_distributed()
-
-    if is_main:
-        if checks_passed == total_checks:
-            print("\n✅ TRAINING COMPLETE")
-            return 0
-        else:
-            print("\n❌ TRAINING FAILED")
-            return 1
     return 0
 
 

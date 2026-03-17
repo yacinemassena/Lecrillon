@@ -57,7 +57,9 @@ RUN pip install \
     einops \
     triton \
     transformers \
-    tensorboard
+    tensorboard \
+    rich \
+    duckdb
 
 # Set working directory
 WORKDIR /workspace
