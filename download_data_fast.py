@@ -94,31 +94,24 @@ def build_include_filters(year: Optional[int] = None,
                           start_year: Optional[int] = None,
                           end_year: Optional[int] = None,
                           data_type: str = 'stock') -> List[str]:
-    """Build rclone --include filters for year filtering."""
+    """Build rclone --include filters for year filtering.
+    
+    Returns empty list when no year filter is active — rclone copies
+    the entire remote folder by default (no --include needed).
+    """
+    # No year filter → download everything in the folder
+    if not year and not (start_year and end_year):
+        return []
+    
     filters = []
-    
-    if data_type == 'news':
-        # Daily news files: YYYY-MM-DD.parquet
+    if data_type in ['stock', 'options', 'news']:
         if year:
-            filters.extend(['--include', f'**/{year}-*.parquet'])
-        elif start_year and end_year:
-            for y in range(start_year, end_year + 1):
-                filters.extend(['--include', f'**/{y}-*.parquet'])
+            filters.extend(['--include', f'**/{year}-*'])
         else:
-            filters.extend(['--include', '**/*.parquet'])
-    elif data_type in ['stock', 'options']:
-        # Date-based files: YYYY-MM-DD.parquet
-        if year:
-            filters.extend(['--include', f'**/{year}-*.parquet'])
-        elif start_year and end_year:
             for y in range(start_year, end_year + 1):
-                filters.extend(['--include', f'**/{y}-*.parquet'])
-        else:
-            filters.extend(['--include', '**/*.parquet'])
-    else:
-        # VIX: download all (small files)
-        filters.extend(['--include', '**'])
-    
+                filters.extend(['--include', f'**/{y}-*'])
+    # Other data types (vix, macro, gdelt, econ, fundamentals, preprocessed)
+    # are small or don't have year-based filenames — download everything
     return filters
 
 
