@@ -9,6 +9,8 @@ Simple and clean.
 """
 
 import logging
+import os
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from datetime import date, timedelta
 from typing import Dict, List, Optional, Set, Tuple
@@ -19,6 +21,29 @@ import torch
 from torch.utils.data import Dataset
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Threaded I/O pool for parallel file loading
+# ---------------------------------------------------------------------------
+_IO_THREADS = max(1, (os.cpu_count() or 4) - 1)
+_IO_POOL: Optional[ThreadPoolExecutor] = None
+
+def set_io_threads(n: int):
+    """Set the number of I/O threads and (re)create the pool."""
+    global _IO_THREADS, _IO_POOL
+    _IO_THREADS = max(1, n)
+    if _IO_POOL is not None:
+        _IO_POOL.shutdown(wait=False)
+    _IO_POOL = ThreadPoolExecutor(max_workers=_IO_THREADS)
+    logger.info(f"I/O thread pool: {_IO_THREADS} threads")
+
+def _get_io_pool() -> ThreadPoolExecutor:
+    """Lazy-init the thread pool."""
+    global _IO_POOL
+    if _IO_POOL is None:
+        _IO_POOL = ThreadPoolExecutor(max_workers=_IO_THREADS)
+        logger.info(f"I/O thread pool: {_IO_THREADS} threads (auto)")
+    return _IO_POOL
 
 
 # ---------------------------------------------------------------------------
@@ -303,6 +328,19 @@ _NEWS_CACHE: Dict[int, pd.DataFrame] = {}
 _BARS_CACHE: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}   # file_path -> (features, timestamps)
 _GDELT_CACHE: Dict[str, pd.DataFrame] = {}                   # date_str -> DataFrame
 _VIX_CACHE: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}    # date_str -> (features, timestamps)
+_RAW_PARQUET_CACHE: Dict[str, object] = {}                    # file_path -> raw DataFrame (polars/pandas)
+
+def _read_parquet_to_cache(path_str: str, use_polars: bool = True):
+    """Read a parquet file into raw cache. Only I/O, no processing. GIL-free."""
+    if path_str in _RAW_PARQUET_CACHE:
+        return
+    try:
+        if use_polars:
+            _RAW_PARQUET_CACHE[path_str] = pl.read_parquet(path_str)
+        else:
+            _RAW_PARQUET_CACHE[path_str] = pd.read_parquet(path_str)
+    except Exception:
+        _RAW_PARQUET_CACHE[path_str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -378,6 +416,7 @@ class BarMambaDataset(Dataset):
         use_vix_features: bool = False,
         max_vix_bars: int = 0,  # Cap on VIX sequence length (0 = auto: 2.7× max_total_bars)
         shared_state: Optional[Dict] = None,  # Pre-built indexes from train dataset
+        preprocessed_path: Optional[str] = None,  # Path to preprocessed memmaps
     ):
         self.split = split
         self.features = features or DEFAULT_FEATURES
@@ -422,6 +461,14 @@ class BarMambaDataset(Dataset):
         # Anchor dates
         self.anchor_start = pd.to_datetime(train_start).date()
         # train_end and val_end already set earlier for z-score computation
+
+        # --- Memmap fast path: preprocessed binary data ---
+        self._use_memmaps = False
+        self._mm = {}  # memmap handles
+        self._mm_idx = {}  # index dicts
+        pp = Path(preprocessed_path) if preprocessed_path else None
+        if pp is not None and (pp / "stock_index.json").exists():
+            self._init_memmaps(pp)
 
         # --- Fast path: reuse indexes/static data from train dataset ---
         if shared_state is not None:
@@ -827,11 +874,17 @@ class BarMambaDataset(Dataset):
         if cache_key in _BARS_CACHE:
             return _BARS_CACHE[cache_key]
         
-        try:
-            df = pl.read_parquet(file_path)
-        except Exception as e:
-            logger.warning(f"Failed to load {file_path.name}: {e}")
-            return None
+        # Check raw parquet cache (populated by parallel prefetch threads)
+        if cache_key in _RAW_PARQUET_CACHE:
+            df = _RAW_PARQUET_CACHE[cache_key]
+            if df is None:
+                return None
+        else:
+            try:
+                df = pl.read_parquet(file_path)
+            except Exception as e:
+                logger.warning(f"Failed to load {file_path.name}: {e}")
+                return None
 
         # Filter tickers
         if self.allowed_tickers and 'ticker' in df.columns:
@@ -935,7 +988,13 @@ class BarMambaDataset(Dataset):
                 
                 if cache_key not in _NEWS_CACHE:
                     path = daily_path / f"{date_str}.parquet"
-                    if path.exists():
+                    path_str = str(path)
+                    # Check raw parquet cache (populated by parallel prefetch)
+                    if path_str in _RAW_PARQUET_CACHE:
+                        raw = _RAW_PARQUET_CACHE[path_str]
+                        if raw is not None:
+                            _NEWS_CACHE[cache_key] = raw
+                    elif path.exists():
                         try:
                             _NEWS_CACHE[cache_key] = pd.read_parquet(path)
                         except Exception as e:
@@ -1025,6 +1084,17 @@ class BarMambaDataset(Dataset):
             month = d.month
             day = d.day
             path = self.gdelt_path / str(year) / f"{month:02d}" / f"{day:02d}.parquet"
+            raw_key = str(path)
+            
+            # Check raw parquet cache (populated by parallel prefetch threads)
+            if raw_key in _RAW_PARQUET_CACHE:
+                df = _RAW_PARQUET_CACHE[raw_key]
+                if df is None or len(df) == 0:
+                    _GDELT_CACHE[cache_key] = None
+                    continue
+                _GDELT_CACHE[cache_key] = df
+                all_gdelt.append(df)
+                continue
             
             if not path.exists():
                 _GDELT_CACHE[cache_key] = None
@@ -1108,11 +1178,20 @@ class BarMambaDataset(Dataset):
         if not self.use_options or d not in self.option_files:
             return None
         
-        try:
-            df = pl.read_parquet(self.option_files[d])
-        except Exception as e:
-            logger.warning(f"Failed to load options for {d}: {e}")
-            return None
+        # Check raw parquet cache (populated by parallel prefetch threads)
+        cache_key = str(self.option_files[d])
+        if cache_key in _RAW_PARQUET_CACHE:
+            df = _RAW_PARQUET_CACHE[cache_key]
+            if df is None:
+                return None
+        else:
+            try:
+                df = pl.read_parquet(self.option_files[d])
+                _RAW_PARQUET_CACHE[cache_key] = df
+            except Exception as e:
+                logger.warning(f"Failed to load options for {d}: {e}")
+                _RAW_PARQUET_CACHE[cache_key] = None
+                return None
         
         if len(df) == 0:
             return None
@@ -1197,12 +1276,20 @@ class BarMambaDataset(Dataset):
         if cache_key in _VIX_CACHE:
             return _VIX_CACHE[cache_key]
         
-        try:
-            df = pd.read_parquet(self.vix_feature_files[d])
-        except Exception as e:
-            logger.warning(f"Failed to load VIX features for {d}: {e}")
-            _VIX_CACHE[cache_key] = None
-            return None
+        # Check raw parquet cache (populated by parallel prefetch threads)
+        raw_key = str(self.vix_feature_files[d])
+        if raw_key in _RAW_PARQUET_CACHE:
+            df = _RAW_PARQUET_CACHE[raw_key]
+            if df is None:
+                _VIX_CACHE[cache_key] = None
+                return None
+        else:
+            try:
+                df = pd.read_parquet(self.vix_feature_files[d])
+            except Exception as e:
+                logger.warning(f"Failed to load VIX features for {d}: {e}")
+                _VIX_CACHE[cache_key] = None
+                return None
         
         if len(df) == 0:
             _VIX_CACHE[cache_key] = None
@@ -1363,39 +1450,534 @@ class BarMambaDataset(Dataset):
             std = bars.std(axis=0, keepdims=True) + 1e-8
             return (bars - mu) / std
 
+    # ------------------------------------------------------------------
+    # Memmap fast path
+    # ------------------------------------------------------------------
+
+    def _init_memmaps(self, pp: Path):
+        """Open preprocessed numpy memmaps. Called once at init."""
+        import json as _json
+
+        def _open(name, suffix="_features"):
+            npy = pp / f"{name}{suffix}.npy"
+            idx = pp / f"{name}_index.json"
+            if npy.exists() and idx.exists():
+                self._mm[f"{name}{suffix}"] = np.load(str(npy), mmap_mode='r')
+                with open(idx) as f:
+                    self._mm_idx[name] = _json.load(f)
+                return True
+            return False
+
+        # Stock (required)
+        if not _open("stock"):
+            logger.warning("Preprocessed stock not found — falling back to parquet")
+            return
+        _open("stock", "_timestamps")
+
+        # Optional feeds
+        if self.use_options:
+            _open("options")
+        if self.use_vix_features:
+            _open("vix")
+            _open("vix", "_timestamps")
+        if self.use_news:
+            _open("news", "_embeddings")  # news uses _embeddings suffix
+            if not f"news_embeddings" in self._mm:
+                _open("news", "_features")  # fallback name
+            _open("news", "_timestamps")
+        if self.use_gdelt:
+            _open("gdelt")
+            _open("gdelt", "_timestamps")
+        if self.use_macro:
+            _open("macro")
+        if self.use_fundamentals:
+            _open("fundamentals")
+        if self.use_econ:
+            for suffix in ["_numeric", "_event_ids", "_currency_ids", "_timestamps"]:
+                npy = pp / f"econ{suffix}.npy"
+                if npy.exists():
+                    self._mm[f"econ{suffix}"] = np.load(str(npy), mmap_mode='r')
+            idx = pp / "econ_index.json"
+            if idx.exists():
+                with open(idx) as f:
+                    self._mm_idx["econ"] = _json.load(f)
+
+        self._use_memmaps = True
+        total_mb = sum(m.nbytes / 1e6 for m in self._mm.values())
+        logger.info(f"Memmap mode: {len(self._mm)} arrays opened ({total_mb:.0f} MB mapped), "
+                    f"{len(self._mm_idx)} indexes loaded")
+
+    def _mm_slice(self, feed: str, date_str: str, suffix: str = "_features"):
+        """Slice a memmap for a given date. Returns numpy array or None."""
+        idx = self._mm_idx.get(feed)
+        key = f"{feed}{suffix}"
+        mm = self._mm.get(key)
+        if idx is None or mm is None or date_str not in idx:
+            return None
+        entry = idx[date_str]
+        o, l = entry["offset"], entry["length"]
+        return np.array(mm[o:o + l])  # copy from mmap into RAM (tiny slice)
+
+    def _getitem_memmap(self, idx: int) -> Dict:
+        """Fast __getitem__ using preprocessed memmaps. Microsecond access."""
+        sample = self.anchor_dates[idx]
+        window_dates = sample['window_dates']
+        vix_targets = sample['vix_targets']
+        horizon_mask = sample['horizon_mask']
+
+        # ── Stock bars ────────────────────────────────────────────────
+        all_bars, all_ts, loaded_days = [], [], []
+        for d in window_dates:
+            ds = str(d)
+            feat = self._mm_slice("stock", ds)
+            if feat is not None and len(feat) > 0:
+                all_bars.append(feat)
+                ts = self._mm_slice("stock", ds, "_timestamps")
+                if ts is not None:
+                    all_ts.append(ts)
+                loaded_days.append((d, len(feat)))
+
+        if not all_bars:
+            return self._empty_result(sample)
+
+        bars = np.concatenate(all_bars, axis=0)
+        bar_timestamps = np.concatenate(all_ts, axis=0) if all_ts else None
+        if len(bars) > self.max_total_bars:
+            bars = bars[-self.max_total_bars:]
+            if bar_timestamps is not None:
+                bar_timestamps = bar_timestamps[-self.max_total_bars:]
+        bars = self._normalize_bars(bars)
+
+        result = {
+            'bars': torch.from_numpy(bars),
+            'vix_targets': torch.tensor(vix_targets, dtype=torch.float32),
+            'horizon_mask': torch.tensor(horizon_mask, dtype=torch.float32),
+            'num_bars': len(bars),
+            'anchor_date': str(sample['anchor_date']),
+        }
+        if bar_timestamps is not None:
+            result['bar_timestamps'] = torch.from_numpy(bar_timestamps)
+
+        # ── News ──────────────────────────────────────────────────────
+        if self.use_news:
+            emb_key = "news_embeddings" if "news_embeddings" in self._mm else "news_features"
+            all_embs, all_nts = [], []
+            for d in window_dates:
+                ds = str(d)
+                e = self._mm_slice("news", ds, "_embeddings")
+                if e is None:
+                    e = self._mm_slice("news", ds, "_features")
+                if e is not None and len(e) > 0:
+                    all_embs.append(e)
+                    t = self._mm_slice("news", ds, "_timestamps")
+                    if t is not None:
+                        all_nts.append(t)
+            if all_embs:
+                news_embs = np.concatenate(all_embs, axis=0)
+                news_ts = np.concatenate(all_nts, axis=0) if all_nts else np.zeros(len(news_embs), dtype=np.int64)
+            else:
+                news_embs = np.zeros((0, self.news_dim), dtype=np.float32)
+                news_ts = np.zeros(0, dtype=np.int64)
+            result['news_embs'] = torch.from_numpy(news_embs)
+            result['news_timestamps'] = torch.from_numpy(news_ts)
+            result['num_news'] = len(news_embs)
+
+        # ── GDELT ─────────────────────────────────────────────────────
+        if self.use_gdelt:
+            all_gf, all_gt = [], []
+            for d in window_dates:
+                ds = str(d)
+                f = self._mm_slice("gdelt", ds)
+                if f is not None and len(f) > 0:
+                    all_gf.append(f)
+                    t = self._mm_slice("gdelt", ds, "_timestamps")
+                    if t is not None:
+                        all_gt.append(t)
+            if all_gf:
+                gdelt_embs = np.concatenate(all_gf, axis=0)
+                gdelt_ts = np.concatenate(all_gt, axis=0) if all_gt else np.zeros(len(gdelt_embs), dtype=np.int64)
+            else:
+                gdelt_embs = np.zeros((0, self.gdelt_dim), dtype=np.float32)
+                gdelt_ts = np.zeros(0, dtype=np.int64)
+            result['gdelt_embs'] = torch.from_numpy(gdelt_embs)
+            result['gdelt_timestamps'] = torch.from_numpy(gdelt_ts)
+            result['num_gdelt'] = len(gdelt_embs)
+
+        # ── Macro (instant lookup) ────────────────────────────────────
+        if self.use_macro and "macro" in self._mm_idx:
+            anchor_str = str(sample['anchor_date'])
+            mv = self._mm_slice("macro", anchor_str)
+            if mv is None:
+                # Find nearest earlier date
+                dates = sorted(self._mm_idx["macro"].keys())
+                earlier = [d for d in dates if d <= anchor_str]
+                if earlier:
+                    mv = self._mm_slice("macro", earlier[-1])
+            if mv is not None:
+                macro_vec = mv.flatten().astype(np.float32)
+            else:
+                macro_vec = np.zeros(max(self.macro_dim, 1), dtype=np.float32)
+            macro_vec = np.nan_to_num(macro_vec, nan=0.0, posinf=0.0, neginf=0.0)
+            if self.macro_mean is not None and self.macro_std is not None:
+                macro_vec = (macro_vec - self.macro_mean) / self.macro_std
+            result['macro_context'] = torch.from_numpy(macro_vec)
+        elif self.use_macro:
+            # Fallback to DataFrame lookup
+            anchor = sample['anchor_date']
+            if self.macro_data is not None and anchor in self.macro_data.index:
+                macro_vec = self.macro_data.loc[anchor].values.astype(np.float32)
+            else:
+                macro_vec = np.zeros(self.macro_dim, dtype=np.float32)
+            macro_vec = np.nan_to_num(macro_vec, nan=0.0, posinf=0.0, neginf=0.0)
+            if self.macro_mean is not None and self.macro_std is not None:
+                macro_vec = (macro_vec - self.macro_mean) / self.macro_std
+            result['macro_context'] = torch.from_numpy(macro_vec)
+
+        # ── Fundamentals (instant lookup) ─────────────────────────────
+        if self.use_fundamentals and "fundamentals" in self._mm_idx:
+            anchor_str = str(sample['anchor_date'])
+            fv = self._mm_slice("fundamentals", anchor_str)
+            if fv is None:
+                dates = sorted(self._mm_idx["fundamentals"].keys())
+                earlier = [d for d in dates if d <= anchor_str]
+                if earlier:
+                    fv = self._mm_slice("fundamentals", earlier[-1])
+            if fv is not None:
+                fund_vec = fv.flatten().astype(np.float32)
+            else:
+                fund_vec = np.zeros(max(self.fundamentals_dim, 1), dtype=np.float32)
+            fund_vec = np.nan_to_num(fund_vec, nan=0.0, posinf=0.0, neginf=0.0)
+            if self.fundamentals_mean is not None and self.fundamentals_std is not None:
+                fund_vec = (fund_vec - self.fundamentals_mean) / self.fundamentals_std
+            result['fundamentals_context'] = torch.from_numpy(fund_vec)
+        elif self.use_fundamentals:
+            anchor = sample['anchor_date']
+            if self.fundamentals_data is not None and anchor in self.fundamentals_data.index:
+                fund_vec = self.fundamentals_data.loc[anchor].values.astype(np.float32)
+            else:
+                fund_vec = np.zeros(self.fundamentals_dim, dtype=np.float32)
+            fund_vec = np.nan_to_num(fund_vec, nan=0.0, posinf=0.0, neginf=0.0)
+            if self.fundamentals_mean is not None and self.fundamentals_std is not None:
+                fund_vec = (fund_vec - self.fundamentals_mean) / self.fundamentals_std
+            result['fundamentals_context'] = torch.from_numpy(fund_vec)
+
+        # ── Econ ──────────────────────────────────────────────────────
+        if self.use_econ and "econ" in self._mm_idx:
+            from datetime import timedelta
+            anchor = sample['anchor_date']
+            econ_idx = self._mm_idx["econ"]
+            all_eids, all_cids, all_enum, all_ets = [], [], [], []
+
+            def _econ_batch(ds, is_future):
+                """Load one day's econ events and build 13-feature vectors."""
+                if ds not in econ_idx:
+                    return
+                e = econ_idx[ds]
+                o, l = e["offset"], e["length"]
+                all_eids.append(np.array(self._mm["econ_event_ids"][o:o+l]))
+                all_cids.append(np.array(self._mm["econ_currency_ids"][o:o+l]))
+                all_ets.append(np.array(self._mm["econ_timestamps"][o:o+l]))
+                # Raw stored cols: [impact_ord, is_usd, time_of_day, actual_z,
+                #   forecast_z, previous_z, has_actual, has_forecast,
+                #   event_rank_today_norm, days_since_last_same_norm]
+                raw = np.array(self._mm["econ_numeric"][o:o+l])  # [N, 10]
+                n = len(raw)
+                event_date = date.fromisoformat(ds)
+                days_until = (event_date - anchor).days
+                days_until_norm = float(days_until) / 15.0
+                # Build 13-feature vectors matching _load_econ_events
+                out = np.zeros((n, 13), dtype=np.float32)
+                out[:, 0] = raw[:, 0] / 3.0                       # impact_norm
+                out[:, 1] = raw[:, 1]                              # is_usd
+                out[:, 2] = days_until_norm                        # days_until_norm
+                tod = raw[:, 2]
+                out[:, 3] = np.where(tod > 1.0, tod / 24.0, tod)  # time_of_day_norm
+                out[:, 4] = float(is_future)                       # is_future
+                if is_future:
+                    out[:, 5] = 0.0                                # actual_z masked
+                    out[:, 8] = 0.0                                # has_actual masked
+                else:
+                    out[:, 5] = raw[:, 3]                          # actual_z
+                    out[:, 8] = raw[:, 6]                          # has_actual
+                out[:, 6] = raw[:, 4]                              # forecast_z
+                out[:, 7] = raw[:, 5]                              # previous_z
+                out[:, 9] = raw[:, 7]                              # has_forecast
+                out[:, 10] = raw[:, 8]                             # event_rank_today_norm
+                out[:, 11] = raw[:, 9]                             # days_since_last_same_norm
+                out[:, 12] = days_until_norm                       # days_until (dup)
+                all_enum.append(out)
+
+            # Lookback events
+            for d in window_dates:
+                _econ_batch(str(d), False)
+            # Forward events (D+1 to D+15)
+            for fwd_offset in range(1, 16):
+                _econ_batch(str(anchor + timedelta(days=fwd_offset)), True)
+
+            if all_eids:
+                eids = np.concatenate(all_eids)
+                cids = np.concatenate(all_cids)
+                enum = np.concatenate(all_enum)
+                ets = np.concatenate(all_ets)
+                # Sort by timestamp
+                sort_idx = np.argsort(ets)
+                result['econ_event_ids'] = torch.from_numpy(eids[sort_idx].astype(np.int64))
+                result['econ_currency_ids'] = torch.from_numpy(cids[sort_idx].astype(np.int64))
+                result['econ_numeric'] = torch.from_numpy(enum[sort_idx])
+                result['econ_timestamps'] = torch.from_numpy(ets[sort_idx])
+                result['num_econ'] = len(eids)
+            else:
+                result['econ_event_ids'] = torch.zeros(0, dtype=torch.long)
+                result['econ_currency_ids'] = torch.zeros(0, dtype=torch.long)
+                result['econ_numeric'] = torch.zeros((0, 13), dtype=torch.float32)
+                result['econ_timestamps'] = torch.zeros(0, dtype=torch.long)
+                result['num_econ'] = 0
+        elif self.use_econ:
+            anchor = sample['anchor_date']
+            econ_ids, econ_cur, econ_num, econ_ts = self._load_econ_events(window_dates, anchor)
+            result['econ_event_ids'] = torch.from_numpy(econ_ids.astype(np.int64))
+            result['econ_currency_ids'] = torch.from_numpy(econ_cur.astype(np.int64))
+            result['econ_numeric'] = torch.from_numpy(econ_num)
+            result['econ_timestamps'] = torch.from_numpy(econ_ts)
+            result['num_econ'] = len(econ_ids)
+
+        # ── Options (depends on stock loaded_days) ────────────────────
+        if self.use_options:
+            all_options = []
+            for d, day_bar_count in loaded_days:
+                ds = str(d)
+                opt = self._mm_slice("options", ds)
+                if opt is not None and len(opt) > 0:
+                    if len(opt) > day_bar_count:
+                        opt = opt[:day_bar_count]
+                    elif len(opt) < day_bar_count:
+                        padded = np.zeros((day_bar_count, opt.shape[1]), dtype=np.float32)
+                        padded[:len(opt)] = opt
+                        opt = padded
+                    all_options.append(opt)
+                else:
+                    all_options.append(np.zeros((day_bar_count, self.num_option_features), dtype=np.float32))
+            if all_options:
+                options = np.concatenate(all_options, axis=0)
+                if len(options) > len(bars):
+                    options = options[-len(bars):]
+                elif len(options) < len(bars):
+                    padded = np.zeros((len(bars), self.num_option_features), dtype=np.float32)
+                    padded[-len(options):] = options
+                    options = padded
+                options_mask = (np.abs(options).sum(axis=1) > 1e-8).astype(np.float32)
+                if options_mask.sum() > 0:
+                    options = self._normalize_bars(options, mask=options_mask)
+                result['options'] = torch.from_numpy(options)
+                result['options_mask'] = torch.from_numpy(options_mask)
+            else:
+                result['options'] = torch.zeros(len(bars), self.num_option_features)
+                result['options_mask'] = torch.zeros(len(bars))
+
+        # ── VIX features ──────────────────────────────────────────────
+        if self.use_vix_features:
+            all_vf, all_vt = [], []
+            for d in window_dates:
+                ds = str(d)
+                vf = self._mm_slice("vix", ds)
+                if vf is not None and len(vf) > 0:
+                    all_vf.append(vf)
+                    vt = self._mm_slice("vix", ds, "_timestamps")
+                    if vt is not None:
+                        all_vt.append(vt)
+            if all_vf:
+                vix_feats = np.concatenate(all_vf, axis=0)
+                vix_ts = np.concatenate(all_vt, axis=0) if all_vt else np.zeros(len(vix_feats), dtype=np.int64)
+                if len(vix_feats) > self.max_vix_bars:
+                    vix_feats = vix_feats[-self.max_vix_bars:]
+                    vix_ts = vix_ts[-self.max_vix_bars:]
+                vix_mask = (np.abs(vix_feats).sum(axis=1) > 1e-8).astype(np.float32)
+                if vix_mask.sum() > 0:
+                    vix_feats = self._normalize_bars(vix_feats, mask=vix_mask)
+                result['vix_features'] = torch.from_numpy(vix_feats)
+                result['vix_timestamps'] = torch.from_numpy(vix_ts)
+                result['vix_mask'] = torch.from_numpy(vix_mask)
+                result['num_vix'] = len(vix_feats)
+            else:
+                result['vix_features'] = torch.zeros(0, self.num_vix_features)
+                result['vix_timestamps'] = torch.zeros(0, dtype=torch.long)
+                result['vix_mask'] = torch.zeros(0)
+                result['num_vix'] = 0
+
+        return result
+
+    def _empty_result(self, sample) -> Dict:
+        """Return empty sample with all required keys."""
+        result = {
+            'bars': torch.zeros(1, self.num_features),
+            'vix_targets': torch.zeros(NUM_HORIZONS, dtype=torch.float32),
+            'horizon_mask': torch.zeros(NUM_HORIZONS, dtype=torch.float32),
+            'num_bars': 0,
+            'anchor_date': str(sample['anchor_date']),
+        }
+        if self.use_news:
+            result['bar_timestamps'] = torch.zeros(1, dtype=torch.long)
+            result['news_embs'] = torch.zeros(0, self.news_dim)
+            result['news_timestamps'] = torch.zeros(0, dtype=torch.long)
+            result['num_news'] = 0
+        if self.use_gdelt:
+            if 'bar_timestamps' not in result:
+                result['bar_timestamps'] = torch.zeros(1, dtype=torch.long)
+            result['gdelt_embs'] = torch.zeros(0, self.gdelt_dim)
+            result['gdelt_timestamps'] = torch.zeros(0, dtype=torch.long)
+            result['num_gdelt'] = 0
+        if self.use_macro:
+            if 'bar_timestamps' not in result:
+                result['bar_timestamps'] = torch.zeros(1, dtype=torch.long)
+            result['macro_context'] = torch.zeros(max(self.macro_dim, 1), dtype=torch.float32)
+        if self.use_econ:
+            if 'bar_timestamps' not in result:
+                result['bar_timestamps'] = torch.zeros(1, dtype=torch.long)
+            result['econ_event_ids'] = torch.zeros(0, dtype=torch.long)
+            result['econ_currency_ids'] = torch.zeros(0, dtype=torch.long)
+            result['econ_numeric'] = torch.zeros(0, self.econ_num_features)
+            result['econ_timestamps'] = torch.zeros(0, dtype=torch.long)
+            result['num_econ'] = 0
+        if self.use_options:
+            result['options'] = torch.zeros(1, self.num_option_features)
+            result['options_mask'] = torch.zeros(1)
+        if self.use_vix_features:
+            result['vix_features'] = torch.zeros(0, self.num_vix_features)
+            result['vix_timestamps'] = torch.zeros(0, dtype=torch.long)
+            result['vix_mask'] = torch.zeros(0)
+            result['num_vix'] = 0
+        if self.use_fundamentals:
+            result['fundamentals_context'] = torch.zeros(max(self.fundamentals_dim, 1), dtype=torch.float32)
+        return result
+
     def __len__(self) -> int:
         return len(self.anchor_dates)
 
+    _samples_loaded = 0  # Class-level counter for first-batch progress
+
+    # ------------------------------------------------------------------
+    # Per-feed worker methods (each does its own I/O + processing)
+    # ------------------------------------------------------------------
+
+    def _feed_stock(self, window_dates: List[date]) -> Dict:
+        """Worker: load + process all stock bar data for the window."""
+        need_timestamps = (self.use_news or self.use_macro or self.use_gdelt
+                           or self.use_econ or self.use_vix_features)
+        all_bars, all_bar_ts, loaded_days = [], [], []
+        for d in window_dates:
+            fp = self.stock_files.get(d)
+            if fp is None:
+                continue
+            if need_timestamps:
+                res = self._load_day_bars_with_timestamps(fp)
+                if res is not None:
+                    all_bars.append(res[0])
+                    all_bar_ts.append(res[1])
+                    loaded_days.append((d, len(res[0])))
+            else:
+                day_bars = self._load_day_bars(fp)
+                if day_bars is not None:
+                    all_bars.append(day_bars)
+                    loaded_days.append((d, len(day_bars)))
+        return {'all_bars': all_bars, 'all_bar_ts': all_bar_ts,
+                'loaded_days': loaded_days, 'need_timestamps': need_timestamps}
+
+    def _feed_news(self, window_dates: List[date]) -> Dict:
+        """Worker: load + process all news data for the window."""
+        news_embs, news_ts = self._load_news(window_dates)
+        return {'news_embs': news_embs, 'news_ts': news_ts}
+
+    def _feed_gdelt(self, window_dates: List[date]) -> Dict:
+        """Worker: load + process all GDELT data for the window."""
+        gdelt_embs, gdelt_ts = self._load_gdelt(window_dates)
+        return {'gdelt_embs': gdelt_embs, 'gdelt_ts': gdelt_ts}
+
+    def _feed_vix(self, window_dates: List[date]) -> Dict:
+        """Worker: load + process all VIX feature data for the window."""
+        all_vix_feats, all_vix_ts = [], []
+        for d in window_dates:
+            res = self._load_vix_features_with_timestamps(d)
+            if res is not None:
+                all_vix_feats.append(res[0])
+                all_vix_ts.append(res[1])
+        if not all_vix_feats:
+            return {'vix_feats': None}
+        vix_feats = np.concatenate(all_vix_feats, axis=0)
+        vix_ts = np.concatenate(all_vix_ts, axis=0)
+        if len(vix_feats) > self.max_vix_bars:
+            vix_feats = vix_feats[-self.max_vix_bars:]
+            vix_ts = vix_ts[-self.max_vix_bars:]
+        vix_mask = (np.abs(vix_feats).sum(axis=1) > 1e-8).astype(np.float32)
+        if vix_mask.sum() > 0:
+            vix_feats = self._normalize_bars(vix_feats, mask=vix_mask)
+        return {'vix_feats': vix_feats, 'vix_ts': vix_ts, 'vix_mask': vix_mask}
+
+    def _feed_econ(self, window_dates: List[date], anchor_date) -> Dict:
+        """Worker: load + process econ calendar data for the window."""
+        econ_ids, econ_cur, econ_num, econ_ts = self._load_econ_events(
+            window_dates, anchor_date)
+        return {'econ_ids': econ_ids, 'econ_cur': econ_cur,
+                'econ_num': econ_num, 'econ_ts': econ_ts}
+
+    def _feed_options(self, loaded_days: List, total_bars: int) -> Dict:
+        """Worker: load + process options data (needs stock loaded_days)."""
+        all_options = []
+        for d, day_bar_count in loaded_days:
+            if day_bar_count > 0:
+                day_options = self._load_day_options(d, day_bar_count)
+                if day_options is not None:
+                    all_options.append(day_options)
+                else:
+                    all_options.append(np.zeros((day_bar_count, self.num_option_features),
+                                                dtype=np.float32))
+        if not all_options:
+            return {'options': None}
+        options = np.concatenate(all_options, axis=0)
+        if len(options) > total_bars:
+            options = options[-total_bars:]
+        elif len(options) < total_bars:
+            padded = np.zeros((total_bars, self.num_option_features), dtype=np.float32)
+            padded[-len(options):] = options
+            options = padded
+        options_mask = (np.abs(options).sum(axis=1) > 1e-8).astype(np.float32)
+        if options_mask.sum() > 0:
+            options = self._normalize_bars(options, mask=options_mask)
+        return {'options': options, 'options_mask': options_mask}
+
+    # ------------------------------------------------------------------
+    # __getitem__  — parallel feed loading
+    # ------------------------------------------------------------------
+
     def __getitem__(self, idx: int) -> Dict:
-        """Get single sample by index. Data cached in RAM after first load."""
+        """Get single sample by index. Uses memmaps if available, else threads."""
+        # ── Memmap fast path (microseconds) ───────────────────────────
+        if self._use_memmaps:
+            return self._getitem_memmap(idx)
+
+        import time as _time
+        _t0 = _time.time()
         sample = self.anchor_dates[idx]
         window_dates = sample['window_dates']
         vix_targets = sample['vix_targets']      # [4] multi-horizon targets
         horizon_mask = sample['horizon_mask']    # [4] validity mask
+        pool = _get_io_pool()
 
-        # Load bars for all lookback days (with timestamps if using news, macro, gdelt, or econ)
-        need_timestamps = self.use_news or self.use_macro or self.use_gdelt or self.use_econ or self.use_vix_features
-        all_bars = []
-        all_bar_ts = []
-        loaded_days = []  # Track which days were successfully loaded
-        for d in window_dates:
-            file_path = self.stock_files.get(d)
-            if file_path is None:
-                continue
-            if need_timestamps:
-                result = self._load_day_bars_with_timestamps(file_path)
-                if result is not None:
-                    all_bars.append(result[0])
-                    all_bar_ts.append(result[1])
-                    loaded_days.append((d, len(result[0])))
-            else:
-                day_bars = self._load_day_bars(file_path)
-                if day_bars is not None:
-                    all_bars.append(day_bars)
-                    loaded_days.append((d, len(day_bars)))
+        # ── Launch independent feeds in parallel ──────────────────────
+        stock_fut = pool.submit(self._feed_stock, window_dates)
+        news_fut  = pool.submit(self._feed_news, window_dates)  if self.use_news   else None
+        gdelt_fut = pool.submit(self._feed_gdelt, window_dates) if self.use_gdelt  else None
+        vix_fut   = pool.submit(self._feed_vix, window_dates)   if self.use_vix_features else None
+        econ_fut  = pool.submit(self._feed_econ, window_dates, sample['anchor_date']) if self.use_econ else None
+
+        # ── Wait for stock (others keep running) ──────────────────────
+        stock = stock_fut.result()
+        all_bars = stock['all_bars']
+        all_bar_ts = stock['all_bar_ts']
+        loaded_days = stock['loaded_days']
+        need_timestamps = stock['need_timestamps']
 
         if not all_bars:
-            # Return empty sample (will be filtered by collate)
+            # Empty sample — cancel pending futures and return zeros
             result = {
                 'bars': torch.zeros(1, self.num_features),
                 'vix_targets': torch.zeros(NUM_HORIZONS, dtype=torch.float32),
@@ -1438,163 +2020,115 @@ class BarMambaDataset(Dataset):
                 result['fundamentals_context'] = torch.zeros(max(self.fundamentals_dim, 1), dtype=torch.float32)
             return result
 
-        # Concatenate all days into one sequence
+        # ── Assemble stock bars ───────────────────────────────────────
         bars = np.concatenate(all_bars, axis=0)
         if need_timestamps:
             bar_timestamps = np.concatenate(all_bar_ts, axis=0)
-
-        # Cap total sequence length
         if len(bars) > self.max_total_bars:
             bars = bars[-self.max_total_bars:]
             if need_timestamps:
                 bar_timestamps = bar_timestamps[-self.max_total_bars:]
-
-        # Normalize bars (not targets — VIX change stays in raw points)
         bars = self._normalize_bars(bars)
+
+        # ── Launch options now that we have loaded_days ────────────────
+        options_fut = (pool.submit(self._feed_options, loaded_days, len(bars))
+                       if self.use_options else None)
 
         result = {
             'bars': torch.from_numpy(bars),
-            'vix_targets': torch.tensor(vix_targets, dtype=torch.float32),      # [4] horizons
-            'horizon_mask': torch.tensor(horizon_mask, dtype=torch.float32),    # [4] validity
+            'vix_targets': torch.tensor(vix_targets, dtype=torch.float32),
+            'horizon_mask': torch.tensor(horizon_mask, dtype=torch.float32),
             'num_bars': len(bars),
             'anchor_date': str(sample['anchor_date']),
         }
-
-        # Add bar timestamps if needed by news or macro
         if need_timestamps:
             result['bar_timestamps'] = torch.from_numpy(bar_timestamps)
-        
-        # Add news data if enabled
-        if self.use_news:
-            news_embs, news_ts = self._load_news(window_dates)
-            result['news_embs'] = torch.from_numpy(news_embs)
-            result['news_timestamps'] = torch.from_numpy(news_ts)
-            result['num_news'] = len(news_embs)
-        
-        # Add GDELT data if enabled
-        if self.use_gdelt:
-            gdelt_embs, gdelt_ts = self._load_gdelt(window_dates)
-            result['gdelt_embs'] = torch.from_numpy(gdelt_embs.copy())
-            result['gdelt_timestamps'] = torch.from_numpy(gdelt_ts.copy())
-            result['num_gdelt'] = len(gdelt_embs)
-        
-        # Add macro context if enabled (T-1 lookup)
+
+        # ── Gather news (already running in thread) ───────────────────
+        if news_fut is not None:
+            news = news_fut.result()
+            result['news_embs'] = torch.from_numpy(news['news_embs'])
+            result['news_timestamps'] = torch.from_numpy(news['news_ts'])
+            result['num_news'] = len(news['news_embs'])
+
+        # ── Gather GDELT (already running in thread) ──────────────────
+        if gdelt_fut is not None:
+            gdelt = gdelt_fut.result()
+            result['gdelt_embs'] = torch.from_numpy(gdelt['gdelt_embs'].copy())
+            result['gdelt_timestamps'] = torch.from_numpy(gdelt['gdelt_ts'].copy())
+            result['num_gdelt'] = len(gdelt['gdelt_embs'])
+
+        # ── Macro context (instant dict lookup, not worth threading) ──
         if self.use_macro and self.macro_data is not None:
             anchor = sample['anchor_date']
-            # Find T-1: the macro_data is already shifted by 1 day in build script,
-            # so we just look up the anchor date directly
             if anchor in self.macro_data.index:
                 macro_vec = self.macro_data.loc[anchor].values.astype(np.float32)
             else:
-                # Find nearest earlier date
                 earlier = self.macro_data.index[self.macro_data.index <= anchor]
                 if len(earlier) > 0:
                     macro_vec = self.macro_data.loc[earlier[-1]].values.astype(np.float32)
                 else:
                     macro_vec = np.zeros(self.macro_dim, dtype=np.float32)
-            # Apply global z-score normalization (using training period stats)
             macro_vec = np.nan_to_num(macro_vec, nan=0.0, posinf=0.0, neginf=0.0)
             if self.macro_mean is not None and self.macro_std is not None:
                 macro_vec = (macro_vec - self.macro_mean) / self.macro_std
             result['macro_context'] = torch.from_numpy(macro_vec)
-        
-        # Add fundamentals context if enabled (cross-attention state)
+
+        # ── Fundamentals (instant dict lookup) ────────────────────────
         if self.use_fundamentals and self.fundamentals_data is not None:
             anchor = sample['anchor_date']
             if anchor in self.fundamentals_data.index:
                 fund_vec = self.fundamentals_data.loc[anchor].values.astype(np.float32)
             else:
-                # Find nearest earlier date
                 earlier = self.fundamentals_data.index[self.fundamentals_data.index <= anchor]
                 if len(earlier) > 0:
                     fund_vec = self.fundamentals_data.loc[earlier[-1]].values.astype(np.float32)
                 else:
                     fund_vec = np.zeros(self.fundamentals_dim, dtype=np.float32)
-            # Apply global z-score normalization (using training period stats)
             fund_vec = np.nan_to_num(fund_vec, nan=0.0, posinf=0.0, neginf=0.0)
             if self.fundamentals_mean is not None and self.fundamentals_std is not None:
                 fund_vec = (fund_vec - self.fundamentals_mean) / self.fundamentals_std
             result['fundamentals_context'] = torch.from_numpy(fund_vec)
-        
-        # Add econ calendar data if enabled
-        if self.use_econ:
-            anchor = sample['anchor_date']
-            econ_ids, econ_cur, econ_num, econ_ts = self._load_econ_events(window_dates, anchor)
-            result['econ_event_ids'] = torch.from_numpy(econ_ids.astype(np.int64))
-            result['econ_currency_ids'] = torch.from_numpy(econ_cur.astype(np.int64))
-            result['econ_numeric'] = torch.from_numpy(econ_num)
-            result['econ_timestamps'] = torch.from_numpy(econ_ts)
-            result['num_econ'] = len(econ_ids)
-        
-        # Add option data if enabled
-        if self.use_options:
-            all_options = []
-            for d, day_bar_count in loaded_days:
-                # Use loaded_days which tracks actual days with stock data
-                if day_bar_count > 0:
-                    day_options = self._load_day_options(d, day_bar_count)
-                    if day_options is not None:
-                        all_options.append(day_options)
-                    else:
-                        # No options for this day - zero fill
-                        all_options.append(np.zeros((day_bar_count, self.num_option_features), dtype=np.float32))
-            
-            if all_options:
-                options = np.concatenate(all_options, axis=0)
-                # Cap to match bars length
-                if len(options) > len(bars):
-                    options = options[-len(bars):]
-                elif len(options) < len(bars):
-                    padded = np.zeros((len(bars), self.num_option_features), dtype=np.float32)
-                    padded[-len(options):] = options
-                    options = padded
-                # Create mask BEFORE normalization: 1 where we have actual option data
-                options_mask = (np.abs(options).sum(axis=1) > 1e-8).astype(np.float32)
-                # Normalize options using only non-masked values for stats
-                if options_mask.sum() > 0:
-                    options = self._normalize_bars(options, mask=options_mask)
-                result['options'] = torch.from_numpy(options)
-                result['options_mask'] = torch.from_numpy(options_mask)
+
+        # ── Gather econ (already running in thread) ───────────────────
+        if econ_fut is not None:
+            econ = econ_fut.result()
+            result['econ_event_ids'] = torch.from_numpy(econ['econ_ids'].astype(np.int64))
+            result['econ_currency_ids'] = torch.from_numpy(econ['econ_cur'].astype(np.int64))
+            result['econ_numeric'] = torch.from_numpy(econ['econ_num'])
+            result['econ_timestamps'] = torch.from_numpy(econ['econ_ts'])
+            result['num_econ'] = len(econ['econ_ids'])
+
+        # ── Gather options (launched after stock) ─────────────────────
+        if options_fut is not None:
+            opt = options_fut.result()
+            if opt['options'] is not None:
+                result['options'] = torch.from_numpy(opt['options'])
+                result['options_mask'] = torch.from_numpy(opt['options_mask'])
             else:
                 result['options'] = torch.zeros(len(bars), self.num_option_features)
                 result['options_mask'] = torch.zeros(len(bars))
-        
-        # Add VIX features if enabled (with timestamps for checkpoint alignment)
-        # VIX runs extended hours (~540 bars/day) - kept as separate sequence
-        if self.use_vix_features:
-            all_vix_feats = []
-            all_vix_ts = []
-            for d in window_dates:
-                result_vix = self._load_vix_features_with_timestamps(d)
-                if result_vix is not None:
-                    all_vix_feats.append(result_vix[0])
-                    all_vix_ts.append(result_vix[1])
-            
-            if all_vix_feats:
-                vix_feats = np.concatenate(all_vix_feats, axis=0)
-                vix_ts = np.concatenate(all_vix_ts, axis=0)
-                
-                # Cap VIX sequence length (keep most recent bars)
-                if len(vix_feats) > self.max_vix_bars:
-                    vix_feats = vix_feats[-self.max_vix_bars:]
-                    vix_ts = vix_ts[-self.max_vix_bars:]
-                
-                # Create mask: 1 where we have actual VIX data
-                vix_mask = (np.abs(vix_feats).sum(axis=1) > 1e-8).astype(np.float32)
-                
-                # Normalize VIX features
-                if vix_mask.sum() > 0:
-                    vix_feats = self._normalize_bars(vix_feats, mask=vix_mask)
-                
-                result['vix_features'] = torch.from_numpy(vix_feats)
-                result['vix_timestamps'] = torch.from_numpy(vix_ts)
-                result['vix_mask'] = torch.from_numpy(vix_mask)
-                result['num_vix'] = len(vix_feats)
+
+        # ── Gather VIX features (already running in thread) ───────────
+        if vix_fut is not None:
+            vix = vix_fut.result()
+            if vix['vix_feats'] is not None:
+                result['vix_features'] = torch.from_numpy(vix['vix_feats'])
+                result['vix_timestamps'] = torch.from_numpy(vix['vix_ts'])
+                result['vix_mask'] = torch.from_numpy(vix['vix_mask'])
+                result['num_vix'] = len(vix['vix_feats'])
             else:
                 result['vix_features'] = torch.zeros(0, self.num_vix_features)
                 result['vix_timestamps'] = torch.zeros(0, dtype=torch.long)
                 result['vix_mask'] = torch.zeros(0)
                 result['num_vix'] = 0
+
+        # Log progress for first batch (cold cache)
+        BarMambaDataset._samples_loaded += 1
+        n = BarMambaDataset._samples_loaded
+        elapsed = _time.time() - _t0
+        if n <= 64 and (n <= 3 or n % 8 == 0):
+            logger.info(f"Sample {n} loaded in {elapsed:.1f}s (idx={idx}, {len(window_dates)}d, {result['num_bars']} bars)")
 
         return result
 

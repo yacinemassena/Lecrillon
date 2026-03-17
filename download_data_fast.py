@@ -40,6 +40,7 @@ PATHS = {
     'gdelt': f'{DATASETS_ROOT}/GDELT',
     'econ': f'{DATASETS_ROOT}/econ_calendar',
     'fundamentals': f'{DATASETS_ROOT}/fundamentals',
+    'preprocessed': f'{DATASETS_ROOT}/preprocessed',
     'full': DATASETS_ROOT,
 }
 
@@ -242,7 +243,7 @@ Performance Tips:
                         help='Start year for range download')
     parser.add_argument('--end-year', type=int, 
                         help='End year for range download')
-    parser.add_argument('--data-type', choices=['stock', 'vix', 'options', 'news', 'macro', 'gdelt', 'econ', 'fundamentals', 'all', 'full'], 
+    parser.add_argument('--data-type', choices=['stock', 'vix', 'options', 'news', 'macro', 'gdelt', 'econ', 'fundamentals', 'preprocessed', 'all', 'full'], 
                         default='all', help='Type of data to download (default: all)')
     
     # Directory options
@@ -300,12 +301,13 @@ Performance Tips:
         'gdelt': Path('datasets/GDELT'),
         'econ': Path('datasets/econ_calendar'),
         'fundamentals': Path('datasets/fundamentals'),
+        'preprocessed': Path('datasets/preprocessed'),
         'full': Path('datasets'),
     }
     
     # Determine which data types to download
     if args.data_type == 'all':
-        data_types = ['stock', 'vix', 'options', 'news', 'macro', 'gdelt', 'econ', 'fundamentals']
+        data_types = ['stock', 'vix', 'options', 'news', 'macro', 'gdelt', 'econ', 'fundamentals', 'preprocessed']
     else:
         data_types = [args.data_type]
     
