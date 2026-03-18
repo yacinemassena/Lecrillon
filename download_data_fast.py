@@ -106,10 +106,10 @@ def build_include_filters(year: Optional[int] = None,
     filters = []
     if data_type in ['stock', 'options', 'news']:
         if year:
-            filters.extend(['--include', f'**/{year}-*'])
+            filters.extend(['--include', f'{year}-*'])
         else:
             for y in range(start_year, end_year + 1):
-                filters.extend(['--include', f'**/{y}-*'])
+                filters.extend(['--include', f'{y}-*'])
     # Other data types (vix, macro, gdelt, econ, fundamentals, preprocessed)
     # are small or don't have year-based filenames — download everything
     return filters
