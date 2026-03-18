@@ -554,6 +554,14 @@ def train_steps(model, loader, optimizer, criterion, scaler, device, num_steps,
                 f"VRAM={mem_reserved:.1f}GB"
             )
 
+    # Flush remaining accumulated gradients (partial group at end of epoch)
+    if grad_accum > 1 and num_batches % grad_accum != 0:
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        scaler.step(optimizer)
+        scaler.update()
+        optimizer.zero_grad(set_to_none=True)
+
     epoch_time = time.time() - epoch_start_time
     avg_iter_time = epoch_time / max(num_batches, 1)
     return total_loss / max(num_batches, 1), num_batches, avg_iter_time
@@ -862,6 +870,8 @@ def main():
                         help='Path to preprocessed memmaps (auto-detected from datasets/preprocessed)')
     parser.add_argument('--batch-size', type=int, default=cfg.batch_size,
                         help='Batch size for training')
+    parser.add_argument('--grad-accum', type=int, default=cfg.grad_accum,
+                        help='Gradient accumulation steps (effective batch = batch_size × grad_accum)')
     parser.add_argument('--train-start', type=str, default='2005-01-01',
                         help='Start date for training data (YYYY-MM-DD, default: 2005-01-01)')
     parser.add_argument('--train-end', type=str, default=cfg.train_end,
@@ -971,9 +981,10 @@ def main():
     if is_main:
         dashboard.start()
         dashboard.log(f"[dim]📝 Logs: {LOG_FILE}[/]")
-        dashboard.log(f"[bold cyan]📦 Config:[/] Batch: {args.batch_size} | IO threads: {io_label}")
+        eff_batch = args.batch_size * args.grad_accum
+        dashboard.log(f"[bold cyan]📦 Config:[/] Batch: {args.batch_size} × {args.grad_accum} accum = {eff_batch} effective | IO threads: {io_label}")
         dashboard.log(f"[bold cyan]📊 Config:[/] Seq={args.seq_len:,} | Epochs={args.epochs}")
-        logger.info(f"Config: batch={args.batch_size}, seq_len={args.seq_len}, epochs={args.epochs}, lr={args.lr}, use_news={args.use_news}, use_options={args.use_options}")
+        logger.info(f"Config: batch={args.batch_size}, grad_accum={args.grad_accum}, effective_batch={args.batch_size * args.grad_accum}, seq_len={args.seq_len}, epochs={args.epochs}, lr={args.lr}, use_news={args.use_news}, use_options={args.use_options}")
         if is_distributed:
             dashboard.log(f"[bold magenta]🚀 Distributed:[/] {world_size} GPUs")
         dashboard.state.total_epochs = args.epochs
@@ -1436,7 +1447,7 @@ def main():
         # Train
         train_loss, train_steps_count, avg_iter_time = train_steps(
             model, train_loader, optimizer, criterion, scaler,
-            device, args.train_steps, amp_dtype, epoch=epoch+1,
+            device, args.train_steps, amp_dtype, grad_accum=args.grad_accum, epoch=epoch+1,
         )
 
         # Validate (only on main process)
