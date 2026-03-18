@@ -879,7 +879,13 @@ def main():
     parser.add_argument('--val-end', type=str, default=cfg.val_end,
                         help='End date for validation data (YYYY-MM-DD)')
     parser.add_argument('--lr', type=float, default=cfg.lr,
-                        help='Learning rate (default: 1e-6, from HP sweep)')
+                        help='Learning rate (default: 1e-4)')
+    parser.add_argument('--weight-decay', type=float, default=cfg.weight_decay,
+                        help='AdamW weight decay (default: 1e-4)')
+    parser.add_argument('--scheduler', type=str, default=cfg.scheduler, choices=['none', 'cosine', 'plateau'],
+                        help='LR scheduler: none, cosine, plateau (default: cosine)')
+    parser.add_argument('--d-fusion', type=int, default=cfg.d_fusion,
+                        help='Wider fusion output dimension (default: 512)')
     parser.add_argument('--checkpoint-dir', type=str, default='checkpoints',
                         help='Directory to save checkpoints (default: checkpoints)')
     parser.add_argument('--save-every', type=int, default=5,
@@ -1350,6 +1356,7 @@ def main():
         vix_n_layers=args.vix_n_layers,
         vix_d_model=args.vix_d_model,
         vix_d_state=args.vix_d_state,
+        d_fusion=args.d_fusion,
     ).to(device)
     if is_main:
         dashboard.log(f"[bold magenta]🔀 Parallel streams:[/] checkpoint every {args.checkpoint_interval} bars")
@@ -1373,14 +1380,14 @@ def main():
         other_params = [p for p in model.parameters() if id(p) not in film_param_ids]
         optimizer = torch.optim.AdamW([
             {'params': other_params, 'lr': args.lr},
-            {'params': film_params, 'lr': args.lr * 10, 'weight_decay': 1e-4},
-        ], weight_decay=1e-5)
+            {'params': film_params, 'lr': args.lr, 'weight_decay': args.weight_decay},
+        ], weight_decay=args.weight_decay)
         if is_main:
-            dashboard.log(f"[dim]LR: {args.lr} (FiLM: {args.lr * 10})[/]")
+            dashboard.log(f"[dim]LR: {args.lr} (FiLM: {args.lr}, wd={args.weight_decay})[/]")
     else:
-        optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-5)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
         if is_main:
-            dashboard.log(f"[dim]LR: {args.lr}[/]")
+            dashboard.log(f"[dim]LR: {args.lr}, wd={args.weight_decay}[/]")
     # Spike-weighted multi-horizon loss
     criterion = SpikeWeightedHuberLoss(
         delta=0.25,
@@ -1391,6 +1398,24 @@ def main():
     )
     if is_main:
         dashboard.log(f"[dim]Loss: SpikeWeighted (spike≥{args.spike_thresh}pt→{args.spike_weight}×, extreme≥{args.extreme_thresh}pt→{args.extreme_weight}×)[/]")
+
+    # LR Scheduler
+    scheduler = None
+    if args.scheduler == 'cosine':
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=args.epochs, eta_min=args.lr * 0.01,
+        )
+        if is_main:
+            dashboard.log(f"[dim]Scheduler: CosineAnnealing (T_max={args.epochs}, eta_min={args.lr * 0.01:.2e})[/]")
+    elif args.scheduler == 'plateau':
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode='min', factor=0.5, patience=3, min_lr=args.lr * 0.01,
+        )
+        if is_main:
+            dashboard.log(f"[dim]Scheduler: ReduceLROnPlateau (factor=0.5, patience=3, min_lr={args.lr * 0.01:.2e})[/]")
+    else:
+        if is_main:
+            dashboard.log(f"[dim]Scheduler: none (fixed LR)[/]")
 
     # AMP
     amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
@@ -1542,6 +1567,16 @@ def main():
                     dashboard.log(f"[bold yellow]⏹ Early stopping triggered after {args.patience} epochs without improvement[/]")
                     logger.info(f"Early stopping at epoch {epoch+1} (patience={args.patience})")
                     break
+
+            # Step LR scheduler
+            if scheduler is not None:
+                if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                    scheduler.step(val_metrics['loss'])
+                else:
+                    scheduler.step()
+                current_lr = optimizer.param_groups[0]['lr']
+                dashboard.log(f"  [dim]LR: {current_lr:.2e}[/]")
+                logger.info(f"LR after scheduler step: {current_lr:.2e}")
 
             # Save checkpoint every N epochs (only on main process)
             if (epoch + 1) % args.save_every == 0:

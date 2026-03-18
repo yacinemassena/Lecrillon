@@ -542,6 +542,85 @@ class EconEncoder(nn.Module):
 
 
 
+class WideFusionHead(nn.Module):
+    """Wide fusion: concatenate all stream pooled outputs → project to d_fusion.
+    
+    Instead of compressing 4+ streams into d_model=256 via cross-attention,
+    this concatenates all available streams and projects to a wider d_fusion (e.g. 512).
+    The prediction head reads from d_fusion, preserving more multi-stream information.
+    
+    Architecture:
+        stream_outputs (up to 5 × d_model) → Linear(n*d_model, d_fusion) → LayerNorm → GELU
+        + residual from FusionGate output (projected to d_fusion)
+    """
+    
+    def __init__(self, d_model: int, d_fusion: int, max_streams: int = 5, dropout: float = 0.1):
+        super().__init__()
+        self.d_model = d_model
+        self.d_fusion = d_fusion
+        self.max_streams = max_streams
+        
+        # Projection from concatenated streams to d_fusion
+        # Input size = max_streams * d_model (pad with zeros for missing streams)
+        self.concat_proj = nn.Sequential(
+            nn.Linear(max_streams * d_model, d_fusion),
+            nn.LayerNorm(d_fusion),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+        
+        # Project FusionGate residual (d_model → d_fusion)
+        self.gate_residual_proj = nn.Linear(d_model, d_fusion)
+        
+        # Final norm after residual add
+        self.final_norm = nn.LayerNorm(d_fusion)
+    
+    def forward(
+        self,
+        fusion_gate_output: torch.Tensor,
+        stock_pooled: torch.Tensor,
+        news_pooled: Optional[torch.Tensor] = None,
+        options_pooled: Optional[torch.Tensor] = None,
+        fundamentals_state: Optional[torch.Tensor] = None,
+        vix_pooled: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Args:
+            fusion_gate_output: [B, d_model] - output from FusionGate (cross-attention)
+            stock_pooled: [B, d_model] - pooled stock stream
+            news_pooled: [B, d_model] - pooled news stream (optional)
+            options_pooled: [B, d_model] - pooled options stream (optional)
+            fundamentals_state: [B, d_model] - projected fundamentals (optional)
+            vix_pooled: [B, d_model] - pooled VIX stream (optional)
+        
+        Returns:
+            [B, d_fusion] - wide fused representation
+        """
+        B = stock_pooled.shape[0]
+        device = stock_pooled.device
+        zero = torch.zeros(B, self.d_model, device=device)
+        
+        # Concatenate all streams (pad missing with zeros)
+        # Order: stock, news, options, fundamentals, vix
+        streams = [
+            stock_pooled,
+            news_pooled if news_pooled is not None else zero,
+            options_pooled if options_pooled is not None else zero,
+            fundamentals_state if fundamentals_state is not None else zero,
+            vix_pooled if vix_pooled is not None else zero,
+        ]
+        concat = torch.cat(streams, dim=-1)  # [B, max_streams * d_model]
+        
+        # Wide projection
+        wide = self.concat_proj(concat)  # [B, d_fusion]
+        
+        # Add residual from FusionGate (carries cross-attention information)
+        gate_residual = self.gate_residual_proj(fusion_gate_output)  # [B, d_fusion]
+        out = self.final_norm(wide + gate_residual)
+        
+        return out
+
+
 class ParallelMambaVIX(nn.Module):
     """
     Parallel Mamba streams with periodic fusion checkpoints.
@@ -553,7 +632,7 @@ class ParallelMambaVIX(nn.Module):
             - Cross-attention fusion with learned gating
             - Stock state updated with fused context
         
-        Final: Pool all streams → Fuse → VIXHead → prediction
+        Final: Pool all streams → WideFusion → MultiHorizonVIXHead → prediction
     """
     
     def __init__(
@@ -587,9 +666,11 @@ class ParallelMambaVIX(nn.Module):
         vix_n_layers: int = 2,  # Lightweight VIX Mamba
         vix_d_model: int = 64,  # Smaller d_model for VIX (25 features vs stock's 50)
         vix_d_state: int = 16,  # Smaller state for VIX
+        d_fusion: int = 512,  # Wider fusion output dimension
     ):
         super().__init__()
         self.d_model = d_model
+        self.d_fusion = d_fusion
         self.n_layers = n_layers
         self.checkpoint_interval = checkpoint_interval
         self.use_news = use_news
@@ -707,6 +788,10 @@ class ParallelMambaVIX(nn.Module):
         # Fusion gate for checkpoint blending
         self.fusion_gate = FusionGate(d_model, num_heads=num_fusion_heads, dropout=dropout)
         
+        # Wide fusion: concat all streams → project to d_fusion
+        self.wide_fusion = WideFusionHead(d_model, d_fusion, max_streams=5, dropout=dropout)
+        logger.info(f"WideFusion: {5 * d_model} → {d_fusion} (concat + gate residual)")
+        
         # Auxiliary prediction heads (for per-stream losses) - single horizon for aux
         self.stock_aux_head = VIXHead(d_model, head_hidden, dropout)
         if use_news:
@@ -716,8 +801,8 @@ class ParallelMambaVIX(nn.Module):
         if use_vix_features:
             self.vix_aux_head = VIXHead(d_model, head_hidden, dropout)
         
-        # Final prediction head (from fused representation) - multi-horizon
-        self.final_head = MultiHorizonVIXHead(d_model, head_hidden, dropout)
+        # Final prediction head (from wide fused representation) - multi-horizon
+        self.final_head = MultiHorizonVIXHead(d_fusion, head_hidden, dropout)
         
         # Pooling for final states
         self.pool = SequencePooling(d_model, 'attention')
@@ -1102,18 +1187,28 @@ class ParallelMambaVIX(nn.Module):
             results['vix_aux_pred'] = self.vix_aux_head(vix_pooled)
         
         # Final fused prediction
-        # Fuse final states from all streams
+        # Fuse final states from all streams via cross-attention gate
         final_news_state = news_pooled if ((self.use_news or self.use_gdelt) and news_outputs) else None
         final_options_state = options_pooled if (self.use_options and options_outputs) else None
         final_vix_state = vix_pooled if (self.use_vix_features and vix_outputs) else None
         
-        final_fused = self.fusion_gate(
+        gate_output = self.fusion_gate(
             stock_pooled, 
             final_news_state, 
             final_options_state, 
             fund_state,
             final_vix_state,
         )
-        results['vix_pred'] = self.final_head(final_fused)
+        
+        # Wide fusion: concat all streams + gate residual → d_fusion
+        wide_fused = self.wide_fusion(
+            gate_output,
+            stock_pooled,
+            news_pooled=final_news_state,
+            options_pooled=final_options_state,
+            fundamentals_state=fund_state,
+            vix_pooled=final_vix_state,
+        )
+        results['vix_pred'] = self.final_head(wide_fused)
         
         return results

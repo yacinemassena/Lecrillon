@@ -22,7 +22,7 @@ class TrainConfig:
     d_model: int = 256              # Model hidden dimension (scaled down for ~5k samples)
     n_layers: int = 4               # Number of Mamba layers (stock/options streams)
     news_n_layers: int = 2          # Fewer layers for sparse news sequences
-    d_state: int = 64               # Mamba state dimension
+    d_state: int = 128              # Mamba state dimension (128 for richer temporal memory)
     checkpoint_interval: int = 300  # Fusion checkpoint every N bars (300 = 5 min)
     use_news: bool = True           # Enable news stream by default
     use_options: bool = True        # Enable options stream by default
@@ -33,10 +33,15 @@ class TrainConfig:
     use_vix_features: bool = True   # Enable VIX Mamba stream (extended hours, ~540 bars/day)
     vix_n_layers: int = 2           # Lightweight VIX Mamba (2 layers vs 4 for stock)
     vix_d_model: int = 64           # Smaller d_model for VIX (25 features vs stock's 50)
-    vix_d_state: int = 16           # Smaller state for VIX
+    vix_d_state: int = 32           # VIX state dimension (proportional to d_state bump)
     
     # Learning rate (1e-4 for multimodal training with news/options injection)
     lr: float = 1e-4
+    weight_decay: float = 1e-4         # AdamW weight decay (increased from 1e-5 for regularization)
+    scheduler: str = 'cosine'          # LR scheduler: 'none', 'cosine', 'plateau'
+    
+    # Fusion
+    d_fusion: int = 512                 # Wider fusion output dimension (concat streams → project to d_fusion)
     
     # Dates (2025+ reserved as untouched test set)
     train_end: str = '2024-03-31'   # End of training data
