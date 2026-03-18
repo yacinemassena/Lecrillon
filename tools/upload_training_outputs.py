@@ -58,15 +58,17 @@ def upload_training_outputs(
     uploaded_count = 0
     total_size = 0
     
-    # Upload checkpoints
+    # Upload checkpoints (recursively find in subdirectories like checkpoints/best/)
     if not logs_only and not reports_only:
         checkpoints_dir = workspace_root / "checkpoints"
         if checkpoints_dir.exists():
-            checkpoint_files = list(checkpoints_dir.glob("*.pt")) + list(checkpoints_dir.glob("*.pth"))
+            checkpoint_files = list(checkpoints_dir.rglob("*.pt")) + list(checkpoints_dir.rglob("*.pth"))
             if checkpoint_files:
                 print(f"\n📦 Uploading {len(checkpoint_files)} checkpoint(s)...")
                 for ckpt_file in checkpoint_files:
-                    s3_key = f"{base_prefix}/checkpoints/{ckpt_file.name}"
+                    # Preserve subdirectory structure (e.g., best/checkpoint.pt)
+                    relative_path = ckpt_file.relative_to(checkpoints_dir)
+                    s3_key = f"{base_prefix}/checkpoints/{relative_path.as_posix()}"
                     if upload_file(s3_client, ckpt_file, s3_key, verbose):
                         uploaded_count += 1
                         total_size += ckpt_file.stat().st_size
