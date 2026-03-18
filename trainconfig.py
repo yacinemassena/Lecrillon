@@ -16,7 +16,7 @@ class TrainConfig:
     train_steps: int = 0            # Steps per epoch (0 = auto from dataset size)
     val_steps: int = 0              # Validation steps (0 = full validation)
     batch_size: int = 16            # Batch size (16 good for RTX 5080)
-    grad_accum: int = 1             # Gradient accumulation steps (effective batch = batch_size × grad_accum)
+    grad_accum: int = 2             # Gradient accumulation steps (effective batch = batch_size × grad_accum, default 2 for stability)
     
     # Model architecture
     d_model: int = 256              # Model hidden dimension (scaled down for ~5k samples)
