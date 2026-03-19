@@ -38,6 +38,7 @@ def upload_training_outputs(
     logs_only: bool = False,
     reports_only: bool = False,
     verbose: bool = True,
+    max_age_hours: Optional[float] = None,
 ) -> int:
     """Upload training outputs to R2.
     
@@ -58,11 +59,21 @@ def upload_training_outputs(
     uploaded_count = 0
     total_size = 0
     
+    # Time filter
+    import time
+    now = time.time()
+    def is_recent(f: Path) -> bool:
+        if max_age_hours is None:
+            return True
+        age_hours = (now - f.stat().st_mtime) / 3600
+        return age_hours <= max_age_hours
+    
     # Upload checkpoints (recursively find in subdirectories like checkpoints/best/)
     if not logs_only and not reports_only:
         checkpoints_dir = workspace_root / "checkpoints"
         if checkpoints_dir.exists():
             checkpoint_files = list(checkpoints_dir.rglob("*.pt")) + list(checkpoints_dir.rglob("*.pth"))
+            checkpoint_files = [f for f in checkpoint_files if is_recent(f)]
             if checkpoint_files:
                 print(f"\n📦 Uploading {len(checkpoint_files)} checkpoint(s)...")
                 for ckpt_file in checkpoint_files:
@@ -82,6 +93,7 @@ def upload_training_outputs(
         logs_dir = workspace_root / "logs"
         if logs_dir.exists():
             log_files = list(logs_dir.glob("*.log")) + list(logs_dir.glob("*.txt"))
+            log_files = [f for f in log_files if is_recent(f)]
             if log_files:
                 print(f"\n📝 Uploading {len(log_files)} log file(s)...")
                 for log_file in log_files:
@@ -96,6 +108,7 @@ def upload_training_outputs(
         
         # Also upload root-level log files (like train_8000_b24.log)
         root_logs = list(workspace_root.glob("*.log")) + list(workspace_root.glob("train_*.log"))
+        root_logs = [f for f in root_logs if is_recent(f)]
         if root_logs:
             print(f"\n📝 Uploading {len(root_logs)} root-level log file(s)...")
             for log_file in root_logs:
@@ -110,7 +123,7 @@ def upload_training_outputs(
             reports_dir = workspace_root / reports_dir_name
             if reports_dir.exists():
                 report_files = list(reports_dir.rglob("*"))
-                report_files = [f for f in report_files if f.is_file()]
+                report_files = [f for f in report_files if f.is_file() and is_recent(f)]
                 if report_files:
                     print(f"\n📊 Uploading {len(report_files)} file(s) from {reports_dir_name}/...")
                     for report_file in report_files:
@@ -162,8 +175,16 @@ Examples:
                         help='Upload only reports/results')
     parser.add_argument('--quiet', action='store_true',
                         help='Suppress per-file output')
+    parser.add_argument('--max-age-hours', type=float, default=None,
+                        help='Only upload files modified within N hours (default: all files)')
+    parser.add_argument('--recent', action='store_true',
+                        help='Shortcut for --max-age-hours 24 (last 24 hours)')
     
     args = parser.parse_args()
+    
+    max_age = args.max_age_hours
+    if args.recent:
+        max_age = 24.0
     
     uploaded = upload_training_outputs(
         run_id=args.run_id,
@@ -171,6 +192,7 @@ Examples:
         logs_only=args.logs_only,
         reports_only=args.reports_only,
         verbose=not args.quiet,
+        max_age_hours=max_age,
     )
     
     sys.exit(0 if uploaded > 0 else 1)
