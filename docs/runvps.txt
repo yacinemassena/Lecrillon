@@ -48,3 +48,10 @@ python train.py --seq-len 15000 --preprocessed-path datasets/preprocessed
 wsl
 cd /mnt/d/Mamba\ v2
 source venv/bin/activate
+
+grad accum : 
+# RTX 5080: batch=3 fits, simulate effective batch=12
+python train.py --batch-size 3 --grad-accum 4
+ 
+# A100: batch=16 fits, simulate effective batch=64
+python train.py --batch-size 16 --grad-accum 4

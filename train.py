@@ -847,6 +847,94 @@ def run_real_data_preflight(
 
 
 # ---------------------------------------------------------------------------
+# Phased Pre-Training Helpers
+# ---------------------------------------------------------------------------
+def load_pretrained_weights(model, args, device, is_main=True):
+    """Load Phase 1 pre-trained stream weights into ParallelMambaVIX model.
+    
+    Loads encoder + Mamba weights for each stream. FiLM is loaded from stock
+    checkpoint (strongest stream, 4-layer FiLM matches main model).
+    """
+    loaded = []
+
+    # Stock
+    if args.pretrained_stock and Path(args.pretrained_stock).exists():
+        ckpt = torch.load(args.pretrained_stock, map_location=device)
+        model.stock_encoder.load_state_dict(ckpt['encoder'])
+        model.stock_mamba.load_state_dict(ckpt['mamba'])
+        # Load FiLM from stock (canonical 4-layer match)
+        model.film_generator.load_state_dict(ckpt['film'])
+        loaded.append(f"stock (val={ckpt.get('best_val_loss', '?'):.4f})")
+        if is_main:
+            logger.info(f"Loaded pretrained stock: {args.pretrained_stock}")
+            logger.info(f"  FiLM loaded from stock checkpoint")
+
+    # Options
+    if args.pretrained_options and Path(args.pretrained_options).exists():
+        ckpt = torch.load(args.pretrained_options, map_location=device)
+        model.options_encoder.load_state_dict(ckpt['encoder'])
+        model.options_mamba.load_state_dict(ckpt['mamba'])
+        loaded.append(f"options (val={ckpt.get('best_val_loss', '?'):.4f})")
+        if is_main:
+            logger.info(f"Loaded pretrained options: {args.pretrained_options}")
+
+    # News (multiple encoder components)
+    if args.pretrained_news and Path(args.pretrained_news).exists():
+        ckpt = torch.load(args.pretrained_news, map_location=device)
+        model.news_encoder.load_state_dict(ckpt['news_encoder'])
+        model.news_mamba.load_state_dict(ckpt['mamba'])
+        model.news_type_embedding.load_state_dict(ckpt['type_embedding'])
+        if 'gdelt_encoder' in ckpt:
+            model.gdelt_encoder.load_state_dict(ckpt['gdelt_encoder'])
+            model.gdelt_embed_norm.load_state_dict(ckpt['gdelt_embed_norm'])
+            model.gdelt_stats_norm.load_state_dict(ckpt['gdelt_stats_norm'])
+        if 'econ_encoder' in ckpt:
+            model.econ_encoder.load_state_dict(ckpt['econ_encoder'])
+        loaded.append(f"news (val={ckpt.get('best_val_loss', '?'):.4f})")
+        if is_main:
+            logger.info(f"Loaded pretrained news: {args.pretrained_news}")
+
+    # VIX
+    if args.pretrained_vix and Path(args.pretrained_vix).exists():
+        ckpt = torch.load(args.pretrained_vix, map_location=device)
+        model.vix_encoder.load_state_dict(ckpt['encoder'])
+        model.vix_mamba.load_state_dict(ckpt['mamba'])
+        loaded.append(f"vix (val={ckpt.get('best_val_loss', '?'):.4f})")
+        if is_main:
+            logger.info(f"Loaded pretrained VIX: {args.pretrained_vix}")
+
+    return loaded
+
+
+def freeze_stream_params(model, is_main=True):
+    """Freeze all stream encoder/Mamba parameters for Phase 2.
+    
+    Leaves trainable: FusionGate, WideFusionHead, MultiHorizonVIXHead,
+    aux heads, SequencePooling, fundamentals_proj, film_generator.
+    """
+    freeze_prefixes = [
+        'stock_encoder', 'stock_mamba',
+        'options_encoder', 'options_mamba',
+        'news_encoder', 'news_mamba', 'news_type_embedding',
+        'vix_encoder', 'vix_mamba', 'vix_proj',
+        'gdelt_embed_norm', 'gdelt_stats_norm', 'gdelt_encoder',
+        'econ_encoder',
+    ]
+    frozen_count = 0
+    trainable_count = 0
+    for name, param in model.named_parameters():
+        if any(name.startswith(p) for p in freeze_prefixes):
+            param.requires_grad = False
+            frozen_count += param.numel()
+        else:
+            trainable_count += param.numel()
+
+    if is_main:
+        logger.info(f"Phase 2 freeze: {frozen_count:,} frozen, {trainable_count:,} trainable")
+    return frozen_count, trainable_count
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def main():
@@ -957,6 +1045,19 @@ def main():
                         help='Loss weight multiplier for extreme spikes (default: 5.0)')
     parser.add_argument('--diagnose', action='store_true',
                         help='Run verbose init diagnostics (train_diagnostics.py) then exit')
+    # Phased pre-training
+    parser.add_argument('--phase', type=int, default=0, choices=[0, 2, 3],
+                        help='Training phase: 0=normal, 2=freeze streams + train fusion, 3=fine-tune all (default: 0)')
+    parser.add_argument('--pretrained-stock', type=str, default=None,
+                        help='Path to pre-trained stock checkpoint (Phase 2)')
+    parser.add_argument('--pretrained-options', type=str, default=None,
+                        help='Path to pre-trained options checkpoint (Phase 2)')
+    parser.add_argument('--pretrained-news', type=str, default=None,
+                        help='Path to pre-trained news checkpoint (Phase 2)')
+    parser.add_argument('--pretrained-vix', type=str, default=None,
+                        help='Path to pre-trained VIX checkpoint (Phase 2)')
+    parser.add_argument('--film-lr', type=float, default=None,
+                        help='Separate LR for FiLM parameters (default: same as --lr)')
     args = parser.parse_args()
 
     # Run diagnostics if requested
@@ -993,6 +1094,10 @@ def main():
         logger.info(f"Config: batch={args.batch_size}, grad_accum={args.grad_accum}, effective_batch={args.batch_size * args.grad_accum}, seq_len={args.seq_len}, epochs={args.epochs}, lr={args.lr}, use_news={args.use_news}, use_options={args.use_options}")
         if is_distributed:
             dashboard.log(f"[bold magenta]🚀 Distributed:[/] {world_size} GPUs")
+        if args.phase > 0:
+            phase_labels = {2: 'Phase 2: Freeze Streams + Train Fusion', 3: 'Phase 3: Fine-Tune All'}
+            dashboard.log(f"[bold yellow]🔄 {phase_labels[args.phase]}[/]")
+            logger.info(f"Training phase: {args.phase}")
         dashboard.state.total_epochs = args.epochs
         dashboard.state.batch_size = args.batch_size
 
@@ -1361,31 +1466,60 @@ def main():
     if is_main:
         dashboard.log(f"[bold magenta]🔀 Parallel streams:[/] checkpoint every {args.checkpoint_interval} bars")
 
+    # --- Phase 2: Load pre-trained weights and freeze streams ---
+    if args.phase == 2:
+        loaded = load_pretrained_weights(model, args, device, is_main)
+        if is_main:
+            if loaded:
+                dashboard.log(f"[bold yellow]📦 Phase 2: Loaded pre-trained streams:[/] {', '.join(loaded)}")
+            else:
+                dashboard.log(f"[bold red]⚠ Phase 2: No pre-trained checkpoints loaded! Provide --pretrained-stock/options/news/vix[/]")
+                logger.warning("Phase 2 started without any pre-trained checkpoints")
+        frozen, trainable = freeze_stream_params(model, is_main)
+        if is_main:
+            dashboard.log(f"[bold yellow]🔒 Phase 2: {frozen:,} frozen | {trainable:,} trainable[/]")
+
+    # --- Phase 3: Unfreeze everything (checkpoint loaded via --resume below) ---
+    if args.phase == 3:
+        for param in model.parameters():
+            param.requires_grad = True
+        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        if is_main:
+            dashboard.log(f"[bold green]🔓 Phase 3: All {trainable:,} parameters unfrozen (fine-tune)[/]")
+            logger.info(f"Phase 3: All {trainable:,} parameters unfrozen")
+
     # Wrap model in DDP for multi-GPU training
     if is_distributed:
         model = DDP(model, device_ids=[local_rank], output_device=local_rank)
         if is_main:
             dashboard.log(f"[dim]Model wrapped in DistributedDataParallel[/]")
 
-    # Optimizer & loss — separate param group with 10x LR for FiLM generator
+    # Optimizer & loss — separate param group for FiLM generator
     if args.use_macro and hasattr(model, 'module'):
         # DDP wrapped
         base_model = model.module
     else:
         base_model = model
     
+    film_lr = args.film_lr if args.film_lr is not None else args.lr
+    # Phase 2/3: no weight decay on FiLM to prevent gamma collapse
+    film_wd = 0.0 if args.phase in (2, 3) else args.weight_decay
+    
     if args.use_macro and hasattr(base_model, 'film_generator'):
         film_params = list(base_model.film_generator.parameters())
         film_param_ids = set(id(p) for p in film_params)
-        other_params = [p for p in model.parameters() if id(p) not in film_param_ids]
+        # Only include trainable params in optimizer (Phase 2 freezes some)
+        other_params = [p for p in model.parameters() if id(p) not in film_param_ids and p.requires_grad]
+        trainable_film = [p for p in film_params if p.requires_grad]
         optimizer = torch.optim.AdamW([
             {'params': other_params, 'lr': args.lr},
-            {'params': film_params, 'lr': args.lr, 'weight_decay': args.weight_decay},
+            {'params': trainable_film, 'lr': film_lr, 'weight_decay': film_wd},
         ], weight_decay=args.weight_decay)
         if is_main:
-            dashboard.log(f"[dim]LR: {args.lr} (FiLM: {args.lr}, wd={args.weight_decay})[/]")
+            dashboard.log(f"[dim]LR: {args.lr} (FiLM: {film_lr}, film_wd={film_wd})[/]")
     else:
-        optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+        trainable_params = [p for p in model.parameters() if p.requires_grad]
+        optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
         if is_main:
             dashboard.log(f"[dim]LR: {args.lr}, wd={args.weight_decay}[/]")
     # Spike-weighted multi-horizon loss

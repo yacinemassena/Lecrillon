@@ -2,9 +2,18 @@
 
 ## Full-scale model (News, Options, Macro FiLM, GDELT, Econ Calendar, Fundamentals, VIX Mamba)
 
-| GPU | Seq Length | Batch | VRAM (GB) | Speed (s/it) |
-|-----|------------|-------|-----------|--------------|
-| RTX 5080 | 8,000 | 4 | 26 (OOM) | 6.0 |
+| GPU | Seq Length | Batch | VRAM (GB) | Speed (s/it) | Est. Training Time |
+|-----|------------|-------|-----------|--------------|-------------------|
+| RTX 5080 | 8,000 | 3 | 14 | 0.68 | - |
+| RTX 5080 | 8,000 | 4 | 26 (OOM) | 6.0 | - |
+| RTX 5090 | 8,000 | 8 | 21.7 | 2.0 | 96h |
+| RTX 6000 Pro Blackwell | 8,000 | 16 | 43.4 | 3.19 | - |
+| RTX 6000 Pro Blackwell | 8,000 | 24 | 65.4 | 5.0 | 53h |
+| RTX 6000 Pro Blackwell | 8,000 | 32 | 84.9 | 9.0 | - |
+| RTX 6000 Pro Blackwell | 15,000 | 16 | 75.9 | 7.0 | - |
+| A100 | 8,000 | 16 | 43 | 4.0 | 80h |
+| A100 | 15,000 | 16 | 75.9 | 10.0 | - |
+| H100 | 8,000 | 16 | 22-44 | 4 | - |
 
 
 ## Configuration: D=256, L=4, STATE=64, BATCH=16
