@@ -19,10 +19,26 @@ sys.path.insert(0, str(Path(__file__).parent))
 from r2_index.config import BUCKET_NAME, get_s3_client
 
 
-def upload_file(s3_client, local_path: Path, s3_key: str, verbose: bool = True) -> bool:
-    """Upload a single file to R2."""
+def file_exists_in_r2(s3_client, s3_key: str, local_size: int) -> bool:
+    """Check if file exists in R2 with same size."""
+    try:
+        head = s3_client.head_object(Bucket=BUCKET_NAME, Key=s3_key)
+        return head['ContentLength'] == local_size
+    except:
+        return False
+
+
+def upload_file(s3_client, local_path: Path, s3_key: str, verbose: bool = True, skip_existing: bool = True) -> bool:
+    """Upload a single file to R2. Skip if already exists with same size."""
     try:
         size_mb = local_path.stat().st_size / 1e6
+        local_size = local_path.stat().st_size
+        
+        if skip_existing and file_exists_in_r2(s3_client, s3_key, local_size):
+            if verbose:
+                print(f"  ⏭️  {local_path.name} (already in R2, skipping)")
+            return False  # Not uploaded, already exists
+        
         if verbose:
             print(f"  ⬆️  {local_path.name} ({size_mb:.1f} MB) -> {s3_key}")
         s3_client.upload_file(str(local_path), BUCKET_NAME, s3_key)
@@ -38,7 +54,6 @@ def upload_training_outputs(
     logs_only: bool = False,
     reports_only: bool = False,
     verbose: bool = True,
-    max_age_hours: Optional[float] = None,
 ) -> int:
     """Upload training outputs to R2.
     
@@ -58,22 +73,13 @@ def upload_training_outputs(
     
     uploaded_count = 0
     total_size = 0
-    
-    # Time filter
-    import time
-    now = time.time()
-    def is_recent(f: Path) -> bool:
-        if max_age_hours is None:
-            return True
-        age_hours = (now - f.stat().st_mtime) / 3600
-        return age_hours <= max_age_hours
+    skipped_count = 0
     
     # Upload checkpoints (recursively find in subdirectories like checkpoints/best/)
     if not logs_only and not reports_only:
         checkpoints_dir = workspace_root / "checkpoints"
         if checkpoints_dir.exists():
             checkpoint_files = list(checkpoints_dir.rglob("*.pt")) + list(checkpoints_dir.rglob("*.pth"))
-            checkpoint_files = [f for f in checkpoint_files if is_recent(f)]
             if checkpoint_files:
                 print(f"\n📦 Uploading {len(checkpoint_files)} checkpoint(s)...")
                 for ckpt_file in checkpoint_files:
@@ -83,6 +89,8 @@ def upload_training_outputs(
                     if upload_file(s3_client, ckpt_file, s3_key, verbose):
                         uploaded_count += 1
                         total_size += ckpt_file.stat().st_size
+                    else:
+                        skipped_count += 1
             else:
                 print("\n⚠️  No checkpoints found in checkpoints/")
         else:
@@ -93,7 +101,6 @@ def upload_training_outputs(
         logs_dir = workspace_root / "logs"
         if logs_dir.exists():
             log_files = list(logs_dir.glob("*.log")) + list(logs_dir.glob("*.txt"))
-            log_files = [f for f in log_files if is_recent(f)]
             if log_files:
                 print(f"\n📝 Uploading {len(log_files)} log file(s)...")
                 for log_file in log_files:
@@ -101,6 +108,8 @@ def upload_training_outputs(
                     if upload_file(s3_client, log_file, s3_key, verbose):
                         uploaded_count += 1
                         total_size += log_file.stat().st_size
+                    else:
+                        skipped_count += 1
             else:
                 print("\n⚠️  No log files found in logs/")
         else:
@@ -108,7 +117,6 @@ def upload_training_outputs(
         
         # Also upload root-level log files (like train_8000_b24.log)
         root_logs = list(workspace_root.glob("*.log")) + list(workspace_root.glob("train_*.log"))
-        root_logs = [f for f in root_logs if is_recent(f)]
         if root_logs:
             print(f"\n📝 Uploading {len(root_logs)} root-level log file(s)...")
             for log_file in root_logs:
@@ -116,6 +124,8 @@ def upload_training_outputs(
                 if upload_file(s3_client, log_file, s3_key, verbose):
                     uploaded_count += 1
                     total_size += log_file.stat().st_size
+                else:
+                    skipped_count += 1
     
     # Upload reports/results
     if not checkpoint_only and not logs_only:
@@ -123,7 +133,7 @@ def upload_training_outputs(
             reports_dir = workspace_root / reports_dir_name
             if reports_dir.exists():
                 report_files = list(reports_dir.rglob("*"))
-                report_files = [f for f in report_files if f.is_file() and is_recent(f)]
+                report_files = [f for f in report_files if f.is_file()]
                 if report_files:
                     print(f"\n📊 Uploading {len(report_files)} file(s) from {reports_dir_name}/...")
                     for report_file in report_files:
@@ -132,11 +142,14 @@ def upload_training_outputs(
                         if upload_file(s3_client, report_file, s3_key, verbose):
                             uploaded_count += 1
                             total_size += report_file.stat().st_size
+                        else:
+                            skipped_count += 1
     
     # Summary
     total_size_mb = total_size / 1e6
     print(f"\n✅ Upload complete!")
     print(f"   Files uploaded: {uploaded_count}")
+    print(f"   Files skipped (already in R2): {skipped_count}")
     print(f"   Total size: {total_size_mb:.1f} MB")
     print(f"   R2 prefix: {base_prefix}")
     print(f"\n💡 To download on another machine:")
@@ -175,16 +188,8 @@ Examples:
                         help='Upload only reports/results')
     parser.add_argument('--quiet', action='store_true',
                         help='Suppress per-file output')
-    parser.add_argument('--max-age-hours', type=float, default=None,
-                        help='Only upload files modified within N hours (default: all files)')
-    parser.add_argument('--recent', action='store_true',
-                        help='Shortcut for --max-age-hours 24 (last 24 hours)')
     
     args = parser.parse_args()
-    
-    max_age = args.max_age_hours
-    if args.recent:
-        max_age = 24.0
     
     uploaded = upload_training_outputs(
         run_id=args.run_id,
@@ -192,7 +197,6 @@ Examples:
         logs_only=args.logs_only,
         reports_only=args.reports_only,
         verbose=not args.quiet,
-        max_age_hours=max_age,
     )
     
     sys.exit(0 if uploaded > 0 else 1)
