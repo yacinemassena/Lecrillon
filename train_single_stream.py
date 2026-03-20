@@ -636,6 +636,9 @@ def main():
     parser.add_argument('--vix-d-state', type=int, default=16)
     parser.add_argument('--vix-n-layers', type=int, default=cfg.vix_n_layers)
     parser.add_argument('--preprocessed-path', type=str, default=None)
+    parser.add_argument('--predict-target', type=str, default=cfg.predict_target,
+                        choices=['vix', 'vxx', 'spy'],
+                        help='Prediction target ticker (default: vix)')
     args = parser.parse_args()
 
     if args.summarize:
@@ -760,6 +763,7 @@ def main():
         use_fundamentals=False,
         vix_features_path=vix_features_path, use_vix_features=use_vix_features,
         preprocessed_path=pp_path,
+        predict_target=args.predict_target,
     )
     val_dataset = BarMambaDataset(
         stock_data_path=stock_path, vix_data_path=vix_path,
@@ -774,6 +778,7 @@ def main():
         vix_features_path=vix_features_path, use_vix_features=use_vix_features,
         shared_state=train_dataset.get_shared_state(),
         preprocessed_path=pp_path,
+        predict_target=args.predict_target,
     )
 
     collate_fn = BarMambaDataset.collate_fn

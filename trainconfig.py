@@ -31,6 +31,7 @@ class TrainConfig:
     use_econ: bool = True           # Enable economic calendar integration (default on)
     use_fundamentals: bool = True   # Enable fundamentals cross-attention (sector state)
     use_vix_features: bool = True   # Enable VIX Mamba stream (extended hours, ~540 bars/day)
+    predict_target: str = 'vix'     # Prediction target: 'vix', 'vxx', or 'spy'
     vix_n_layers: int = 2           # Lightweight VIX Mamba (2 layers vs 4 for stock)
     vix_d_model: int = 64           # Smaller d_model for VIX (25 features vs stock's 50)
     vix_d_state: int = 32           # VIX state dimension (proportional to d_state bump)

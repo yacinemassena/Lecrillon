@@ -1034,6 +1034,9 @@ def main():
                         help='VIX Mamba state dimension (default: 16)')
     parser.add_argument('--checkpoint-interval', type=int, default=cfg.checkpoint_interval,
                         help='Fusion checkpoint interval in bars (default: 300 = 5 min)')
+    parser.add_argument('--predict-target', type=str, default=cfg.predict_target,
+                        choices=['vix', 'vxx', 'spy'],
+                        help='Prediction target ticker (default: vix)')
     # Spike-weighted loss parameters
     parser.add_argument('--spike-thresh', type=float, default=2.0,
                         help='VIX point change threshold for spike weighting (default: 2.0)')
@@ -1090,8 +1093,9 @@ def main():
         dashboard.log(f"[dim]📝 Logs: {LOG_FILE}[/]")
         eff_batch = args.batch_size * args.grad_accum
         dashboard.log(f"[bold cyan]📦 Config:[/] Batch: {args.batch_size} × {args.grad_accum} accum = {eff_batch} effective | IO threads: {io_label}")
-        dashboard.log(f"[bold cyan]📊 Config:[/] Seq={args.seq_len:,} | Epochs={args.epochs}")
-        logger.info(f"Config: batch={args.batch_size}, grad_accum={args.grad_accum}, effective_batch={args.batch_size * args.grad_accum}, seq_len={args.seq_len}, epochs={args.epochs}, lr={args.lr}, use_news={args.use_news}, use_options={args.use_options}")
+        target_label = args.predict_target.upper()
+        dashboard.log(f"[bold cyan]📊 Config:[/] Seq={args.seq_len:,} | Epochs={args.epochs} | Target={target_label}")
+        logger.info(f"Config: batch={args.batch_size}, grad_accum={args.grad_accum}, effective_batch={args.batch_size * args.grad_accum}, seq_len={args.seq_len}, epochs={args.epochs}, lr={args.lr}, predict_target={args.predict_target}, use_news={args.use_news}, use_options={args.use_options}")
         if is_distributed:
             dashboard.log(f"[bold magenta]🚀 Distributed:[/] {world_size} GPUs")
         if args.phase > 0:
@@ -1129,12 +1133,16 @@ def main():
         dashboard.log("[dim]Checking data availability...[/]")
     
     try:
-        has_overlap = check_data_overlap(data_paths)
-        if not has_overlap:
-            logger.error("No stock-VIX overlap found. Check your data paths.")
-            sys.exit(1)
+        if args.predict_target == 'vix':
+            has_overlap = check_data_overlap(data_paths)
+            if not has_overlap:
+                logger.error("No stock-VIX overlap found. Check your data paths.")
+                sys.exit(1)
+        else:
+            # VXX/SPY targets come from stock parquets — always available
+            has_overlap = True
         if is_main:
-            dashboard.log("[green]✓ Real data available[/]")
+            dashboard.log(f"[green]✓ Real data available (target={args.predict_target.upper()})[/]")
     except Exception as e:
         logger.error(f"Data check failed: {e}")
         sys.exit(1)
@@ -1357,6 +1365,7 @@ def main():
         vix_features_path=vix_features_path,
         use_vix_features=args.use_vix_features,
         preprocessed_path=pp_path,
+        predict_target=args.predict_target,
     )
     val_dataset = BarMambaDataset(
         stock_data_path=stock_path,
@@ -1382,6 +1391,7 @@ def main():
         use_vix_features=args.use_vix_features,
         shared_state=train_dataset.get_shared_state(),
         preprocessed_path=pp_path,
+        predict_target=args.predict_target,
     )
     num_features = train_dataset.num_features
     collate_fn = BarMambaDataset.collate_fn
@@ -1523,15 +1533,27 @@ def main():
         if is_main:
             dashboard.log(f"[dim]LR: {args.lr}, wd={args.weight_decay}[/]")
     # Spike-weighted multi-horizon loss
-    criterion = SpikeWeightedHuberLoss(
-        delta=0.25,
-        spike_thresh=args.spike_thresh,
-        extreme_thresh=args.extreme_thresh,
-        spike_weight=args.spike_weight,
-        extreme_weight=args.extreme_weight,
-    )
-    if is_main:
-        dashboard.log(f"[dim]Loss: SpikeWeighted (spike≥{args.spike_thresh}pt→{args.spike_weight}×, extreme≥{args.extreme_thresh}pt→{args.extreme_weight}×)[/]")
+    # SPY doesn't have spike/crush dynamics like VIX/VXX — disable spike weighting
+    if args.predict_target == 'spy':
+        criterion = SpikeWeightedHuberLoss(
+            delta=0.25,
+            spike_thresh=999.0,   # effectively disabled
+            extreme_thresh=999.0,
+            spike_weight=1.0,
+            extreme_weight=1.0,
+        )
+        if is_main:
+            dashboard.log(f"[dim]Loss: Huber (spike weighting disabled for SPY)[/]")
+    else:
+        criterion = SpikeWeightedHuberLoss(
+            delta=0.25,
+            spike_thresh=args.spike_thresh,
+            extreme_thresh=args.extreme_thresh,
+            spike_weight=args.spike_weight,
+            extreme_weight=args.extreme_weight,
+        )
+        if is_main:
+            dashboard.log(f"[dim]Loss: SpikeWeighted (spike≥{args.spike_thresh}pt→{args.spike_weight}×, extreme≥{args.extreme_thresh}pt→{args.extreme_weight}×)[/]")
 
     # LR Scheduler
     scheduler = None

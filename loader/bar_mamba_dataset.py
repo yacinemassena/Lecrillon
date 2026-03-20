@@ -373,6 +373,38 @@ def load_vix_daily_close(vix_dir: str) -> Dict:
     return daily_close
 
 
+def load_ticker_daily_close(stock_dir: str, ticker: str) -> Dict:
+    """Extract daily close for any ticker from stock 2-min parquets.
+    
+    Reads each date parquet, filters to `ticker`, takes last bar's close.
+    Used for --predict-target vxx/spy (alternative to VIX CSV targets).
+    """
+    stock_path = Path(stock_dir)
+    daily_close = {}
+
+    parquet_files = sorted(stock_path.glob('*.parquet'))
+    if not parquet_files:
+        logger.warning(f"No parquet files found in {stock_dir}")
+        return daily_close
+
+    ticker_upper = ticker.upper()
+    for pf in parquet_files:
+        if pf.name.startswith('._'):
+            continue
+        try:
+            date_str = pf.stem.split('.')[0]
+            dt = pd.to_datetime(date_str).date()
+            df = pd.read_parquet(pf, columns=['ticker', 'close'])
+            tf = df[df['ticker'] == ticker_upper]
+            if len(tf) > 0:
+                daily_close[dt] = float(tf['close'].iloc[-1])
+        except Exception as e:
+            continue
+
+    logger.info(f"Loaded {ticker_upper} daily close for {len(daily_close)} trading days")
+    return daily_close
+
+
 # ---------------------------------------------------------------------------
 # Dataset
 # ---------------------------------------------------------------------------
@@ -417,8 +449,10 @@ class BarMambaDataset(Dataset):
         max_vix_bars: int = 0,  # Cap on VIX sequence length (0 = auto: 2.7× max_total_bars)
         shared_state: Optional[Dict] = None,  # Pre-built indexes from train dataset
         preprocessed_path: Optional[str] = None,  # Path to preprocessed memmaps
+        predict_target: str = 'vix',  # 'vix', 'vxx', or 'spy'
     ):
         self.split = split
+        self.predict_target = predict_target.lower()  # 'vix', 'vxx', or 'spy'
         self.features = features or DEFAULT_FEATURES
         self.num_features = len(self.features)
         self.max_bars_per_day = max_bars_per_day
@@ -639,8 +673,12 @@ class BarMambaDataset(Dataset):
         if self.use_vix_features and self.vix_features_path:
             self._index_vix_feature_files()
 
-        # Load VIX daily close
-        self.vix_daily = load_vix_daily_close(vix_data_path)
+        # Load prediction target daily close
+        if self.predict_target == 'vix':
+            self.vix_daily = load_vix_daily_close(vix_data_path)
+        else:
+            self.vix_daily = load_ticker_daily_close(stock_data_path, self.predict_target)
+            logger.info(f"Predict target: {self.predict_target.upper()} (from stock parquets)")
 
         # Build valid anchor dates
         self.anchor_dates = self._build_anchor_dates()
