@@ -34,6 +34,7 @@ GDELT_PREFIX = f'{DATASETS_ROOT_PREFIX}GDELT/'
 ECON_PREFIX = f'{DATASETS_ROOT_PREFIX}econ_calendar/'
 FUNDAMENTALS_PREFIX = f'{DATASETS_ROOT_PREFIX}fundamentals/'
 PREPROCESSED_PREFIX = f'{DATASETS_ROOT_PREFIX}preprocessed/'
+CHECKPOINTS_PREFIX = 'checkpoints/'
 
 
 def _matches_year_filter(relative_path: str,
@@ -446,6 +447,9 @@ Examples:
   
   # Download preprocessed memmaps (fast loading, ~25 GB)
   python download_data.py --data-type preprocessed
+
+  # Download Phase 1 checkpoints (~30 MB)
+  python download_data.py --data-type checkpoints
   
   # Download all data types for 2024 (year filter applies to ALL types)
   python download_data.py --year 2024 --data-type all
@@ -464,7 +468,7 @@ Examples:
     parser.add_argument('--year', type=int, help='Specific year to download (e.g., 2024) - applies to ALL data types')
     parser.add_argument('--start-year', type=int, help='Start year for range download - applies to ALL data types')
     parser.add_argument('--end-year', type=int, help='End year for range download - applies to ALL data types')
-    parser.add_argument('--data-type', choices=['stock', 'vix', 'options', 'news', 'macro', 'gdelt', 'econ', 'fundamentals', 'preprocessed', 'all', 'full'], default='all',
+    parser.add_argument('--data-type', choices=['stock', 'vix', 'options', 'news', 'macro', 'gdelt', 'econ', 'fundamentals', 'preprocessed', 'checkpoints', 'all', 'full'], default='all',
                        help='Type of data to download (default: all)')
     parser.add_argument('--stock-dir', type=Path, default=Path('datasets/Stock_Data_2min'),
                        help='Local directory for stock data (default: datasets/Stock_Data_2min)')
@@ -577,6 +581,11 @@ Examples:
 
     if args.data_type in ['preprocessed', 'all']:
         _download_prefix(s3, PREPROCESSED_PREFIX, Path('datasets/preprocessed'), 'Preprocessed memmaps',
+                         force=args.force)
+        print()
+
+    if args.data_type in ['checkpoints', 'all']:
+        _download_prefix(s3, CHECKPOINTS_PREFIX, Path('checkpoints'), 'Checkpoints',
                          force=args.force)
         print()
     
