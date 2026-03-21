@@ -984,10 +984,6 @@ def main():
                         help='LR scheduler: none, cosine, plateau (default: cosine)')
     parser.add_argument('--d-fusion', type=int, default=cfg.d_fusion,
                         help='Wider fusion output dimension (default: 512)')
-    parser.add_argument('--d-state', type=int, default=cfg.d_state,
-                        help='Mamba state dimension (default: 128, Phase 1 checkpoints use 64)')
-    parser.add_argument('--vix-d-state', type=int, default=cfg.vix_d_state,
-                        help='VIX Mamba state dimension (default: 32, Phase 1 checkpoints use 16)')
     parser.add_argument('--checkpoint-dir', type=str, default='checkpoints',
                         help='Base directory for checkpoints (default: checkpoints)')
     parser.add_argument('--run-name', type=str, default=None,
