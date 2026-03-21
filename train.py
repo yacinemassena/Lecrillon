@@ -186,7 +186,7 @@ class SpikeWeightedHuberLoss(nn.Module):
 # ---------------------------------------------------------------------------
 # Checkpoint Utilities
 # ---------------------------------------------------------------------------
-def save_checkpoint(model, optimizer, scaler, epoch, val_loss, checkpoint_dir, is_distributed):
+def save_checkpoint(model, optimizer, scaler, epoch, val_loss, checkpoint_dir, is_distributed, run_name=None):
     """Save training checkpoint (overwrites previous)."""
     checkpoint_path = Path(checkpoint_dir)
     checkpoint_path.mkdir(parents=True, exist_ok=True)
@@ -200,16 +200,26 @@ def save_checkpoint(model, optimizer, scaler, epoch, val_loss, checkpoint_dir, i
         'optimizer_state_dict': optimizer.state_dict(),
         'scaler_state_dict': scaler.state_dict(),
         'val_loss': val_loss,
+        'run_name': run_name,
     }
     
-    checkpoint_file = checkpoint_path / 'checkpoint.pt'
+    # Use run_name in filename if provided
+    filename = f'{run_name}.pt' if run_name else 'checkpoint.pt'
+    checkpoint_file = checkpoint_path / filename
     torch.save(checkpoint, checkpoint_file)
     return checkpoint_file
 
 
-def load_checkpoint(checkpoint_dir, model, optimizer, scaler, device, is_distributed):
+def load_checkpoint(checkpoint_dir, model, optimizer, scaler, device, is_distributed, run_name=None):
     """Load training checkpoint if exists. Returns start_epoch."""
-    checkpoint_file = Path(checkpoint_dir) / 'checkpoint.pt'
+    # Try run_name.pt first, then fallback to checkpoint.pt
+    checkpoint_path = Path(checkpoint_dir)
+    if run_name:
+        checkpoint_file = checkpoint_path / f'{run_name}.pt'
+        if not checkpoint_file.exists():
+            checkpoint_file = checkpoint_path / 'checkpoint.pt'  # fallback
+    else:
+        checkpoint_file = checkpoint_path / 'checkpoint.pt'
     
     if not checkpoint_file.exists():
         return 0, None  # Start from epoch 0
@@ -975,7 +985,9 @@ def main():
     parser.add_argument('--d-fusion', type=int, default=cfg.d_fusion,
                         help='Wider fusion output dimension (default: 512)')
     parser.add_argument('--checkpoint-dir', type=str, default='checkpoints',
-                        help='Directory to save checkpoints (default: checkpoints)')
+                        help='Base directory for checkpoints (default: checkpoints)')
+    parser.add_argument('--run-name', type=str, default=None,
+                        help='Run name for checkpoint folder/files. Prompted if not provided. Empty = datetime.')
     parser.add_argument('--save-every', type=int, default=5,
                         help='Save checkpoint every N epochs (default: 5)')
     parser.add_argument('--patience', type=int, default=5,
@@ -1062,6 +1074,18 @@ def main():
     parser.add_argument('--film-lr', type=float, default=None,
                         help='Separate LR for FiLM parameters (default: same as --lr)')
     args = parser.parse_args()
+
+    # Prompt for run name if not provided (only on main process, before distributed setup)
+    if args.run_name is None:
+        default_name = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+        try:
+            user_input = input(f'Enter run name (empty for {default_name}): ').strip()
+            args.run_name = user_input if user_input else default_name
+        except (EOFError, KeyboardInterrupt):
+            args.run_name = default_name
+    
+    # Update checkpoint-dir to include run name
+    args.checkpoint_dir = str(Path(args.checkpoint_dir) / args.run_name)
 
     # Run diagnostics if requested
     if args.diagnose:
@@ -1582,7 +1606,7 @@ def main():
     start_epoch = 0
     if args.resume:
         start_epoch, prev_val_loss = load_checkpoint(
-            args.checkpoint_dir, model, optimizer, scaler, device, is_distributed
+            args.checkpoint_dir, model, optimizer, scaler, device, is_distributed, args.run_name
         )
         if is_main:
             if start_epoch > 0:
@@ -1711,7 +1735,7 @@ def main():
                 epochs_without_improvement = 0
                 best_ckpt = save_checkpoint(
                     model, optimizer, scaler, epoch + 1, val_metrics['loss'],
-                    args.checkpoint_dir + '/best', is_distributed
+                    args.checkpoint_dir + '/best', is_distributed, args.run_name + '_best'
                 )
                 dashboard.log(f"[bold green]🏆 New best model![/] val_loss={best_val_loss:.4f}")
                 logger.info(f"New best model saved: val_loss={best_val_loss:.4f}")
@@ -1738,7 +1762,7 @@ def main():
             if (epoch + 1) % args.save_every == 0:
                 ckpt_file = save_checkpoint(
                     model, optimizer, scaler, epoch + 1, val_metrics['loss'],
-                    args.checkpoint_dir, is_distributed
+                    args.checkpoint_dir, is_distributed, args.run_name
                 )
                 dashboard.log(f"[bold blue]💾 Checkpoint saved:[/] {ckpt_file}")
 
@@ -1746,7 +1770,7 @@ def main():
     if is_main and args.epochs > 0 and 'val_metrics' in dir():
         ckpt_file = save_checkpoint(
             model, optimizer, scaler, args.epochs, val_metrics['loss'],
-            args.checkpoint_dir, is_distributed
+            args.checkpoint_dir, is_distributed, args.run_name
         )
         dashboard.log(f"[bold blue]💾 Final checkpoint saved:[/] {ckpt_file}")
 
