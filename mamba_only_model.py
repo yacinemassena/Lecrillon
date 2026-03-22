@@ -654,6 +654,7 @@ class ParallelMambaVIX(nn.Module):
         head_hidden: int = 128,
         use_macro: bool = False,
         macro_dim: int = 21,  # FED/FRED macro features from datasets/macro/macro_daily.parquet
+        macro_mode: str = 'concat',  # 'film' or 'concat' - concat is simpler and more stable
         use_gdelt: bool = False,
         gdelt_dim: int = 391,  # 384 MiniLM embedding + 7 stats
         use_econ: bool = False,
@@ -682,6 +683,7 @@ class ParallelMambaVIX(nn.Module):
         self.use_vix_features = use_vix_features
         self.vix_d_model = vix_d_model
         self.gdelt_dim = gdelt_dim
+        self.macro_mode = macro_mode
         
         # Fundamentals projection (cross-attention state)
         if use_fundamentals:
@@ -775,15 +777,24 @@ class ParallelMambaVIX(nn.Module):
             )
             logger.info(f"Options stream enabled: {option_features} → {d_model}, {n_layers} layers")
         
-        # Macro FiLM conditioning (optional) - time-aware modulation
+        # Macro conditioning (optional) - either FiLM or concat mode
         if use_macro:
-            self.film_generator = FiLMGenerator(
-                macro_dim=macro_dim,
-                d_model=d_model,
-                n_layers=n_layers,
-                dropout=dropout,
-            )
-            logger.info(f"Macro FiLM enabled: {macro_dim} features, {n_layers} layers, time-aware")
+            if macro_mode == 'film':
+                self.film_generator = FiLMGenerator(
+                    macro_dim=macro_dim,
+                    d_model=d_model,
+                    n_layers=n_layers,
+                    dropout=dropout,
+                )
+                logger.info(f"Macro FiLM enabled: {macro_dim} features, {n_layers} layers, time-aware")
+            else:  # concat mode - simpler and more stable
+                self.macro_proj = nn.Sequential(
+                    nn.LayerNorm(macro_dim),
+                    nn.Linear(macro_dim, d_model),
+                    nn.GELU(),
+                    nn.Dropout(dropout),
+                )
+                logger.info(f"Macro concat enabled: {macro_dim} → {d_model} (additive conditioning)")
         
         # Fusion gate for checkpoint blending
         self.fusion_gate = FusionGate(d_model, num_heads=num_fusion_heads, dropout=dropout)
@@ -945,13 +956,22 @@ class ParallelMambaVIX(nn.Module):
         B, T, _ = bars.shape
         device = bars.device
         
-        # Generate FiLM parameters if macro conditioning is enabled
+        # Generate macro conditioning based on mode
         film_params = None
-        if self.use_macro and macro_context is not None and bar_timestamps is not None:
-            film_params = self.film_generator(macro_context, bar_timestamps, T)
+        macro_bias = None  # For concat mode
+        if self.use_macro and macro_context is not None:
+            if self.macro_mode == 'film' and bar_timestamps is not None:
+                film_params = self.film_generator(macro_context, bar_timestamps, T)
+            elif self.macro_mode == 'concat':
+                # Project macro to d_model, will be added to encoded stock
+                macro_bias = self.macro_proj(macro_context)  # [B, d_model]
         
         # Encode all streams
         stock_encoded = self.stock_encoder(bars)  # [B, T, d_model]
+        
+        # Apply macro concat conditioning (additive bias across all timesteps)
+        if macro_bias is not None:
+            stock_encoded = stock_encoded + macro_bias.unsqueeze(1)  # [B, T, d_model]
         
         # Encode Benzinga news if present
         benzinga_encoded = None

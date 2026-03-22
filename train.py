@@ -1011,7 +1011,9 @@ def main():
     parser.add_argument('--options-path', type=str, default=None,
                         help='Path to options data directory (default: datasets/opt_trade_1sec)')
     parser.add_argument('--use-macro', action='store_true', default=cfg.use_macro,
-                        help='Enable macro FiLM conditioning (Fed/treasury/FOMC)')
+                        help='Enable macro conditioning (Fed/treasury/FOMC)')
+    parser.add_argument('--macro-mode', type=str, default='concat', choices=['film', 'concat'],
+                        help='Macro conditioning mode: film (unstable) or concat (default, stable)')
     parser.add_argument('--macro-path', type=str, default=None,
                         help='Path to macro_daily.parquet (default: datasets/macro/macro_daily.parquet)')
     parser.add_argument('--use-gdelt', action='store_true', default=cfg.use_gdelt,
@@ -1483,6 +1485,7 @@ def main():
         head_hidden=128,
         use_macro=args.use_macro,
         macro_dim=macro_dim,
+        macro_mode=args.macro_mode,
         use_gdelt=args.use_gdelt,
         gdelt_dim=gdelt_dim,
         use_econ=args.use_econ,
@@ -1513,13 +1516,21 @@ def main():
         if is_main:
             dashboard.log(f"[bold yellow]🔒 Phase 2: {frozen:,} frozen | {trainable:,} trainable[/]")
 
-    # --- Phase 3: Unfreeze everything (checkpoint loaded via --resume below) ---
+    # --- Phase 3: Load pre-trained weights and unfreeze everything (end-to-end fine-tune) ---
     if args.phase == 3:
+        # Load pretrained stream weights (same as Phase 2)
+        loaded = load_pretrained_weights(model, args, device, is_main)
+        if is_main:
+            if loaded:
+                dashboard.log(f"[bold green]📦 Phase 3: Loaded pre-trained streams:[/] {', '.join(loaded)}")
+            else:
+                dashboard.log(f"[bold yellow]⚠ Phase 3: No pre-trained checkpoints loaded (training from scratch)[/]")
+        # Unfreeze all parameters for end-to-end fine-tuning
         for param in model.parameters():
             param.requires_grad = True
         trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
         if is_main:
-            dashboard.log(f"[bold green]🔓 Phase 3: All {trainable:,} parameters unfrozen (fine-tune)[/]")
+            dashboard.log(f"[bold green]🔓 Phase 3: All {trainable:,} parameters unfrozen (end-to-end fine-tune)[/]")
             logger.info(f"Phase 3: All {trainable:,} parameters unfrozen")
 
     # Wrap model in DDP for multi-GPU training
